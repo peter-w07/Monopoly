@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Multiplayer Monopoly in your browser.">
+  <title>Monopoly</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/ui.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a href="/" class="brand" data-ui="home"><span class="brand-mark" aria-hidden="true">🎩</span><span class="brand-text">Monopoly</span></a>
+    <div id="topbar-game" class="topbar-game" hidden>
+      <button type="button" class="code-chip" data-ui="copy-invite" title="Copy invite link">
+        <span class="code-chip-label">Code</span><strong id="topbar-code"></strong>
+      </button>
+      <span id="conn-status" class="conn" aria-live="polite"></span>
+      <button type="button" class="btn ghost small" data-ui="home">Home</button>
+    </div>
+  </header>
+
+  <div id="replaced-banner" class="replaced" role="alert" hidden>
+    <span>Opened in another tab</span>
+    <button type="button" class="btn small" data-ui="use-here">Use here</button>
+  </div>
+
+  <main>
+    <!-- Shown until ui.js has loaded -->
+    <section id="screen-boot" class="screen center-screen">
+      <div class="spinner" aria-hidden="true"></div>
+      <p>Loading… If this doesn't go away, try reloading the page.</p>
+    </section>
+
+    <!-- Home: create / join / resume -->
+    <section id="screen-home" class="screen" hidden>
+      <div class="home">
+        <div class="home-hero">
+          <div class="home-logo" aria-hidden="true">🎩</div>
+          <h1>Monopoly</h1>
+          <p class="muted">Roll the dice, buy the streets and bankrupt your friends — right in the browser.</p>
+        </div>
+
+        <div class="card">
+          <label class="field">
+            <span>Your name</span>
+            <input id="home-name" type="text" maxlength="20" autocomplete="nickname" placeholder="e.g. Alice">
+          </label>
+        </div>
+
+        <div class="home-grid">
+          <form id="create-form" class="card">
+            <h2>Create a game</h2>
+            <div class="settings-grid">
+              <label class="field">
+                <span>Starting cash</span>
+                <input id="set-cash" type="number" min="100" max="100000" step="50" value="1500" required>
+              </label>
+              <label class="field">
+                <span>Turn timer</span>
+                <select id="set-timer">
+                  <option value="0">Off</option>
+                  <option value="30">30 seconds</option>
+                  <option value="60">1 minute</option>
+                  <option value="90" selected>90 seconds</option>
+                  <option value="120">2 minutes</option>
+                  <option value="180">3 minutes</option>
+                  <option value="300">5 minutes</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Max players</span>
+                <select id="set-max">
+                  <option>2</option><option>3</option><option>4</option><option>5</option>
+                  <option selected>6</option><option>7</option><option>8</option>
+                </select>
+              </label>
+              <div class="checks">
+                <label class="check"><input id="set-pot" type="checkbox"> Free Parking pot</label>
+                <label class="check"><input id="set-even" type="checkbox" checked> Build evenly</label>
+              </div>
+            </div>
+            <button type="submit" class="btn primary block">Create game</button>
+          </form>
+
+          <form id="code-form" class="card">
+            <h2>Join by code</h2>
+            <label class="field">
+              <span>Game code or invite link</span>
+              <input id="code-input" type="text" autocomplete="off" spellcheck="false" placeholder="ABC123" required>
+            </label>
+            <p id="code-error" class="form-error" hidden></p>
+            <button type="submit" class="btn block">Join game</button>
+          </form>
+        </div>
+
+        <section id="my-games-card" class="card" hidden>
+          <h2>Your games</h2>
+          <ul id="my-games" class="rows"></ul>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Open lobbies</h2>
+            <span class="muted small">Updates automatically</span>
+          </div>
+          <ul id="open-lobbies" class="rows"><li class="empty">Loading…</li></ul>
+        </section>
+      </div>
+    </section>
+
+    <!-- Between opening a game and its first state message -->
+    <section id="screen-loading" class="screen center-screen" hidden>
+      <div class="spinner" aria-hidden="true"></div>
+      <p id="loading-text">Connecting…</p>
+      <button type="button" class="btn ghost" data-ui="home">Back to home</button>
+    </section>
+
+    <!-- Lobby: players, token pick, host start -->
+    <section id="screen-lobby" class="screen" hidden>
+      <div class="card lobby-card">
+        <div class="lobby-head">
+          <div>
+            <div class="eyebrow">Game code</div>
+            <div id="lobby-code" class="big-code"></div>
+          </div>
+          <button type="button" class="btn" data-ui="copy-invite">🔗 Copy invite link</button>
+        </div>
+
+        <section>
+          <h2 class="section-title">Players <span id="lobby-count" class="muted"></span></h2>
+          <ul id="lobby-players" class="plist"></ul>
+        </section>
+
+        <form id="lobby-join" class="lobby-join" hidden>
+          <h2 class="section-title">Join this game</h2>
+          <label class="field">
+            <span>Your name</span>
+            <input id="join-name" type="text" maxlength="20" autocomplete="nickname" placeholder="e.g. Alice">
+          </label>
+          <div class="field-label">Pick a token</div>
+          <div id="token-grid" class="token-grid" role="radiogroup" aria-label="Token"></div>
+          <button id="join-btn" type="submit" class="btn primary block">Join game</button>
+        </form>
+
+        <p id="lobby-note" class="note" hidden></p>
+        <div id="lobby-actions" class="lobby-actions"></div>
+
+        <details class="lobby-settings" open>
+          <summary>Game settings</summary>
+          <dl id="lobby-settings" class="settings-list"></dl>
+        </details>
+      </div>
+    </section>
+
+    <!-- Game table: board (renderer2d.js) + side panel (ui.js) -->
+    <section id="screen-game" class="screen screen-game" hidden>
+      <div class="game-layout">
+        <div class="board-wrap">
+          <div id="board"></div>
+          <div id="dialog-layer" class="dialog-layer"></div>
+        </div>
+        <aside class="panel" aria-label="Game panel">
+          <div id="turn-banner"></div>
+          <div id="action-bar" class="action-bar"></div>
+          <section class="panel-section">
+            <h2 class="section-title">Players</h2>
+            <ul id="game-players" class="plist"></ul>
+          </section>
+          <section id="props-section" class="panel-section">
+            <h2 class="section-title">My properties</h2>
+            <div id="my-props"></div>
+          </section>
+          <div id="panel-footer" class="panel-footer"></div>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+</body>
+</html>
