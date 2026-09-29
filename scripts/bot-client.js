@@ -1,5 +1,5 @@
 // A headless WebSocket player: connects to a game table like a browser tab would and plays
-// from the `legal` lists the server sends. Used by scripts/playtest.js and the server tests.
+// from the `legal` lists the server sends. Used by scripts/playtest.js.
 //
 //   const bot = new BotClient({ url: 'ws://localhost:3000/ws', gameId, name: 'Bot 1', startAt: 4 });
 //   bot.connect();
@@ -14,8 +14,15 @@
 //   DECLARE_BANKRUPTCY only when even selling everything can't cover the debt, END_TURN).
 //   Every move it sends comes from the `legal` it last received.
 // - At most one action in flight: it waits for the resulting state (seq changes) or an error.
+//   Each action carries the seq of the state it was chosen from, so the server refuses it
+//   (STALE_STATE) instead of applying it to a newer state; that counts as a failed action.
+// - Paces its actions below the server's per-socket message budget (server/limits.js). If the
+//   server still answers RATE_LIMITED, the action is retried ~200 ms later and not counted as an error.
+//   The server reports at most one dropped message per second, so an action with no answer after
+//   2 s is sent again (safe: it carries the same seq, so it can't be applied twice).
 // - Keeps the `welcome` credentials and resumes its seat with them on every reconnect.
-//   Reconnects with exponential backoff + jitter, except after close code 4000 (seat REPLACED).
+//   Reconnects with exponential backoff + jitter, except after close code 4000 (seat REPLACED)
+//   or error NO_GAME (the game no longer exists): then it stops for good.
 // - Records every `error` message in `bot.errors`, with the action that caused it.
 //
 // Events (EventEmitter): 'welcome', 'state', 'server-error', 'open', 'close' (code), 'finished'.
@@ -26,6 +33,11 @@ import { TOKENS, currentPlayerId, makeRng } from '../engine/index.js';
 import { chooseAction } from '../test/bot.js';
 
 const CLOSE_REPLACED = 4000;
+const RATE_RETRY_MS = 200;
+const NO_ANSWER_MS = 2000;
+// Own send budget, kept under the server's default (burst 100, 50 messages/s per socket).
+const PACE_BURST = 80;
+const PACE_PER_MS = 40 / 1000;
 
 export class BotClient extends EventEmitter {
   /**
@@ -57,6 +69,8 @@ export class BotClient extends EventEmitter {
     this.legal = null;        // latest legal actions for this seat
     this.errors = [];         // { code, message, action, phase, seq }
     this.actionsSent = 0;
+    this.rateLimited = 0;     // RATE_LIMITED answers (retried, not errors)
+    this.pace = { tokens: PACE_BURST, at: Date.now() };
     this.connects = 0;        // successful socket opens
     this.closeCodes = [];
     this.replaced = false;
@@ -185,6 +199,15 @@ export class BotClient extends EventEmitter {
 
       case 'error': {
         const failed = this.inFlight;
+        if (msg.code === 'RATE_LIMITED') {
+          // Transient: the server dropped our last message. Try again shortly.
+          this.rateLimited++;
+          this.say(`rate limited${failed ? ` (retrying ${failed.action.type})` : ''}`);
+          this.inFlight = null;
+          this.cancelThink();
+          this.thinkTimer = setTimeout(() => this.act(), RATE_RETRY_MS);
+          break;
+        }
         this.errors.push({
           code: msg.code,
           message: msg.message,
@@ -198,6 +221,9 @@ export class BotClient extends EventEmitter {
           this.inFlight = null;
           this.blockedSeq = failed.seq; // don't loop on a failing move; wait for the state to change
         }
+        // The game is gone (finished and archived, or an idle lobby deleted). Reconnecting would only
+        // get NO_GAME again every time the server closes the unattached socket, so stop for good.
+        if (msg.code === 'NO_GAME') this.close();
         this.emit('server-error', msg);
         break;
       }
@@ -228,9 +254,33 @@ export class BotClient extends EventEmitter {
     if (this.stopped || this.inFlight || !this.connected) return;
     const action = this.decide();
     if (!action) return;
-    this.inFlight = { action, seq: this.state.seq };
+    const waitMs = this.paceWait();
+    if (waitMs > 0) {
+      this.cancelThink();
+      this.thinkTimer = setTimeout(() => this.act(), waitMs);
+      return;
+    }
+    const flight = { action, seq: this.state.seq };
+    this.inFlight = flight;
     this.actionsSent++;
-    this.send({ t: 'action', action });
+    this.send({ t: 'action', seq: this.state.seq, action });
+    // Silently dropped (rate limit)? Nothing else will wake us up, so try again.
+    setTimeout(() => {
+      if (this.inFlight !== flight) return;
+      this.inFlight = null;
+      this.schedule();
+    }, NO_ANSWER_MS).unref();
+  }
+
+  /** Take a send token: 0 if one was available, else the milliseconds to wait for the next. */
+  paceWait() {
+    const now = Date.now();
+    const pace = this.pace;
+    pace.tokens = Math.min(PACE_BURST, pace.tokens + (now - pace.at) * PACE_PER_MS);
+    pace.at = now;
+    if (pace.tokens < 1) return Math.ceil((1 - pace.tokens) / PACE_PER_MS);
+    pace.tokens -= 1;
+    return 0;
   }
 
   /** The move to make right now based on the latest state + legal, or null. */

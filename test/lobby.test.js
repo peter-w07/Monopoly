@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
   createGame, normalizeSettings, DEFAULT_SETTINGS, OWNABLE_INDICES, legalActions,
 } from '../engine/index.js';
-import { lobby, act, reject, player, assertEvent, TOKEN_IDS } from './helpers.js';
+import { lobby, act, reject, player, setPlayer, assertEvent, TOKEN_IDS } from './helpers.js';
 
 const join = (playerId, name, token) => ({ type: 'JOIN', playerId, name, token });
 
@@ -150,6 +150,36 @@ describe('START_GAME', () => {
     reject(lobby({ players: 1 }), { type: 'START_GAME', playerId: 'p1' }, 'NOT_ENOUGH_PLAYERS');
   });
 
+  describe('while the host is offline', () => {
+    const start = (playerId) => ({ type: 'START_GAME', playerId });
+    const canStart = (state, playerId) => legalActions(state, playerId).actions.includes('START_GAME');
+    const hostOffline = () => setPlayer(lobby({ players: 3 }), 'p1', { connected: false });
+
+    test('the first connected player in join order may start instead', () => {
+      const s = hostOffline();
+      assert.ok(canStart(s, 'p2'));
+      assert.ok(!canStart(s, 'p3'));
+      reject(s, start('p3'), 'NOT_HOST');
+      const { state } = act(s, start('p2'));
+      assert.equal(state.status, 'active');
+      assert.deepEqual(state.turn.order, ['p1', 'p2', 'p3'], 'turn order is still join order');
+      assert.equal(state.hostId, 'p1');
+    });
+
+    test('offline players are skipped when picking the stand-in', () => {
+      const s = setPlayer(hostOffline(), 'p2', { connected: false });
+      assert.deepEqual(['p1', 'p2', 'p3'].filter((id) => canStart(s, id)), ['p1', 'p3']);
+      reject(s, start('p2'), 'NOT_HOST');
+      act(s, start('p3'));
+    });
+
+    test('with the host connected only the host may start', () => {
+      const s = setPlayer(lobby({ players: 3 }), 'p2', { connected: false });
+      assert.deepEqual(['p1', 'p2', 'p3'].filter((id) => canStart(s, id)), ['p1']);
+      reject(s, start('p3'), 'NOT_HOST');
+    });
+  });
+
   test('activates the game with join order as turn order', () => {
     const { state, events } = act(lobby({ players: 3 }), { type: 'START_GAME', playerId: 'p1' });
     assert.equal(state.status, 'active');
@@ -187,5 +217,21 @@ describe('LEAVE in the lobby', () => {
 
   test('unknown players cannot leave', () => {
     reject(lobby({ players: 2 }), { type: 'LEAVE', playerId: 'ghost' }, 'NO_PLAYER');
+  });
+
+  test('LEAVE { lobbyOnly: true } leaves the lobby but never resigns from a started game', () => {
+    const leave = { type: 'LEAVE', playerId: 'p2', lobbyOnly: true };
+    const { state, events } = act(lobby({ players: 3 }), leave);
+    assert.deepEqual(state.players.map((p) => p.id), ['p1', 'p3']);
+    assertEvent(events, 'player_left', { playerId: 'p2' });
+
+    const started = act(lobby({ players: 3 }), { type: 'START_GAME', playerId: 'p1' }).state;
+    reject(started, leave, 'NOT_IN_LOBBY'); // also checks the state is untouched
+    reject(started, { ...leave, lobbyOnly: 'yes' }, 'BAD_PAYLOAD');
+    for (const plain of [{ type: 'LEAVE', playerId: 'p2' }, { ...leave, lobbyOnly: false }]) {
+      const resigned = act(started, plain);
+      assert.equal(player(resigned.state, 'p2').bankrupt, true);
+      assertEvent(resigned.events, 'bankrupt', { playerId: 'p2', toPlayerId: null });
+    }
   });
 });

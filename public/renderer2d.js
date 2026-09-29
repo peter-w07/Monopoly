@@ -28,6 +28,12 @@ const JAIL_STRIP = 0.46; // "just visiting" strip inside the jail corner (30.67%
 const TOKEN_GAP = 0.5; // max distance between tokens sharing a spot
 
 const ICONS = { chance: '❓', community: '📦', tax: '💰', railroad: '🚂' };
+const money = (n) => `$${(Number(n) || 0).toLocaleString('en-US')}`; // "$1,400", as in the side panel
+
+// Short tile labels for phone-sized boards, where full names would be tiny (renderer2d.css swaps
+// them in): generic words dropped, whole words only, long words cut to fit ("Mediterranean" → "Medite.").
+const GENERIC_WORDS = /^(avenue|ave\.?|place|railroad|company|gardens|works|tax|st\.)$/i;
+const SHORT_CHARS = { top: 7, bottom: 7, left: 9, right: 9 }; // characters per line that fit at ~7px
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -45,6 +51,7 @@ let gameId; // id of the game on screen (undefined until the first render)
 let lastSeq = null; // seq whose events have already been played
 let lastArgs = null; // [state, myPlayerId] of the latest render, for a late board load
 let boardRetry = null;
+let info = null; // tile info card (tap / click a tile): { card, index, ctx, sig }
 
 injectStylesheet();
 BOARD = await loadBoard();
@@ -229,6 +236,7 @@ function build() {
   root.append(buildCenter());
   tokenLayer = el('div', 'r2d-tokens');
   root.append(tokenLayer);
+  buildInfoCard();
 }
 
 function isOwnable(tile) {
@@ -250,6 +258,15 @@ function nameFit(name, side) {
   return Math.min(1, room / longest).toFixed(2);
 }
 
+/** Phone label: "St. Charles Place" → "Charles", "B. & O. Railroad" → "B&O", "Connecticut Avenue" → "Connec.". */
+function shortName(name, side) {
+  const max = SHORT_CHARS[side] ?? 7;
+  let words = String(name).split(/\s+/).filter((w) => w && !GENERIC_WORDS.test(w));
+  if (!words.length) words = String(name).split(/\s+/).slice(0, 1);
+  if (words.every((w) => w.replace(/\./g, '').length <= 1)) words = [words.join('').replace(/\./g, '')]; // initials
+  return words.slice(0, 2).map((w) => (w.length > max ? `${w.slice(0, max - 1)}.` : w)).join(' ');
+}
+
 function buildTile(tile, i) {
   const side = sideOf(i);
   const [c, r] = cellOf(i);
@@ -269,13 +286,18 @@ function buildTile(tile, i) {
       node.append(band);
     }
     const body = el('div', 'r2d-body');
-    const name = el('div', 'r2d-name', tile.name);
+    const name = el('div', 'r2d-name');
+    name.append(el('span', 'r2d-name-full', tile.name), el('span', 'r2d-name-short', shortName(tile.name, side)));
     name.style.setProperty('--fit', nameFit(tile.name, side));
     body.append(name);
     const icon = iconOf(tile);
     if (icon) body.append(el('div', 'r2d-icon', icon));
     if (tile.price != null) body.append(el('div', 'r2d-price', `$${tile.price}`));
-    else if (tile.type === 'tax') body.append(el('div', 'r2d-price r2d-tax', `Pay $${tile.amount}`));
+    else if (tile.type === 'tax') {
+      const tax = el('div', 'r2d-price r2d-tax');
+      tax.append(el('span', 'r2d-tax-pay', 'Pay '), `$${tile.amount}`); // phones drop the "Pay"
+      body.append(tax);
+    }
     node.append(body);
   }
   if (refs.ownable) node.append(el('div', 'r2d-owner'), el('div', 'r2d-mbadge', 'M'));
@@ -386,6 +408,7 @@ function draw(state, events, me) {
   };
 
   drawTiles(ctx);
+  drawInfo(ctx);
   drawTokens(ctx);
   drawTurn(ctx);
   drawDice(ctx);
@@ -399,6 +422,7 @@ function draw(state, events, me) {
 function resetGame(id) {
   gameId = id;
   lastSeq = null;
+  closeInfo();
   for (const t of tokens.values()) {
     stopWalk(t);
     t.el.remove();
@@ -447,21 +471,27 @@ function drawTiles(ctx) {
 
 /** Tooltip text: static facts, plus owner and current rent when `ctx` is given. */
 function tileTitle(tile, ctx, owner = null, houses = 0, mortgaged = false) {
-  const lines = [tile.name];
+  const { facts, status } = tileInfo(tile, ctx, owner, houses, mortgaged);
+  return [tile.name, ...facts, ...status].join('\n');
+}
+
+/** What the tooltip and the info card say: static `facts`, and `status` (owner, buildings, rent now) with `ctx`. */
+function tileInfo(tile, ctx, owner = null, houses = 0, mortgaged = false) {
+  const lines = [];
   const rent = Array.isArray(tile.rent) ? tile.rent : [];
   switch (tile.type) {
     case 'property':
-      lines.push(`Price $${tile.price} · house $${tile.houseCost} · mortgage $${tile.mortgage}`);
-      lines.push(`Rent $${rent[0]} ($${rent[0] * 2} with the full color set)`);
-      lines.push(`1–4 houses $${rent.slice(1, 5).join(' / $')} · hotel $${rent[5]}`);
+      lines.push(`Price ${money(tile.price)} · house ${money(tile.houseCost)} · mortgage ${money(tile.mortgage)}`);
+      lines.push(`Rent ${money(rent[0])} (${money(rent[0] * 2)} with the full color set)`);
+      lines.push(`1–4 houses ${rent.slice(1, 5).map(money).join(' / ')} · hotel ${money(rent[5])}`);
       break;
     case 'railroad':
-      lines.push(`Price $${tile.price} · mortgage $${tile.mortgage}`);
-      lines.push(`Rent $${rent.join(' / $')} for 1–${rent.length} railroads owned`);
+      lines.push(`Price ${money(tile.price)} · mortgage ${money(tile.mortgage)}`);
+      lines.push(`Rent ${rent.map(money).join(' / ')} for 1–${rent.length} railroads owned`);
       break;
     case 'utility': {
       const m = tile.multipliers ?? [];
-      lines.push(`Price $${tile.price} · mortgage $${tile.mortgage}`);
+      lines.push(`Price ${money(tile.price)} · mortgage ${money(tile.mortgage)}`);
       lines.push(`Rent ${m[0]}× dice with one utility, ${m[1]}× with both`);
       break;
     }
@@ -473,28 +503,141 @@ function tileTitle(tile, ctx, owner = null, houses = 0, mortgaged = false) {
     case 'tax': lines.push(`Pay $${tile.amount}`); break;
     default: break;
   }
-  if (!ctx || !isOwnable(tile)) return lines.join('\n');
-  if (!owner) {
-    lines.push('Unowned');
-  } else {
-    lines.push(`Owner: ${owner.name}${mortgaged ? ' (mortgaged)' : ''}`);
-    if (houses) lines.push(houses === 5 ? 'Hotel' : `${houses} house${houses > 1 ? 's' : ''}`);
-    lines.push(mortgaged ? 'No rent while mortgaged' : `Rent now: ${currentRent(tile, ctx, owner.id, houses)}`);
+  const status = [];
+  if (ctx && isOwnable(tile)) {
+    if (!owner) {
+      status.push('Unowned');
+    } else {
+      status.push(`Owner: ${owner.name}${mortgaged ? ' (mortgaged)' : ''}`);
+      if (houses) status.push(houses === 5 ? 'Hotel' : `${houses} house${houses > 1 ? 's' : ''}`);
+      status.push(mortgaged ? 'No rent while mortgaged' : `Rent now: ${currentRent(tile, ctx, owner.id, houses)}`);
+    }
   }
-  return lines.join('\n');
+  return { facts: lines, status };
 }
 
 function currentRent(tile, ctx, ownerId, houses) {
   const rent = Array.isArray(tile.rent) ? tile.rent : [];
   const ownedBy = (i) => ctx.tileState.get(i)?.ownerId === ownerId;
   if (tile.type === 'property') {
-    if (houses > 0) return `$${rent[houses]}`;
+    if (houses > 0) return money(rent[houses]);
     const fullSet = (groupTiles[tile.group] ?? []).every(ownedBy);
-    return `$${(rent[0] ?? 0) * (fullSet ? 2 : 1)}`;
+    return money((rent[0] ?? 0) * (fullSet ? 2 : 1));
   }
   const count = BOARD.tiles.filter((t, i) => t.type === tile.type && ownedBy(i)).length;
-  if (tile.type === 'railroad') return `$${rent[Math.min(count, rent.length) - 1]}`;
+  if (tile.type === 'railroad') return money(rent[Math.min(count, rent.length) - 1]);
   return `${tile.multipliers?.[count - 1] ?? '?'}× dice`;
+}
+
+// --- tile info card ----------------------------------------------------------
+// Tapping (or clicking) a tile opens a small card next to it with the tooltip's facts: price, owner,
+// buildings and rent right now — the only way to see them on touch screens. The next tap anywhere
+// closes it (a tap on another tile moves it there); it follows state changes while open.
+
+function buildInfoCard() {
+  const card = el('div', 'r2d-info');
+  card.hidden = true;
+  card.setAttribute('role', 'status');
+  root.append(card);
+  info = { card, index: null, ctx: null, sig: '' };
+  root.addEventListener('click', onBoardClick);
+  document.addEventListener('click', (e) => {
+    if (info.index != null && !root.contains(e.target)) closeInfo();
+  }, true);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && info.index != null) closeInfo();
+  });
+  window.addEventListener('resize', () => placeInfo());
+}
+
+function onBoardClick(e) {
+  const target = e.target;
+  let index = null;
+  if (!target.closest('.r2d-info')) {
+    const tile = target.closest('.r2d-tile');
+    const token = target.closest('.r2d-token');
+    if (tile) index = Number(tile.dataset.index);
+    else if (token) index = [...tokens.values()].find((t) => t.el === token)?.spot.index ?? null;
+  }
+  if (index == null || index === info.index) closeInfo();
+  else openInfo(index);
+}
+
+function openInfo(index) {
+  if (info.index != null) dropClass(tiles[info.index].node, 'is-inspected');
+  info.index = index;
+  info.sig = '';
+  tiles[index].node.classList.add('is-inspected');
+  drawInfo(info.ctx);
+}
+
+function closeInfo() {
+  if (!info || info.index == null) return;
+  dropClass(tiles[info.index].node, 'is-inspected');
+  info.index = null;
+  info.sig = '';
+  setHidden(info.card, true);
+}
+
+function drawInfo(ctx) {
+  info.ctx = ctx;
+  const i = info.index;
+  if (i == null || !ctx) return;
+  const tile = BOARD.tiles[i];
+  const ts = ctx.tileState.get(i);
+  const owner = (ts?.ownerId && ctx.byId.get(ts.ownerId)) || null;
+  const houses = owner ? Math.max(0, Math.min(5, Math.trunc(Number(ts.houses)) || 0)) : 0;
+  const mortgaged = !!(owner && ts.mortgaged);
+  const { facts, status } = tileInfo(tile, ctx.live ? ctx : null, owner, houses, mortgaged);
+  const band = tile.type === 'property' ? BOARD.groups?.[tile.group]?.color ?? '' : '';
+  const color = owner ? ctx.colorOf.get(owner.id) : '';
+  const sig = JSON.stringify([i, band, color, facts, status]);
+  if (sig === info.sig) return;
+  info.sig = sig;
+
+  const { card } = info;
+  const head = el('div', 'r2d-info-head');
+  if (band) head.style.setProperty('--band', band);
+  head.append(el('span', 'r2d-info-name', tile.name));
+  const statusBox = el('div', 'r2d-info-status');
+  status.forEach((line, k) => {
+    const row = el('div', k === status.length - 1 && owner ? 'r2d-info-rent' : null, line);
+    if (k === 0 && owner) {
+      row.className = 'r2d-info-owner';
+      row.style.setProperty('--owner', color);
+    }
+    statusBox.append(row);
+  });
+  const factsBox = el('div', 'r2d-info-facts');
+  factsBox.append(...facts.map((line) => el('div', null, line)));
+  card.replaceChildren(head, ...(status.length ? [statusBox] : []), factsBox);
+  setHidden(card, false);
+  placeInfo();
+}
+
+/** Puts the card beside its tile, toward the board centre, and keeps it on the board. */
+function placeInfo() {
+  if (!info || info.index == null || info.card.hidden) return;
+  const { card } = info;
+  const size = root.clientWidth;
+  if (!size) return;
+  const u = size / UNITS;
+  const r = tileRect(info.index);
+  const w = card.offsetWidth;
+  const h = card.offsetHeight;
+  const gap = 0.15 * u;
+  const cx = (r.x + r.w / 2) * u;
+  const cy = (r.y + r.h / 2) * u;
+  let x = cx - w / 2;
+  let y = cy - h / 2;
+  const side = sideOf(info.index);
+  if (side === 'bottom' || (side === 'corner' && cy > size / 2)) y = r.y * u - h - gap;
+  if (side === 'top' || (side === 'corner' && cy < size / 2)) y = (r.y + r.h) * u + gap;
+  if (side === 'left' || (side === 'corner' && cx < size / 2)) x = (r.x + r.w) * u + gap;
+  if (side === 'right' || (side === 'corner' && cx > size / 2)) x = r.x * u - w - gap;
+  const clamp = (v, extent) => Math.max(gap, Math.min(v, size - extent - gap));
+  card.style.left = pct((clamp(x, w) / size) * UNITS);
+  card.style.top = pct((clamp(y, h) / size) * UNITS);
 }
 
 // --- tokens ----------------------------------------------------------------
@@ -785,13 +928,13 @@ function stopTumble() {
 function drawPot(ctx) {
   const on = ctx.live && !!ctx.state.settings?.freeParkingPot;
   const amount = Math.max(0, Number(ctx.state.pot) || 0);
-  const text = on ? `Free Parking pot: $${amount}` : '';
+  const text = on ? `Free Parking pot: ${money(amount)}` : '';
   setHidden(center.pot, !on);
   setText(center.pot, text);
   const badge = tiles[BOARD.freeParkingIndex ?? 20]?.pot;
   if (badge) {
     setHidden(badge, !on);
-    setText(badge, on ? `$${amount}` : '');
+    setText(badge, on ? money(amount) : '');
   }
 }
 

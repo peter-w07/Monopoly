@@ -1,21 +1,24 @@
 // Turn timers and AFK handling: one timer per room, driving state.turn.deadlineAt.
 //
 // room.timer = { key, handle, retries, turnDeadline }
-//   key          `${status}|${turn.number}|${currentPlayerId}|${phase}|${rollAgain}` the deadline belongs to
+//   key          `${status}|${turn.number}|${currentPlayerId}|${phase}|${rollAgain}|${doublesCount}` the
+//                deadline belongs to (doublesCount: every doubles roll that lands with nothing pending
+//                leaves phase end_turn + rollAgain unchanged, but still earns a fresh deadline)
 //   handle       the pending setTimeout (expiry or retry)
 //   retries      failed TIMEOUT attempts for the current key
 //   turnDeadline the full-length deadline for this key (restored if an AFK player comes back)
 //
 // Rules:
-// - When the key changes, the deadline restarts: turnTimeoutSec, or 20s if the current player is
+// - When the key changes, the deadline restarts: turnTimeoutSec, or 45s if the current player is
 //   disconnected. No timer unless the game is active, turnTimeoutSec > 0 and a player is connected.
-// - Current player disconnects: deadline = min(existing, now + 20s). All players gone: pause.
+// - Current player disconnects: deadline = min(existing, now + 45s) — long enough for a phone that
+//   switched apps or networks to come back. All players gone: pause.
 //   Someone reconnects to a paused game: fresh deadline.
 // - On expiry the registered handler applies TIMEOUT. If that errors: retry every 5s, 3 times max.
 
 import { currentPlayerId } from '../engine/index.js';
 
-const AFK_MS = 20_000;
+export const AFK_MS = 45_000;
 const RETRY_MS = 5_000;
 const MAX_RETRIES = 3;
 
@@ -35,7 +38,7 @@ export function newTimerState() {
 
 function turnKey(state) {
   const { turn } = state;
-  return `${state.status}|${turn.number}|${currentPlayerId(state)}|${turn.phase}|${turn.rollAgain}`;
+  return `${state.status}|${turn.number}|${currentPlayerId(state)}|${turn.phase}|${turn.rollAgain}|${turn.doublesCount}`;
 }
 
 const timeoutMs = (state) => (Number(state.settings?.turnTimeoutSec) || 0) * 1000;

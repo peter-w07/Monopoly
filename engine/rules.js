@@ -80,7 +80,11 @@ export function buildingRefund(tileIndex) {
   return Math.floor(getTile(tileIndex).houseCost / 2);
 }
 
-/** Cash the player could raise: cash + half cost of every building level + mortgage value of unmortgaged tiles. */
+/**
+ * Cash the player could raise: cash + half cost of every building level + mortgage value of unmortgaged tiles.
+ * Exact, because every building level can always be sold (a hotel breaks into as many houses as the bank
+ * has, see canSellHouse) and every tile can be mortgaged once its group's buildings are gone.
+ */
 export function liquidationValue(state, playerId) {
   const player = getPlayer(state, playerId);
   if (!player) return 0;
@@ -146,6 +150,10 @@ export function canBuild(state, playerId, tileIndex) {
   return OK;
 }
 
+/**
+ * A hotel can always be sold: it breaks into 4 houses, or into as many as the bank has left
+ * (0–3) during a house shortage, and the missing levels are refunded too (see sellOne in actions.js).
+ */
 export function canSellHouse(state, playerId, tileIndex) {
   const bad = checkOwnedTile(state, playerId, tileIndex, true);
   if (bad) return bad;
@@ -155,7 +163,6 @@ export function canSellHouse(state, playerId, tileIndex) {
   if (state.settings.evenBuild && ts.houses !== Math.max(...groupStates(state, tileIndex).map((t) => t.houses))) {
     return fail('UNEVEN_BUILD', 'Sell evenly: sell from the property with the most buildings first.');
   }
-  if (ts.houses === 5 && state.bank.houses < 4) return fail('BANK_SHORTAGE', 'The bank needs 4 houses to break up a hotel.');
   return OK;
 }
 
@@ -216,9 +223,21 @@ function validateStub(state) {
 
 const hasTileIndex = (a) => Number.isInteger(a.tileIndex);
 
+/**
+ * Who may START_GAME: the host, or — while the host is offline — the first connected player in
+ * join order, so a lobby whose host went away can still be started. The engine only reads
+ * `connected`, which the server maintains.
+ */
+function mayStart(state, playerId) {
+  if (playerId === state.hostId) return true;
+  if (getPlayer(state, state.hostId)?.connected !== false) return false;
+  return state.players.find((p) => p.connected)?.id === playerId;
+}
+
 /** Payload shape checks, beyond the playerId every action needs. */
 const PAYLOAD_CHECKS = {
   JOIN: (a) => typeof a.name === 'string' && typeof a.token === 'string',
+  LEAVE: (a) => a.lobbyOnly === undefined || typeof a.lobbyOnly === 'boolean',
   BUILD: hasTileIndex,
   SELL_HOUSE: hasTileIndex,
   MORTGAGE: hasTileIndex,
@@ -237,15 +256,17 @@ const VALIDATORS = {
     return null;
   },
 
+  // { lobbyOnly: true } means "leave the lobby": it never turns into a resignation once the game has started.
   LEAVE(state, a) {
     if (state.status === 'lobby') return getPlayer(state, a.playerId) ? null : err('NO_PLAYER', 'You are not in this game.');
+    if (a.lobbyOnly === true) return err('NOT_IN_LOBBY', 'The game has already started.');
     return requireActive(state) ?? requirePlayer(state, a.playerId);
   },
 
   START_GAME(state, a) {
     if (state.status !== 'lobby') return err('NOT_IN_LOBBY', 'The game has already started.');
     if (!getPlayer(state, a.playerId)) return err('NO_PLAYER', 'You are not in this game.');
-    if (state.hostId !== a.playerId) return err('NOT_HOST', 'Only the host can start the game.');
+    if (!mayStart(state, a.playerId)) return err('NOT_HOST', 'Only the host can start the game.');
     if (state.players.length < 2) return err('NOT_ENOUGH_PLAYERS', 'At least 2 players are needed.');
     return null;
   },
@@ -339,8 +360,9 @@ export const ACTION_TYPES = Object.freeze(Object.keys(VALIDATORS));
 
 /** → null if the action would succeed, else { code, message }. Pure. */
 export function validateAction(state, action) {
-  if (!action || typeof action !== 'object' || !Object.hasOwn(VALIDATORS, action.type)) {
-    return err('UNKNOWN_ACTION', `Unknown action type: ${String(action?.type)}.`);
+  if (!action || typeof action !== 'object' || typeof action.type !== 'string' || !Object.hasOwn(VALIDATORS, action.type)) {
+    const type = typeof action?.type === 'string' ? action.type : `(${typeof action?.type})`;
+    return err('UNKNOWN_ACTION', `Unknown action type: ${type}.`);
   }
   if (typeof action.playerId !== 'string' || action.playerId === '') return err('BAD_PAYLOAD', 'Missing playerId.');
   const shapeOk = PAYLOAD_CHECKS[action.type]?.(action) ?? true;

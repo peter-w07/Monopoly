@@ -22,16 +22,20 @@ const BUSY_TIMEOUT_MS = 4000;
 // After a move, dialogs wait this long so the board can show the dice and the token's walk first
 // (the same buttons are in the side panel right away).
 const DIALOG_HOLD_MS = 1500;
+// Space/Enter can't end the turn this soon after my roll (a double press would skip the move).
+const END_TURN_KEY_HOLD_MS = 700;
+const RECENT_LOG_LINES = 5;
 const NOT_FOUND = Symbol('not found');
+// Must match the single-column breakpoint in style.css: there, dialogs sit in the side panel
+// above the action bar instead of floating over the board.
+const NARROW = window.matchMedia('(max-width: 899px)');
 
 const KEY_NAME = 'monopoly.name';
 const KEY_SESSIONS = 'monopoly.sessions';
 const seatKey = (gameId) => `monopoly.seat.${gameId}`;
 
-const CONFIRM_TEXT = {
-  DECLARE_BANKRUPTCY: 'Declare bankruptcy? Everything you own goes to your creditor and you are out of the game.',
-  LEAVE: 'Resign from this game? Your cash and properties go back to the bank and you are out of the game.',
-};
+// Actions that don't depend on what the player saw last: sent without the state seq.
+const SEQ_FREE = new Set(['JOIN', 'LEAVE', 'START_GAME']);
 
 const ERROR_TEXT = {
   NOT_YOUR_TURN: "It's not your turn.",
@@ -41,6 +45,7 @@ const ERROR_TEXT = {
   BAD_NAME: 'Names must be 1–20 characters.',
   MUST_ROLL_AGAIN: 'You rolled doubles — roll again first.',
   NOT_ENOUGH_PLAYERS: 'You need at least 2 players to start.',
+  NOT_IN_LOBBY: 'The game has already started.',
 };
 
 // ---------------------------------------------------------------------------
@@ -64,6 +69,11 @@ const app = {
   dismissed: new Set(),   // dialog keys the player closed
   dialogAt: 0,            // no dialog appears before this time (see DIALOG_HOLD_MS)
   dialogTimer: null,
+  lastRollAt: 0,          // when my latest dice roll arrived (see END_TURN_KEY_HOLD_MS)
+  keyTimer: null,
+  expanded: new Set(),    // player ids whose holdings are open in the players list
+  focusMemo: null,        // a control that lost focus to a re-render and should get it back
+  autoJoin: null,         // { name }: take a seat as soon as the lobby we just created arrives
   selectedToken: null,
   resigned: false,        // I resigned (LEAVE while active): the engine records that as bankrupt
   homeTimer: null,
@@ -91,6 +101,44 @@ function setHtml(el, html) {
   if (lastHtml.get(el) === html) return;
   lastHtml.set(el, html);
   el.innerHTML = html;
+}
+
+// A control's identity across re-renders: its action (+ tile), UI command, or player row.
+function focusKey(el) {
+  const d = el.dataset ?? {};
+  if (d.act) return `act:${d.act}:${d.tile ?? ''}`;
+  if (d.ui) return `ui:${d.ui}:${d.key ?? d.game ?? ''}`;
+  const row = el.tagName === 'SUMMARY' ? el.closest('details[data-player]') : null;
+  return row ? `player:${row.dataset.player}` : null;
+}
+
+const focusable = (el) => el && !el.disabled && el.isConnected;
+
+/**
+ * setHtml for containers with buttons: keyboard focus stays on the same control (same action and
+ * tile) after the rewrite. If that control is disabled right now (buttons are while an action is in
+ * flight), the next rewrite of the container within a few seconds tries again, falling back to
+ * another control for the same tile (Mortgage → Unmortgage). Mouse and touch clicks drop focus
+ * instead (see boot), so this only carries keyboard users along.
+ */
+function setHtmlKeepFocus(el, html) {
+  const active = document.activeElement;
+  const inside = active && active !== document.body && el.contains(active);
+  const memo = app.focusMemo;
+  let want = null;
+  if (inside) want = { el, key: focusKey(active), tile: active.dataset?.tile ?? null };
+  else if (memo?.el === el && Date.now() - memo.at < 5000 && document.activeElement === document.body) want = memo;
+  setHtml(el, html);
+  if (!want?.key || el.contains(document.activeElement)) return;
+  const controls = [...el.querySelectorAll('[data-act], [data-ui], summary')];
+  const target = controls.find((c) => focusable(c) && focusKey(c) === want.key)
+    ?? (want.tile != null ? controls.find((c) => focusable(c) && c.dataset.tile === want.tile) : null);
+  if (target) {
+    target.focus({ preventScroll: true });
+    app.focusMemo = null;
+  } else {
+    app.focusMemo = { ...want, at: want.at ?? Date.now() };
+  }
 }
 
 /** Accepts 'ABC123', 'abc123', 'g_abc123' or an invite URL; returns 'g_abc123' or null. */
@@ -227,6 +275,24 @@ function rentText(s, index) {
   return '';
 }
 
+/** Mirrors rules.netWorth: cash + price of each tile (mortgage value if mortgaged) + house cost of buildings. */
+function netWorth(s, playerId) {
+  const p = playerById(s, playerId);
+  if (!p) return 0;
+  return s.tiles.reduce((sum, ts) => {
+    if (ts.ownerId !== playerId) return sum;
+    const tile = TILES[ts.index];
+    return sum + (ts.mortgaged ? tile.mortgage : tile.price) + (ts.houses > 0 ? ts.houses * tile.houseCost : 0);
+  }, p.cash);
+}
+
+/** Who gets my assets if I go bankrupt or resign now: the player I owe, else the bank (null). */
+function myCreditor() {
+  const debt = app.state?.turn.pendingDebt;
+  if (!isMyTurn() || app.state.turn.phase !== 'paying' || !debt?.toPlayerId || debt.payees?.length) return null;
+  return playerById(app.state, debt.toPlayerId);
+}
+
 // ---------------------------------------------------------------------------
 // Screens & navigation
 // ---------------------------------------------------------------------------
@@ -254,11 +320,14 @@ function closeGame() {
   Object.assign(app, {
     conn: null, gameId: null, seat: null, takeover: null, state: null,
     legal: EMPTY_LEGAL, net: { status: 'closed' }, selectedToken: null, resigned: false,
+    autoJoin: null, focusMemo: null, lastRollAt: 0,
   });
   setBusy(false);
   app.dismissed.clear();
+  app.expanded.clear();
   app.dialogAt = 0;
   clearTimeout(app.dialogTimer);
+  clearTimeout(app.keyTimer);
   $('#replaced-banner').hidden = true;
   clearDialog();
 }
@@ -282,11 +351,15 @@ async function fetchSummary(gameId) {
   }
 }
 
-/** Open a game table (lobby or game) — resolving this tab's seat per CONTRACT §8. */
-async function openGame(gameId) {
+/**
+ * Open a game table (lobby or game) — resolving this tab's seat per CONTRACT §8.
+ * `autoJoin: { name }` (a game we just created) takes a seat without a second click.
+ */
+async function openGame(gameId, { autoJoin = null } = {}) {
   closeGame();
   const seq = app.openSeq;
   app.gameId = gameId;
+  app.autoJoin = autoJoin;
   history.replaceState(null, '', `/?game=${encodeURIComponent(gameId)}`);
   $('#topbar-code').textContent = codeOf(gameId);
   $('#loading-text').textContent = `Opening game ${codeOf(gameId)}…`;
@@ -348,27 +421,63 @@ function handleWelcome(msg) {
 function handleState(msg) {
   const { state } = msg;
   if (!state || (app.gameId && state.id !== app.gameId)) return;
-  const firstState = !app.state;
+  const prev = app.state;
+  const firstState = !prev;
   app.state = state;
   app.legal = { ...EMPTY_LEGAL, ...(msg.legal ?? {}) };
   if (typeof msg.now === 'number') app.clockOffset = msg.now - Date.now();
   setBusy(false);
-  syncStoredSeat();
+  if (syncStoredSeat() === 'left') {
+    goHome();
+    toast('You left the lobby.', 'info');
+    return;
+  }
 
   const events = Array.isArray(msg.events) ? msg.events : [];
   if (state.status === 'lobby') {
     showScreen('lobby');
     renderLobby();
+    if (app.autoJoin) autoJoin();
+    else if (becameHost(prev, state)) toast("You're the host now — start when everyone's in.", 'good', 6000);
   } else {
+    app.autoJoin = null;
     if (app.screen !== 'game') showScreen('game');
     if (!firstState && !document.hidden && events.some((e) => e.type === 'moved')) {
       app.dialogAt = Date.now() + DIALOG_HOLD_MS;
     }
+    const myId = me()?.id;
+    if (myId && events.some((e) => e.type === 'dice_rolled' && e.playerId === myId)) app.lastRollAt = Date.now();
     drawBoard(events);
     renderGame();
     if (!firstState) announceLater(events);
   }
   updateTitle();
+}
+
+/** The previous host left the lobby and the seat passed to me. */
+function becameHost(prev, state) {
+  const myId = app.seat?.playerId;
+  return !!myId && prev?.status === 'lobby' && !!playerById(prev, myId)
+    && !!prev.hostId && prev.hostId !== myId && state.hostId === myId;
+}
+
+/** Take a seat in the lobby we just created, with the home screen's name and the first free token. */
+function autoJoin() {
+  if (me() || !can('JOIN')) {
+    app.autoJoin = null;
+    return;
+  }
+  const { name } = app.autoJoin;
+  app.autoJoin = null;
+  if (!name) {
+    $('#join-name').focus();
+    return;
+  }
+  const taken = new Set(app.state.players.map((p) => p.token));
+  const token = TOKENS.find((t) => !taken.has(t.id))?.id;
+  if (!token) return;
+  app.joinName = name;
+  act('JOIN', { name, token });
 }
 
 // Toasts about a move (rent, cards, passing GO…) wait for the board to show it, like dialogs do.
@@ -383,11 +492,11 @@ function announceLater(events) {
 }
 
 // Keep stored credentials in line with the table: refresh the remembered name, and forget the
-// seat once our player has left the lobby (the server turns that socket into a spectator).
+// seat once our player has left the lobby (returns 'left'; the caller goes home).
 // Only `welcome` creates remembered seats, so two tabs in one browser don't keep overwriting
 // each other's entry on every broadcast.
 function syncStoredSeat() {
-  if (!app.seat) return;
+  if (!app.seat) return null;
   const m = me();
   const remembered = getSessions()[app.gameId];
   if (m) {
@@ -395,8 +504,10 @@ function syncStoredSeat() {
   } else if (app.state.status === 'lobby') {
     clearTabSeat(app.gameId);
     forgetSession(app.gameId, app.seat.playerId);
-    app.seat = null; // a new JOIN gets a fresh seat via `welcome`
+    app.seat = null;
+    return 'left';
   }
+  return null;
 }
 
 function handleError(msg) {
@@ -414,11 +525,25 @@ function handleError(msg) {
     toast(`Game ${code} doesn't exist anymore.`, 'error');
     return;
   }
+  if (msg.code === 'ROOM_BUSY') {
+    // Too many spectators: the server didn't let this tab in. Staying would only repeat this every
+    // few seconds (the unattached socket is closed, net.js reconnects, same answer), so go home.
+    const code = codeOf(app.gameId);
+    goHome();
+    toast(`Too many people are watching game ${code} right now — try again in a little while.`, 'error', 8000);
+    return;
+  }
   if (msg.code === 'BAD_TOKEN') {
     clearTabSeat(app.gameId);
     forgetSession(app.gameId, app.seat?.playerId);
     app.seat = null;
     toast('Your saved seat is no longer valid — you are watching as a visitor.', 'error');
+    rerender();
+    return;
+  }
+  if (msg.code === 'STALE_STATE') {
+    // The click was meant for a state that has already changed (e.g. a timeout played the move).
+    toast('Too late — the game moved on.', 'info', 2500);
     rerender();
     return;
   }
@@ -469,7 +594,8 @@ function setBusy(on) {
 
 function act(type, payload = {}) {
   if (!app.conn || app.busy) return;
-  if (!app.conn.send({ type, ...payload })) {
+  const seq = SEQ_FREE.has(type) ? undefined : app.state?.seq;
+  if (!app.conn.send({ type, ...payload }, seq)) {
     toast('Not connected right now — please wait a moment.', 'error');
     return;
   }
@@ -502,19 +628,22 @@ function renderConn() {
 
 // Runs 4× a second: turn countdown (clock-skew corrected) and the reconnect countdown.
 function tick() {
+  const deadline = app.state?.status === 'active' ? app.state.turn.deadlineAt : null;
+  const left = deadline ? Math.max(0, Math.ceil((deadline - (Date.now() + app.clockOffset)) / 1000)) : 0;
+  const clock = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
   const cd = document.querySelector('[data-countdown]');
   if (cd) {
-    const deadline = app.state?.status === 'active' ? app.state.turn.deadlineAt : null;
     if (!deadline) {
       cd.hidden = true;
     } else {
-      const secs = Math.max(0, Math.ceil((deadline - (Date.now() + app.clockOffset)) / 1000));
-      const text = `⏱ ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
+      const text = `⏱ ${clock}`;
       if (cd.textContent !== text) cd.textContent = text;
       cd.hidden = false;
-      cd.classList.toggle('urgent', secs <= 10);
+      cd.classList.toggle('urgent', left <= 10);
     }
   }
+  const offline = document.querySelector('[data-offline-in]');
+  if (offline && deadline && offline.textContent !== clock) offline.textContent = clock;
   const retry = document.querySelector('[data-retry-in]');
   if (retry && app.net.retryAt) {
     retry.textContent = `${Math.max(0, Math.ceil((app.net.retryAt - Date.now()) / 1000))}s`;
@@ -620,7 +749,7 @@ async function createGame(event) {
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok || !body.gameId) throw new Error(body.message ?? body.error ?? `HTTP ${res.status}`);
-    openGame(body.gameId);
+    openGame(body.gameId, { autoJoin: { name } }); // the creator sits down right away (as host)
   } catch (err) {
     toast(`Couldn't create a game: ${err.message}`, 'error');
   } finally {
@@ -689,19 +818,21 @@ function renderLobby() {
   $('#lobby-note').hidden = notes.length === 0;
   setHtml($('#lobby-note'), notes.join(' '));
 
-  // Seated: host starts, anyone can leave.
+  // Seated: the host starts (or anyone the server lets start, e.g. while the host is offline); anyone can leave.
   let actions = '';
   if (m) {
-    if (s.hostId === m.id) {
+    if (s.hostId === m.id || can('START_GAME')) {
       actions += `<button type="button" class="btn primary" data-act="START_GAME"${disabledAttr(can('START_GAME') && ready())}>Start game</button>`;
-      if (!can('START_GAME')) actions += `<span class="hint">${s.players.length < 2 ? 'Need 2+ players to start.' : 'Waiting…'}</span>`;
+      if (s.hostId !== m.id) actions += '<span class="hint">The host is offline — you can start.</span>';
+      else if (!can('START_GAME')) actions += `<span class="hint">${s.players.length < 2 ? 'Need 2+ players to start.' : 'Waiting…'}</span>`;
     } else {
       const host = playerById(s, s.hostId);
       actions += `<span class="hint">Waiting for ${host ? esc(host.name) : 'the host'} to start the game…</span>`;
     }
-    if (can('LEAVE')) actions += `<button type="button" class="btn ghost" data-act="LEAVE"${disabledAttr(ready())}>Leave</button>`;
+    // lobbyOnly: if the game starts before this arrives, the server refuses it instead of resigning me.
+    if (can('LEAVE')) actions += `<button type="button" class="btn ghost" data-act="LEAVE" data-lobby-only${disabledAttr(ready())}>Leave</button>`;
   }
-  setHtml($('#lobby-actions'), actions);
+  setHtmlKeepFocus($('#lobby-actions'), actions);
 
   const st = s.settings;
   setHtml($('#lobby-settings'), [
@@ -758,6 +889,7 @@ function joinLobby(event) {
 function renderGame() {
   renderBanner();
   renderActions();
+  renderRecentLog();
   renderPlayers();
   renderProperties();
   renderFooter();
@@ -773,9 +905,9 @@ function renderBanner() {
   let title;
   if (s.status === 'finished') {
     const winner = playerById(s, s.winnerId);
-    title = winner ? (winner.id === m?.id ? '🏆 You win!' : `🏆 ${winner.name} wins!`) : 'Game over';
+    title = esc(winner ? (winner.id === m?.id ? '🏆 You win!' : `🏆 ${winner.name} wins!`) : 'Game over');
   } else {
-    title = mine ? myTurnText(s) : otherTurnText(s, cur);
+    title = mine ? esc(myTurnText(s)) : otherTurnHtml(s, cur);
   }
   const sub = [];
   if (s.status === 'active') sub.push(`Turn ${s.turn.number}`);
@@ -786,7 +918,7 @@ function renderBanner() {
     <div class="turn-banner${mine ? ' mine' : ''}" style="--pc:${cur && s.status === 'active' ? playerColor(s, cur.id) : 'var(--muted)'}">
       <span class="turn-token">${cur && s.status === 'active' ? tokenEmoji(cur.token) : '🏁'}</span>
       <div class="turn-text">
-        <div class="turn-title">${esc(title)}</div>
+        <div class="turn-title">${title}</div>
         <div class="turn-sub">${esc(sub.join(' · '))}</div>
       </div>
       <span class="countdown" data-countdown hidden></span>
@@ -797,7 +929,17 @@ function myTurnText(s) {
   const t = s.turn;
   switch (t.phase) {
     case 'rolling': return 'Your turn — roll the dice';
-    case 'jail_decision': return `You're in jail — pay ${money(BOARD.jailFine)}, use a card or roll for doubles`;
+    case 'jail_decision': {
+      // Only the options that are open right now (the fine needs the cash, the card needs a card).
+      const options = [
+        can('PAY_JAIL_FINE') && `pay ${money(BOARD.jailFine)}`,
+        can('USE_JAIL_CARD') && 'use a card',
+        'roll for doubles',
+      ].filter(Boolean);
+      const last = options.pop();
+      const list = options.length ? `${options.join(', ')} or ${last}` : last;
+      return `You're in jail — ${list}`;
+    }
     case 'buying_or_auction': return `Buy ${tileName(t.pendingPurchase)} for ${money(TILES[t.pendingPurchase]?.price)}?`;
     case 'paying': return `You owe ${money(t.pendingDebt?.amount)} — raise cash or declare bankruptcy`;
     case 'end_turn': return t.rollAgain ? 'Doubles! Roll again' : 'Build or mortgage if you like, then end your turn';
@@ -805,17 +947,31 @@ function myTurnText(s) {
   }
 }
 
-function otherTurnText(s, cur) {
+/** Banner text (HTML) while someone else is to move. */
+function otherTurnHtml(s, cur) {
   const t = s.turn;
   const name = cur?.name ?? 'the next player';
-  switch (t.phase) {
-    case 'rolling': return `Waiting for ${name} to roll…`;
-    case 'jail_decision': return `${name} is in jail and deciding what to do…`;
-    case 'buying_or_auction': return `${name} is deciding whether to buy ${tileName(t.pendingPurchase)}…`;
-    case 'paying': return `${name} owes ${money(t.pendingDebt?.amount)} and is raising cash…`;
-    case 'end_turn': return t.rollAgain ? `${name} rolled doubles and goes again…` : `Waiting for ${name} to finish their turn…`;
-    default: return `Waiting for ${name}…`;
+  if (cur && !cur.connected) {
+    // tick() fills in the countdown to the server's auto-play.
+    return t.deadlineAt
+      ? `${esc(name)} is offline — auto-play in <span data-offline-in></span>`
+      : `${esc(name)} is offline — waiting for them to come back…`;
   }
+  switch (t.phase) {
+    case 'rolling': return esc(`Waiting for ${name} to roll…`);
+    case 'jail_decision': return esc(`${name} is in jail and deciding what to do…`);
+    case 'buying_or_auction': return esc(`${name} is deciding whether to buy ${tileName(t.pendingPurchase)}…`);
+    case 'paying': return esc(`${name} owes ${money(t.pendingDebt?.amount)} and is raising cash…`);
+    case 'end_turn': return esc(t.rollAgain ? `${name} rolled doubles and goes again…` : `Waiting for ${name} to finish their turn…`);
+    default: return esc(`Waiting for ${name}…`);
+  }
+}
+
+/** Shown with the (disabled) buttons while the connection is down. */
+function netNoteHtml() {
+  const { status } = app.net;
+  if (status !== 'connecting' && status !== 'reconnecting') return '';
+  return '<p class="hint net-note">Reconnecting… actions are paused. <button type="button" class="linkish" data-ui="retry">Retry</button></p>';
 }
 
 function renderActions() {
@@ -823,11 +979,11 @@ function renderActions() {
   const m = me();
   const bar = $('#action-bar');
   if (s.status !== 'active') {
-    setHtml(bar, '<button type="button" class="btn primary block" data-ui="home">Back to home</button>');
+    setHtmlKeepFocus(bar, '<button type="button" class="btn primary block" data-ui="home">Back to home</button>');
     return;
   }
   if (!m) {
-    setHtml(bar, `<p class="note">👀 You're watching this game.${app.takeover ? ` ${takeoverLink()}` : ''}</p>`);
+    setHtmlKeepFocus(bar, `<p class="note">👀 You're watching this game.${app.takeover ? ` ${takeoverLink()}` : ''}</p>`);
     return;
   }
   if (m.bankrupt) {
@@ -858,39 +1014,67 @@ function renderActions() {
   if (can('DECLARE_BANKRUPTCY')) button('DECLARE_BANKRUPTCY', 'Declare bankruptcy', 'danger');
 
   let hint = '';
+  const canRaise = app.legal.mortgage.length > 0 || app.legal.sellHouse.length > 0;
   if (isMyTurn() && t.phase === 'buying_or_auction' && !can('BUY')) {
-    hint = 'Not enough cash to buy — mortgage or sell below, or decline.';
+    hint = canRaise ? 'Not enough cash to buy — mortgage or sell to raise it, or decline.' : 'Not enough cash to buy — decline.';
   } else if (isMyTurn() && t.phase === 'paying' && !can('PAY_DEBT')) {
-    hint = `Raise ${money(t.pendingDebt.amount - m.cash)} more by selling or mortgaging below.`;
+    hint = canRaise
+      ? `Raise ${money(t.pendingDebt.amount - m.cash)} more by selling or mortgaging.`
+      : 'Nothing left to sell or mortgage.';
   }
+  // Space can't end the turn while the dice and token are still moving; the tip returns after.
+  const hold = can('END_TURN') ? endTurnKeyHold() : 0;
+  clearTimeout(app.keyTimer);
+  if (hold > 0) app.keyTimer = setTimeout(rerender, hold + 20);
   const key = keyboardAction();
   const keyHint = key ? `<p class="hint kbd-hint">Tip: press <kbd>Space</kbd> to ${key === 'ROLL' ? 'roll' : 'end your turn'}.</p>` : '';
-  setHtml(bar, buttons.length
-    ? `<div class="action-buttons">${buttons.join('')}</div>${hint ? `<p class="hint">${hint}</p>` : keyHint}`
+  setHtmlKeepFocus(bar, buttons.length
+    ? `<div class="action-buttons">${buttons.join('')}</div>${netNoteHtml()}${hint ? `<p class="hint">${hint}</p>` : keyHint}`
     : '');
 }
 
+// Phones and narrow windows: the latest log lines in the panel (the board's own log is tiny there;
+// style.css hides this list on wide layouts).
+function renderRecentLog() {
+  const lines = Array.isArray(app.state.log) ? app.state.log.slice(-RECENT_LOG_LINES) : [];
+  setHtml($('#recent-log'), lines.map((line) => `<li>${esc(line)}</li>`).join(''));
+}
+
+// Every player's row opens (a <details>) to show their properties, so anyone — spectators
+// included — can check who owns what and what it rents for. Open rows stay open (app.expanded).
 function renderPlayers() {
   const s = app.state;
   const curId = s.status === 'active' ? currentPlayerId(s) : null;
   const myId = me()?.id;
-  setHtml($('#game-players'), s.players.map((p, i) => {
+  setHtmlKeepFocus($('#game-players'), s.players.map((p, i) => {
     const badges = [];
     if (p.inJail) badges.push('<span class="tag jail">🔒 In jail</span>');
     if (p.getOutOfJailCards > 0) badges.push(`<span class="tag goojf" title="Get Out of Jail Free cards">🎫 ${p.getOutOfJailCards}</span>`);
     if (!p.connected && !p.bankrupt) badges.push('<span class="tag off">offline</span>');
     if (p.id === s.winnerId) badges.push('<span class="tag set">winner</span>');
     const cls = ['prow', p.id === curId && 'current', p.bankrupt && 'bankrupt', !p.connected && 'offline'].filter(Boolean).join(' ');
-    return `<li class="${cls}" style="--pc:${PLAYER_COLORS[i % PLAYER_COLORS.length]}">
-      <span class="pdot"></span>
-      <span class="prow-token">${tokenEmoji(p.token)}</span>
-      <span class="prow-main">
-        <span class="prow-name">${esc(p.name)}${p.id === myId ? ' <span class="tag you">you</span>' : ''}</span>
-        <span class="prow-badges">${badges.join('')}</span>
-      </span>
-      <span class="prow-cash">${p.bankrupt ? 'Bankrupt' : money(p.cash)}</span>
+    return `<li style="--pc:${PLAYER_COLORS[i % PLAYER_COLORS.length]}">
+      <details class="pdetails" data-player="${esc(p.id)}"${app.expanded.has(p.id) ? ' open' : ''}>
+        <summary class="${cls}" title="Show ${esc(p.name)}'s properties">
+          <span class="pdot"></span>
+          <span class="prow-token">${tokenEmoji(p.token)}</span>
+          <span class="prow-main">
+            <span class="prow-name">${esc(p.name)}${p.id === myId ? ' <span class="tag you">you</span>' : ''}</span>
+            <span class="prow-badges">${badges.join('')}</span>
+          </span>
+          <span class="prow-cash">${p.bankrupt ? 'Bankrupt' : money(p.cash)}</span>
+          <span class="prow-chev" aria-hidden="true"></span>
+        </summary>
+        <div class="holdings">${holdingsHtml(s, p)}</div>
+      </details>
     </li>`;
   }).join(''));
+}
+
+function holdingsHtml(s, p) {
+  const owned = s.tiles.filter((t) => t.ownerId === p.id);
+  if (!owned.length) return `<p class="muted small">${p.bankrupt ? 'Out of the game — owns nothing.' : 'No properties yet.'}</p>`;
+  return groupsHtml(s, owned, false);
 }
 
 function renderProperties() {
@@ -900,29 +1084,45 @@ function renderProperties() {
   section.hidden = !m || m.bankrupt;
   if (section.hidden) return;
 
+  const live = s.status === 'active'; // a finished game shows what I ended with, without buttons
   const owned = s.tiles.filter((t) => t.ownerId === m.id);
-  const bankLine = `<div class="bank-line">Bank: ${s.bank.houses} houses · ${s.bank.hotels} hotels</div>`;
   if (!owned.length) {
-    setHtml($('#my-props'), `<p class="muted small">You don't own anything yet — land on an unowned property to buy it.</p>`);
+    setHtml($('#my-props'), `<p class="muted small">${live
+      ? "You don't own anything yet — land on an unowned property to buy it."
+      : 'You ended the game without properties.'}</p>`);
     return;
   }
+  const bankLine = live ? `<div class="bank-line">Bank: ${s.bank.houses} houses · ${s.bank.hotels} hotels</div>` : '';
+  setHtmlKeepFocus($('#my-props'), bankLine + groupsHtml(s, owned, live));
+}
+
+const groupKeyOf = (index) => (TILES[index].type === 'property' ? TILES[index].group : TILES[index].type);
+
+function groupMeta(key) {
+  const info = BOARD.groups[key];
+  return {
+    info,
+    name: info?.name ?? (key === 'railroad' ? 'Railroads' : 'Utilities'),
+    color: info?.color ?? (key === 'railroad' ? '#3d4448' : '#8a9199'),
+  };
+}
+
+/** Owned tiles grouped by color set (railroads and utilities last); `buttons` adds build/mortgage controls. */
+function groupsHtml(s, owned, buttons) {
   const groups = new Map();
   for (const ts of owned) {
-    const tile = TILES[ts.index];
-    const key = tile.type === 'property' ? tile.group : tile.type;
+    const key = groupKeyOf(ts.index);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(ts);
   }
-  setHtml($('#my-props'), bankLine + GROUP_ORDER
+  return GROUP_ORDER
     .filter((key) => groups.has(key))
-    .map((key) => groupHtml(s, key, groups.get(key)))
-    .join(''));
+    .map((key) => groupHtml(s, key, groups.get(key), buttons))
+    .join('');
 }
 
-function groupHtml(s, key, list) {
-  const info = BOARD.groups[key];
-  const name = info?.name ?? (key === 'railroad' ? 'Railroads' : 'Utilities');
-  const color = info?.color ?? (key === 'railroad' ? '#3d4448' : '#8a9199');
+function groupHtml(s, key, list, buttons) {
+  const { info, name, color } = groupMeta(key);
   const total = TILES.filter((t) => (info ? t.group === key : t.type === key)).length;
   const fullSet = !!info && list.length === total;
   return `<div class="pgroup" style="--gc:${color}">
@@ -930,11 +1130,11 @@ function groupHtml(s, key, list) {
       <span>${esc(name)}</span><span class="muted">${list.length}/${total}</span>
       ${fullSet ? '<span class="tag set">Full set</span>' : ''}
     </div>
-    ${list.sort((a, b) => a.index - b.index).map((ts) => propertyRow(s, ts, fullSet)).join('')}
+    ${list.sort((a, b) => a.index - b.index).map((ts) => propertyRow(s, ts, fullSet, buttons)).join('')}
   </div>`;
 }
 
-function propertyRow(s, ts, fullSet) {
+function propertyRow(s, ts, fullSet, withButtons) {
   const tile = TILES[ts.index];
   const i = ts.index;
   const L = app.legal;
@@ -943,14 +1143,19 @@ function propertyRow(s, ts, fullSet) {
     `<button type="button" class="btn small ${cls}" data-act="${type}" data-tile="${i}"${disabledAttr(ok && list.includes(i))}>${label}</button>`;
 
   const buttons = [];
-  if (tile.type === 'property' && fullSet && !ts.mortgaged && ts.houses < 5) {
-    buttons.push(button('BUILD', L.build, `${ts.houses === 4 ? 'Build hotel' : 'Build house'} −${money(tile.houseCost)}`));
+  if (withButtons) {
+    if (tile.type === 'property' && fullSet && !ts.mortgaged && ts.houses < 5) {
+      buttons.push(button('BUILD', L.build, `${ts.houses === 4 ? 'Build hotel' : 'Build house'} −${money(tile.houseCost)}`));
+    }
+    if (ts.houses > 0) {
+      buttons.push(button('SELL_HOUSE', L.sellHouse, `Sell ${ts.houses === 5 ? 'hotel' : 'house'} +${money(Math.floor(tile.houseCost / 2))}`));
+    }
+    if (!ts.mortgaged && ts.houses === 0) buttons.push(button('MORTGAGE', L.mortgage, `Mortgage +${money(tile.mortgage)}`));
+    if (ts.mortgaged) {
+      const canPay = ok && L.unmortgage.includes(i);
+      buttons.push(button('UNMORTGAGE', L.unmortgage, `Unmortgage −${money(unmortgageCost(i))}`, canPay ? 'primary' : ''));
+    }
   }
-  if (ts.houses > 0) {
-    buttons.push(button('SELL_HOUSE', L.sellHouse, `Sell ${ts.houses === 5 ? 'hotel' : 'house'} +${money(Math.floor(tile.houseCost / 2))}`));
-  }
-  if (!ts.mortgaged && ts.houses === 0) buttons.push(button('MORTGAGE', L.mortgage, `Mortgage +${money(tile.mortgage)}`));
-  if (ts.mortgaged) buttons.push(button('UNMORTGAGE', L.unmortgage, `Unmortgage −${money(unmortgageCost(i))}`, 'primary'));
 
   const status = ts.mortgaged ? '<span class="tag mort">Mortgaged</span>' : buildingsHtml(ts.houses);
   return `<div class="prop${ts.mortgaged ? ' mortgaged' : ''}">
@@ -976,142 +1181,216 @@ function renderFooter() {
 }
 
 // ---------------------------------------------------------------------------
-// Dialogs — floating cards over the board (never over the side panel), only for me.
-// Closing one just hides it; the same buttons stay available in the side panel.
+// Dialogs — only for me. On wide layouts they float low over the board (never over the side
+// panel or the dice); closing one just hides it, as the same buttons are in the side panel. On
+// narrow layouts (NARROW) the same information sits in the panel right above the action bar,
+// without repeating the action bar's buttons, so nothing covers the board.
 // ---------------------------------------------------------------------------
 
 function renderDialog() {
-  const layer = $('#dialog-layer');
-  const dialog = currentDialog();
-  const visible = !!dialog && !app.dismissed.has(dialog.key);
+  const narrow = NARROW.matches;
+  const box = narrow ? $('#panel-dialog') : $('#dialog-layer');
+  clearDialogBox(narrow ? $('#dialog-layer') : $('#panel-dialog'));
+  const dialog = currentDialog(narrow);
+  const visible = !!dialog && (narrow || !app.dismissed.has(dialog.key));
   const hold = app.dialogAt - Date.now();
   clearTimeout(app.dialogTimer);
   // A dialog that is already up just refreshes; a new one waits for the board's move animation.
-  if (!visible || (hold > 0 && layer.dataset.key !== dialog.key)) {
-    clearDialog();
+  if (!visible || (hold > 0 && box.dataset.key !== dialog.key)) {
+    clearDialogBox(box);
     if (visible) app.dialogTimer = setTimeout(renderDialog, hold);
     return;
   }
-  const alreadyShown = layer.dataset.key === dialog.key;
-  layer.dataset.key = dialog.key;
-  setHtml(layer, `<div class="dialog ${dialog.cls ?? ''}" role="dialog" aria-labelledby="dialog-title">
-    <button type="button" class="dialog-x" data-ui="dismiss" data-key="${esc(dialog.key)}" aria-label="Hide" title="Hide — the buttons stay in the side panel">×</button>
-    ${dialog.html}
-  </div>`);
+  const alreadyShown = box.dataset.key === dialog.key;
+  box.dataset.key = dialog.key;
+  // Updates (cash after each mortgage) must not scroll the dialog or its raise-cash list back up.
+  const scrollers = '.dialog, .raise-list';
+  const scrolled = alreadyShown ? [...box.querySelectorAll(scrollers)].map((e) => e.scrollTop) : [];
+  // While the connection is down, say first why the buttons are disabled.
+  const html = dialog.key === 'game-over' ? dialog.html : netNoteHtml() + dialog.html;
+  setHtmlKeepFocus(box, narrow
+    ? `<div class="panel-dialog ${dialog.cls ?? ''}" role="group" aria-label="${esc(dialog.label)}">${html}</div>`
+    : `<div class="dialog ${dialog.cls ?? ''}" role="dialog" aria-labelledby="dialog-title" tabindex="-1">
+        <button type="button" class="dialog-x" data-ui="dismiss" data-key="${esc(dialog.key)}" aria-label="Hide" title="Hide — the buttons stay in the side panel">×</button>
+        ${html}
+      </div>`);
+  box.querySelectorAll(scrollers).forEach((e, k) => { if (scrolled[k]) e.scrollTop = scrolled[k]; });
   // Only a newly opened dialog pops in; updates to the one on screen (cash, buttons) don't.
-  if (alreadyShown) layer.firstElementChild?.classList.add('shown');
+  if (alreadyShown) box.firstElementChild?.classList.add('shown');
+  else focusNewDialog(box, narrow);
+}
+
+// Keyboard users continue in a new dialog: if focus was lost to a re-render (after Roll) or is in
+// the action bar, move it to the dialog's main button (never a dangerous one). On narrow layouts
+// those buttons live in the action bar.
+function focusNewDialog(box, narrow) {
+  const active = document.activeElement;
+  const bar = $('#action-bar');
+  const fromBody = !active || active === document.body;
+  if (!fromBody && !(!narrow && bar.contains(active))) return;
+  const safe = '[data-act]:not(:disabled):not(.danger)';
+  const target = narrow
+    ? bar.querySelector(`.action-buttons ${safe}`)
+    : box.querySelector(`.dialog-btns ${safe}`) ?? box.querySelector('.dialog');
+  target?.focus({ preventScroll: true });
+}
+
+function clearDialogBox(box) {
+  setHtml(box, '');
+  delete box.dataset.key;
 }
 
 function clearDialog() {
-  const layer = $('#dialog-layer');
-  setHtml(layer, '');
-  delete layer.dataset.key;
+  clearDialogBox($('#dialog-layer'));
+  clearDialogBox($('#panel-dialog'));
 }
 
-function currentDialog() {
+function currentDialog(compact) {
   const s = app.state;
-  if (s.status === 'finished') return { key: 'game-over', cls: 'dialog-over', html: gameOverHtml(s) };
+  if (s.status === 'finished') return { key: 'game-over', cls: 'dialog-over', label: 'Final standings', html: gameOverHtml(s, compact) };
   const m = me();
   if (!m || m.bankrupt || !isMyTurn()) return null;
   const t = s.turn;
   if (t.phase === 'buying_or_auction' && t.pendingPurchase != null) {
-    return { key: `buy:${t.number}:${t.pendingPurchase}`, html: buyHtml(m, t.pendingPurchase) };
+    return { key: `buy:${t.number}:${t.pendingPurchase}`, label: 'Buy decision', html: buyHtml(m, t.pendingPurchase, compact) };
   }
   if (t.phase === 'paying' && t.pendingDebt) {
-    return { key: `debt:${t.number}:${t.pendingDebt.reason}:${t.pendingDebt.amount}`, html: debtHtml(s, m, t.pendingDebt) };
+    return {
+      key: `debt:${t.number}:${t.pendingDebt.reason}:${t.pendingDebt.amount}`,
+      label: 'Debt',
+      html: debtHtml(s, m, t.pendingDebt, compact),
+    };
   }
-  if (t.phase === 'jail_decision') return { key: `jail:${t.number}`, html: jailHtml(m) };
+  if (t.phase === 'jail_decision') return { key: `jail:${t.number}`, label: 'Jail', html: jailHtml(m, compact) };
   return null;
 }
 
-function buyHtml(m, index) {
+// `compact` = the panel version on narrow layouts: no title or buttons (the banner and the action
+// bar already have them).
+function buyHtml(m, index, compact) {
   const tile = TILES[index];
   const ok = ready();
   const short = tile.price - m.cash;
-  let hint = '';
-  if (!can('BUY')) {
-    hint = short > 0
-      ? `<p class="hint">You need ${money(short)} more. Mortgage or sell buildings under <em>My properties</em>, or decline.</p>`
-      : `<p class="hint">You can't buy this right now.</p>`;
-  }
-  return `<h3 id="dialog-title" class="dialog-title">Buy ${esc(tile.name)}?</h3>
-    ${deedHtml(tile)}
-    <div class="dialog-cash">You have <strong>${money(m.cash)}</strong></div>
-    <div class="dialog-btns">
+  let after = '';
+  if (short > 0) after = raiseCashHtml(short, 'Nothing left to sell or mortgage — you can only decline.');
+  else if (!can('BUY')) after = `<p class="hint">You can't buy this right now.</p>`;
+  // The deed's band is the dialog's heading, which keeps the card short enough to sit under the dice.
+  return `${deedHtml(tile, `Buy for ${money(tile.price)}?`)}
+    <div class="dialog-cash">You have <strong>${money(m.cash)}</strong>${short > 0 ? ` — <span class="neg">${money(short)} short</span>` : ''}</div>
+    ${compact ? '' : `<div class="dialog-btns">
       <button type="button" class="btn primary" data-act="BUY"${disabledAttr(ok && can('BUY'))}>Buy ${money(tile.price)}</button>
       <button type="button" class="btn" data-act="DECLINE"${disabledAttr(ok && can('DECLINE'))}>Decline</button>
-    </div>
-    ${hint}`;
+    </div>`}
+    ${after}`;
 }
 
-/** Title-deed card: color band, rent table, costs. */
-function deedHtml(tile) {
+/** Compact title deed: color band (with `heading` as the dialog title), rent on up to three lines, costs. */
+function deedHtml(tile, heading) {
   let band = '#3d4448';
-  let kicker = 'Title deed';
   let rows = [];
   if (tile.type === 'property') {
     band = BOARD.groups[tile.group]?.color ?? band;
     rows = [
-      ['Rent', money(tile.rent[0])],
-      ['With the full color set', money(tile.rent[0] * 2)],
-      ...[1, 2, 3, 4].map((n) => [`With ${n} house${n > 1 ? 's' : ''}`, money(tile.rent[n])]),
-      ['With a hotel', money(tile.rent[5])],
+      ['Rent', `${money(tile.rent[0])} · full set ${money(tile.rent[0] * 2)}`],
+      ['1–4 houses', tile.rent.slice(1, 5).map(money).join(' / ')],
+      ['Hotel', money(tile.rent[5])],
     ];
   } else if (tile.type === 'railroad') {
-    kicker = '🚂 Railroad';
-    rows = tile.rent.map((r, i) => [`If ${i + 1} railroad${i ? 's are' : ' is'} owned`, money(r)]);
+    rows = [[`🚂 1–${tile.rent.length} railroads`, tile.rent.map(money).join(' / ')]];
   } else if (tile.type === 'utility') {
     band = '#8a9199';
-    kicker = /water/i.test(tile.name) ? '🚰 Utility' : '💡 Utility';
-    rows = tile.multipliers.map((x, i) => [`If ${i + 1} utilit${i ? 'ies are' : 'y is'} owned`, `${x}× dice`]);
+    rows = [[/water/i.test(tile.name) ? '🚰 Rent' : '💡 Rent', `${tile.multipliers[0]}× dice · ${tile.multipliers[1]}× with both`]];
   }
-  const costs = [`Price ${money(tile.price)}`, tile.houseCost ? `Houses ${money(tile.houseCost)} each` : '', `Mortgage ${money(tile.mortgage)}`]
+  const costs = [tile.houseCost ? `Houses ${money(tile.houseCost)} each` : '', `Mortgage ${money(tile.mortgage)}`]
     .filter(Boolean).join(' · ');
   return `<div class="deed" style="--gc:${band};--gc-text:${textOn(band)}">
-    <div class="deed-band"><span class="deed-kicker">${kicker}</span><strong>${esc(tile.name)}</strong></div>
+    <div class="deed-band" id="dialog-title"><span class="deed-kicker">${esc(heading)}</span><strong>${esc(tile.name)}</strong></div>
     <table class="deed-rent">${rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')}</table>
     <div class="deed-foot">${costs}</div>
   </div>`;
 }
 
-function debtHtml(s, m, debt) {
+/**
+ * "Raise cash" buttons for when cash is short (buy or debt): sell a building or mortgage, straight
+ * from `legal`, so the player doesn't have to scroll to My properties.
+ */
+function raiseCashHtml(short, emptyText) {
+  const s = app.state;
+  const ok = ready();
+  const items = [
+    ...app.legal.sellHouse.map((i) => [i, 'SELL_HOUSE',
+      `Sell ${tileState(s, i)?.houses === 5 ? 'hotel' : 'house'} +${money(Math.floor(TILES[i].houseCost / 2))}`]),
+    ...app.legal.mortgage.map((i) => [i, 'MORTGAGE', `Mortgage +${money(TILES[i].mortgage)}`]),
+  ];
+  if (!items.length) return `<p class="hint">${emptyText}</p>`;
+  return `<div class="raise">
+    <div class="raise-head">Raise ${money(short)}</div>
+    <ul class="raise-list">${items.map(([i, type, label]) => `
+      <li style="--gc:${groupMeta(groupKeyOf(i)).color}">
+        <span class="raise-name">${esc(TILES[i].name)}</span>
+        <button type="button" class="btn small" data-act="${type}" data-tile="${i}"${disabledAttr(ok)}>${label}</button>
+      </li>`).join('')}
+    </ul>
+  </div>`;
+}
+
+function debtHtml(s, m, debt, compact) {
   const ok = ready();
   const creditor = debt.payees?.length ? 'the other players' : debt.toPlayerId ? playerName(s, debt.toPlayerId) : 'the bank';
   const reason = { rent: 'rent', tax: 'tax', card: 'a card', jail_fine: 'the jail fine' }[debt.reason] ?? String(debt.reason ?? '').replace(/_/g, ' ');
   const short = debt.amount - m.cash;
-  return `<h3 id="dialog-title" class="dialog-title">💸 You owe ${money(debt.amount)}</h3>
-    <p class="dialog-text">To <strong>${esc(creditor)}</strong>${reason ? ` for ${esc(reason)}` : ''}.</p>
+  return `${compact ? '' : `<h3 id="dialog-title" class="dialog-title">💸 You owe ${money(debt.amount)}</h3>`}
+    <p class="dialog-text">${compact ? `You owe ${money(debt.amount)} to` : 'To'} <strong>${esc(creditor)}</strong>${reason ? ` for ${esc(reason)}` : ''}.</p>
     <div class="dialog-cash">You have <strong>${money(m.cash)}</strong>${short > 0 ? ` — <span class="neg">${money(short)} short</span>` : ''}</div>
-    ${short > 0 ? '<p class="hint">Sell buildings or mortgage properties under <em>My properties</em> to raise the rest — or declare bankruptcy.</p>' : ''}
-    <div class="dialog-btns">
+    ${compact ? '' : `<div class="dialog-btns">
       <button type="button" class="btn primary" data-act="PAY_DEBT"${disabledAttr(ok && can('PAY_DEBT'))}>Pay ${money(debt.amount)}</button>
       <button type="button" class="btn danger" data-act="DECLARE_BANKRUPTCY"${disabledAttr(ok && can('DECLARE_BANKRUPTCY'))}>Declare bankruptcy</button>
-    </div>`;
+    </div>`}
+    ${short > 0 ? raiseCashHtml(short, 'Nothing left to sell or mortgage — you can only declare bankruptcy.') : ''}`;
 }
 
-function jailHtml(m) {
+function jailHtml(m, compact) {
   const ok = ready();
   const used = m.jailTurns ?? 0;
   const max = BOARD.maxJailTurns;
   const lastTry = used >= max - 1;
   const cards = m.getOutOfJailCards;
-  return `<h3 id="dialog-title" class="dialog-title">🔒 You're in jail</h3>
+  return `${compact ? '' : `<h3 id="dialog-title" class="dialog-title">🔒 You're in jail</h3>`}
     <p class="dialog-text">Doubles attempts used: <strong>${used} of ${max}</strong>.
       ${lastTry ? `Last try — if you miss, you pay ${money(BOARD.jailFine)} and move anyway.` : ''}</p>
     <div class="dialog-cash">You have <strong>${money(m.cash)}</strong>${cards ? ` · 🎫 ${cards} jail card${cards > 1 ? 's' : ''}` : ''}</div>
-    <div class="dialog-btns stack">
+    ${compact ? '' : `<div class="dialog-btns stack">
       <button type="button" class="btn primary" data-act="ROLL"${disabledAttr(ok && can('ROLL'))}>🎲 Roll for doubles</button>
       <button type="button" class="btn" data-act="PAY_JAIL_FINE"${disabledAttr(ok && can('PAY_JAIL_FINE'))}>Pay fine ${money(BOARD.jailFine)}</button>
       <button type="button" class="btn" data-act="USE_JAIL_CARD"${disabledAttr(ok && can('USE_JAIL_CARD'))}>🎫 Use jail card</button>
-    </div>`;
+    </div>`}`;
 }
 
-function gameOverHtml(s) {
+function gameOverHtml(s, compact) {
   const winner = playerById(s, s.winnerId);
   const iWon = !!winner && winner.id === me()?.id;
-  return `<h3 id="dialog-title" class="dialog-title">${iWon ? '🏆 You win!' : '🏁 Game over'}</h3>
-    ${winner ? `<p class="dialog-text">${tokenEmoji(winner.token)} ${esc(winner.name)} is the last player standing with ${money(winner.cash)}.</p>` : ''}
-    <div class="dialog-btns"><button type="button" class="btn primary" data-ui="home">Back to home</button></div>`;
+  return `${compact ? '' : `<h3 id="dialog-title" class="dialog-title">${iWon ? '🏆 You win!' : '🏁 Game over'}</h3>`}
+    ${standingsHtml(s)}
+    ${compact ? '' : '<div class="dialog-btns"><button type="button" class="btn primary" data-ui="home">Back to home</button></div>'}`;
+}
+
+/** Final standings: the winner, then other players still in by net worth, then bankrupt players in turn order. */
+function standingsHtml(s) {
+  const myId = me()?.id;
+  const inGame = s.players
+    .filter((p) => !p.bankrupt && p.id !== s.winnerId)
+    .sort((a, b) => netWorth(s, b.id) - netWorth(s, a.id));
+  const order = s.turn.order?.length ? s.turn.order : s.players.map((p) => p.id);
+  const out = order.map((id) => playerById(s, id)).filter((p) => p?.bankrupt && p.id !== s.winnerId);
+  const rows = [playerById(s, s.winnerId), ...inGame, ...out].filter(Boolean);
+  return `<ol class="standings">${rows.map((p) => `
+    <li class="${p.bankrupt ? 'out' : ''}" style="--pc:${playerColor(s, p.id)}">
+      <span class="pdot"></span>
+      <span class="st-token">${tokenEmoji(p.token)}</span>
+      <span class="st-name">${esc(p.name)}${p.id === myId ? ' <span class="tag you">you</span>' : ''}${p.id === s.winnerId ? ' <span class="tag set">winner</span>' : ''}</span>
+      <span class="st-worth"${p.bankrupt ? '' : ' title="Net worth: cash + property + buildings"'}>${p.bankrupt ? 'Bankrupt' : money(netWorth(s, p.id))}</span>
+    </li>`).join('')}
+  </ol>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,8 +1402,16 @@ function toast(text, kind = 'info', ms = 4500) {
   const el = document.createElement('div');
   el.className = `toast toast-${kind}`;
   el.setAttribute('role', kind === 'error' ? 'alert' : 'status');
-  el.textContent = text;
-  el.addEventListener('click', () => el.remove());
+  const message = document.createElement('span');
+  message.textContent = text;
+  // Toasts let clicks through to the buttons underneath (style.css); only the × is clickable.
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'toast-x';
+  close.setAttribute('aria-label', 'Dismiss');
+  close.textContent = '×';
+  close.addEventListener('click', () => el.remove());
+  el.append(message, close);
   box.append(el);
   while (box.children.length > 5) box.firstElementChild.remove();
   setTimeout(() => {
@@ -1133,7 +1420,11 @@ function toast(text, kind = 'info', ms = 4500) {
   }, ms);
 }
 
-/** Toasts for events that involve me (plus bankruptcies, which matter to everyone). */
+/**
+ * Toasts for events that involve me (plus bankruptcies, which matter to everyone) — but not for
+ * what I just did myself or what is already on screen (my purchase, my debt, the banner saying
+ * it's my turn): those would only pile up over the buttons.
+ */
 function announce(events) {
   const s = app.state;
   const myId = me()?.id;
@@ -1142,13 +1433,10 @@ function announce(events) {
     const mine = !!myId && ev.playerId === myId;
     switch (ev.type) {
       case 'turn_started':
-        if (mine) toast("🎲 It's your turn!", 'info', 2500);
+        if (mine && !document.hasFocus()) toast("🎲 It's your turn!", 'info', 2500);
         break;
       case 'passed_go':
         if (mine) toast(`You passed GO and collected ${money(ev.amount)}`, 'good');
-        break;
-      case 'bought':
-        if (mine) toast(`You bought ${tileName(ev.tileIndex)} for ${money(ev.price)}`, 'good');
         break;
       case 'paid_rent':
         if (mine) toast(`You paid ${money(ev.amount)} rent to ${name(ev.ownerId)} for ${tileName(ev.tileIndex)}`, 'bad');
@@ -1157,9 +1445,12 @@ function announce(events) {
       case 'paid_tax':
         if (mine) toast(`You paid ${money(ev.amount)} ${tileName(ev.tileIndex)}`, 'bad');
         break;
-      case 'paid': // card fees / jail fines; my own card fees are already explained by the card toast
-        if (mine && ev.reason !== 'card') toast(`You paid ${money(ev.amount)} to ${ev.toPlayerId ? name(ev.toPlayerId) : 'the bank'}`, 'bad');
-        else if (!mine && myId && ev.toPlayerId === myId) toast(`${name(ev.playerId)} paid you ${money(ev.amount)}`, 'good');
+      case 'paid': // card fees are explained by the card toast, jail fines by left_jail (or my own click)
+        if (mine && ev.reason !== 'card' && ev.reason !== 'jail_fine') {
+          toast(`You paid ${money(ev.amount)} to ${ev.toPlayerId ? name(ev.toPlayerId) : 'the bank'}`, 'bad');
+        } else if (!mine && myId && ev.toPlayerId === myId) {
+          toast(`${name(ev.playerId)} paid you ${money(ev.amount)}`, 'good');
+        }
         break;
       case 'collected':
         if (mine && ev.reason === 'free_parking') toast(`You collected the ${money(ev.amount)} Free Parking pot!`, 'good');
@@ -1167,8 +1458,7 @@ function announce(events) {
         else if (!mine && myId && ev.fromPlayerId === myId) toast(`You paid ${money(ev.amount)} to ${name(ev.playerId)}`, 'bad');
         break;
       case 'debt_paid':
-        if (mine) toast(`Debt of ${money(ev.amount)} paid`, 'good');
-        else if (myId && (ev.toPlayerId === myId || ev.payees?.some((x) => x.playerId === myId))) {
+        if (!mine && myId && (ev.toPlayerId === myId || ev.payees?.some((x) => x.playerId === myId))) {
           toast(`${name(ev.playerId)} paid what they owed you`, 'good');
         }
         break;
@@ -1181,11 +1471,9 @@ function announce(events) {
       case 'sent_to_jail':
         if (mine) toast(ev.reason === 'doubles' ? 'Three doubles in a row — go to jail! 🔒' : 'You were sent to jail 🔒', 'bad');
         break;
-      case 'left_jail':
-        if (mine) toast("You're out of jail!", 'good');
-        break;
-      case 'debt_started':
-        if (mine) toast(`You owe ${money(ev.amount)} — raise cash to pay it`, 'bad');
+      case 'left_jail': // paying the fine or using a card was my own click
+        if (mine && ev.method === 'doubles') toast("Doubles — you're out of jail!", 'good');
+        else if (mine && ev.method === 'forced_fine') toast(`Third miss — you paid the ${money(BOARD.jailFine)} fine and move on`, 'bad');
         break;
       case 'timeout':
         if (mine) toast("Time's up — the game played your turn for you", 'bad');
@@ -1225,13 +1513,28 @@ function takeOver() {
   app.conn.reconnect(); // the hello with these credentials moves the seat to this tab
 }
 
+function confirmText(type) {
+  if (type === 'DECLARE_BANKRUPTCY') {
+    const to = myCreditor()?.name ?? 'the bank';
+    return `Declare bankruptcy? Everything you own goes to ${to} and you are out of the game.`;
+  }
+  if (type === 'LEAVE' && app.state?.status === 'active') {
+    // Resigning while I owe one player hands my assets to them, as bankruptcy would.
+    const to = myCreditor()?.name ?? 'the bank';
+    return `Resign from this game? Your cash and properties go to ${to} and you are out of the game.`;
+  }
+  return null;
+}
+
 function onActionClick(el) {
   const type = el.dataset.act;
-  // LEAVE only needs a confirmation while the game is running (it means resigning).
-  const confirmText = type === 'LEAVE' && app.state?.status !== 'active' ? null : CONFIRM_TEXT[type];
-  if (confirmText && !window.confirm(confirmText)) return;
-  if (type === 'LEAVE' && app.state?.status === 'active') app.resigned = true;
-  act(type, el.dataset.tile != null ? { tileIndex: Number(el.dataset.tile) } : {});
+  const lobbyOnly = type === 'LEAVE' && el.dataset.lobbyOnly != null; // the lobby's Leave never resigns
+  const text = lobbyOnly ? null : confirmText(type);
+  if (text && !window.confirm(text)) return;
+  if (type === 'LEAVE' && !lobbyOnly && app.state?.status === 'active') app.resigned = true;
+  const payload = el.dataset.tile != null ? { tileIndex: Number(el.dataset.tile) } : {};
+  if (lobbyOnly) payload.lobbyOnly = true;
+  act(type, payload);
 }
 
 function onUiClick(el, event) {
@@ -1294,8 +1597,13 @@ function keyboardAction() {
   if (app.state?.status !== 'active') return null;
   const phase = app.state.turn.phase;
   if (can('ROLL') && (phase === 'rolling' || phase === 'end_turn')) return 'ROLL';
-  if (can('END_TURN')) return 'END_TURN';
+  if (can('END_TURN') && endTurnKeyHold() <= 0) return 'END_TURN';
   return null;
+}
+
+/** ms until Space/Enter may end the turn: not while my dice and token are still moving. */
+function endTurnKeyHold() {
+  return Math.max(app.dialogAt, app.lastRollAt + END_TURN_KEY_HOLD_MS) - Date.now();
 }
 
 function boot() {
@@ -1311,10 +1619,32 @@ function boot() {
   document.addEventListener('click', (event) => {
     const el = event.target.closest('[data-act], [data-ui]');
     if (!el || el.disabled || el.closest('#board')) return; // #board belongs to the renderer
-    if (el.dataset.act) onActionClick(el);
-    else onUiClick(el, event);
+    if (el.dataset.act) {
+      // A mouse or touch click (detail > 0) must not leave focus on the button, or on the control
+      // setHtmlKeepFocus moves it to (Unmortgage → Mortgage): Space/Enter would then press that
+      // instead of rolling or ending the turn. Keyboard presses (detail 0) keep their place.
+      if (event.detail > 0) {
+        el.blur();
+        app.focusMemo = null;
+      }
+      onActionClick(el);
+    } else {
+      onUiClick(el, event);
+    }
   });
   document.addEventListener('keydown', onKeyDown);
+  // Remember which players' holdings are open, so re-renders keep them open (toggle doesn't bubble).
+  document.addEventListener('toggle', (event) => {
+    const row = event.target;
+    if (!row.matches?.('details[data-player]') || !row.isConnected) return;
+    if (row.open) app.expanded.add(row.dataset.player);
+    else app.expanded.delete(row.dataset.player);
+  }, true);
+  document.addEventListener('focusin', () => { app.focusMemo = null; });
+  NARROW.addEventListener('change', () => {
+    clearDialog();
+    rerender();
+  });
   setInterval(tick, 250);
 
   const param = new URLSearchParams(location.search).get('game');

@@ -110,6 +110,37 @@ describe('failed actions leave the state untouched', () => {
     }
   });
 
+  test('the action type must be a string', () => {
+    const s = newGame();
+    reject(s, { type: ['ROLL'], playerId: 'p1' }, 'UNKNOWN_ACTION'); // would coerce to "ROLL" as a key
+    reject(s, { type: { toString: () => 'ROLL' }, playerId: 'p1' }, 'UNKNOWN_ACTION');
+    const res = applyAction(s, { type: Object.create(null), playerId: 'p1' }); // can't even be printed
+    assert.equal(res.error?.code, 'UNKNOWN_ACTION');
+    assert.equal(res.state, s);
+  });
+
+  test('an action is read once: it cannot validate as one action and run as another', () => {
+    const s = newGame();
+    const shifty = (first, then) => {
+      let reads = 0;
+      const action = { playerId: 'p1', get type() { reads += 1; return reads === 1 ? first : then; } };
+      return { action, reads: () => reads };
+    };
+    const a = shifty('ROLL', 'END_TURN'); // END_TURN would be rejected before rolling
+    const res = applyAction(s, a.action);
+    assert.ok(!res.error, JSON.stringify(res.error));
+    assert.equal(a.reads(), 1);
+    assert.ok(res.events.some((e) => e.type === 'dice_rolled'));
+    assert.ok(!res.events.some((e) => e.type === 'turn_ended'));
+
+    const b = shifty('END_TURN', 'ROLL');
+    const failed = applyAction(s, b.action);
+    assert.equal(b.reads(), 1);
+    assert.equal(failed.error?.code, 'WRONG_PHASE');
+    assert.equal(failed.state, s);
+    assert.deepEqual(failed.events, []);
+  });
+
   test('stub actions are NOT_IMPLEMENTED once the game is active', () => {
     const s = newGame();
     for (const type of ['START_AUCTION', 'BID', 'PROPOSE_TRADE', 'ACCEPT_TRADE', 'REJECT_TRADE']) {

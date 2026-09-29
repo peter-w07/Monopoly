@@ -19,6 +19,8 @@ const REPLAY_GAMES = 5;           // games whose recorded actions are replayed t
 const TIMEOUT_RATE = 0.03;        // share of steps where the server's TIMEOUT acts instead of the bot
 const EXPLORE_RATE = 0.05;        // share of steps where a random listed action replaces the bot's choice
 const RESIGN_RATE = 1 / 3000;     // chance per step that an off-turn player resigns (LEAVE)
+const PAYING_RESIGN_RATE = 0.02;  // the same while a debt is pending (the debtor may resign too), to exercise
+                                  // debts owed to or by a player who resigns
 const LEGAL_CHECK_EVERY = 50;     // every n-th step, cross-check the whole legalActions list
 
 const PLAY_PHASES = ['rolling', 'jail_decision', 'buying_or_auction', 'paying', 'end_turn'];
@@ -28,6 +30,7 @@ const MANAGEMENT = { build: 'BUILD', sellHouse: 'SELL_HOUSE', mortgage: 'MORTGAG
 const OWNABLE = BOARD.tiles.filter((t) => ['property', 'railroad', 'utility'].includes(t.type)).map((t) => t.index);
 const GROUPS = Object.keys(BOARD.groups).map((g) => groupIndices(g)).filter((g) => g.length > 0);
 const DECK_SIZE = 16;
+const POT_REASONS = ['tax', 'card', 'jail_fine']; // bank payments that feed the free-parking pot (CONTRACT §4.6)
 
 // ---------------------------------------------------------------------------
 // Playing a game
@@ -56,12 +59,14 @@ function startGame(seed, rng) {
 
 /**
  * The next action: usually the current player's bot; sometimes a TIMEOUT, a random listed action
- * (reaching moves a sensible bot never makes, e.g. building while poor) or an off-turn resignation.
+ * (reaching moves a sensible bot never makes, e.g. building while poor) or a resignation (by an
+ * off-turn player, or while a debt is pending also by the debtor).
  */
 function nextAction(state, rng, step, where) {
   const pid = currentPlayerId(state);
-  if (nextFloat(rng) < RESIGN_RATE) {
-    const others = state.players.filter((p) => !p.bankrupt && p.id !== pid);
+  const paying = state.turn.phase === 'paying';
+  if (nextFloat(rng) < (paying ? PAYING_RESIGN_RATE : RESIGN_RATE)) {
+    const others = state.players.filter((p) => !p.bankrupt && (paying || p.id !== pid));
     const quitter = others[nextInt(rng, 0, others.length - 1)];
     assert.ok(legalActions(state, quitter.id).actions.includes('LEAVE'), `${where}: LEAVE not listed for ${quitter.id}`);
     return { type: 'LEAVE', playerId: quitter.id };
@@ -98,6 +103,7 @@ function playGame(seed, { record = false } = {}) {
   let snapshot = jsonSnapshot(state, `seed ${seed} start`);
   const actions = [];
   const events = [];
+  const turn = { open: true }; // START_GAME opened the first turn
   let steps = 0;
   for (; steps < MAX_ACTIONS && state.status === 'active'; steps++) {
     const where = `seed ${seed} step ${steps}`;
@@ -106,13 +112,15 @@ function playGame(seed, { record = false } = {}) {
     if (!sameJson(state, snapshot)) assert.fail(`${where}: ${JSON.stringify(action)} mutated its input state`);
     if (res.state === state || res.state.seq !== state.seq + 1) assert.fail(`${where}: expected a new state with seq + 1`);
     snapshot = jsonSnapshot(res.state, where);
-    checkInvariants(res.state, where, action);
+    checkInvariants(res.state, where, action, state, res.events);
+    checkEvents(state, res.state, res.events, turn, where, action);
     if (record) {
       actions.push(action);
       events.push(res.events);
     }
     state = res.state;
   }
+  if (state.status === 'finished') assert.ok(!turn.open, `seed ${seed}: the last turn never got a turn_ended`);
   // jsonSnapshot checks JSON-safety at every step; do one real round trip per game as well.
   assert.deepStrictEqual(JSON.parse(JSON.stringify(state)), state, `seed ${seed}: JSON round trip lost data`);
   return { start, state, steps, actions, events };
@@ -193,10 +201,15 @@ function sameJson(a, b) {
   return true;
 }
 
-function checkInvariants(s, where, action) {
-  const expect = (ok, message) => {
+function failer(where, action) {
+  return (ok, message) => {
     if (!ok) assert.fail(`${where} after ${JSON.stringify(action)}: ${typeof message === 'function' ? message() : message}`);
   };
+}
+
+/** `prev` is the state the action was applied to, `events` what it emitted. */
+function checkInvariants(s, where, action, prev, events) {
+  const expect = failer(where, action);
   const t = s.turn;
   const alive = s.players.filter((p) => !p.bankrupt);
   const tileAt = new Map(s.tiles.map((tile) => [tile.index, tile]));
@@ -262,9 +275,18 @@ function checkInvariants(s, where, action) {
   expect(s.bank.houses + houses === BOARD.bankHouses, () => `houses not conserved: bank ${s.bank.houses} + board ${houses}`);
   expect(s.bank.hotels + hotels === BOARD.bankHotels, () => `hotels not conserved: bank ${s.bank.hotels} + board ${hotels}`);
   if (s.settings.evenBuild) {
+    // An even group only turns uneven when a hotel is sold while the bank is short of houses: it
+    // breaks into fewer than 4 houses (a sale of more than one level). The even-build/sell rules
+    // then steer the group back to even.
+    const spread = (state, group) => {
+      const levels = group.map((i) => state.tiles.find((tile) => tile.index === i).houses);
+      return Math.max(...levels) - Math.min(...levels);
+    };
     for (const group of GROUPS) {
-      const levels = group.map((i) => tileAt.get(i).houses);
-      expect(Math.max(...levels) - Math.min(...levels) <= 1, () => `uneven group ${group}: ${levels}`);
+      if (spread(s, group) <= 1 || spread(prev, group) > 1) continue;
+      const shortageSale = events.some((e) => e.type === 'sold_house' && group.includes(e.tileIndex)
+        && e.amount > Math.floor(getTile(e.tileIndex).houseCost / 2));
+      expect(shortageSale, () => `group ${group} became uneven: ${group.map((i) => tileAt.get(i).houses)}`);
     }
   }
 
@@ -279,6 +301,68 @@ function checkInvariants(s, where, action) {
   expect(Number.isInteger(s.pot) && s.pot >= 0, () => `pot ${s.pot}`);
   expect(s.settings.freeParkingPot || s.pot === 0, 'pot used while freeParkingPot is off');
   expect(s.log.length <= 100, () => `log has ${s.log.length} lines`);
+}
+
+/**
+ * Events are enough for an event-driven renderer: replaying one action's money events on the old
+ * cash and pot gives exactly the new cash and pot, and turn_started / turn_ended alternate
+ * (`turn.open` carries that across actions).
+ */
+function checkEvents(prev, next, events, turn, where, action) {
+  const expect = failer(where, action);
+  const cash = new Map(prev.players.map((p) => [p.id, p.cash]));
+  const add = (playerId, amount) => cash.set(playerId, cash.get(playerId) + amount);
+  let pot = prev.pot;
+  const toBank = (reason, amount) => {
+    if (prev.settings.freeParkingPot && POT_REASONS.includes(reason)) pot += amount;
+  };
+  for (const e of events) {
+    switch (e.type) {
+      case 'passed_go': add(e.playerId, e.amount); break;
+      case 'bought': add(e.playerId, -e.price); break;
+      case 'paid_rent': add(e.playerId, -e.amount); add(e.ownerId, e.amount); break;
+      case 'paid_tax': add(e.playerId, -e.amount); toBank('tax', e.amount); break;
+      case 'paid':
+        add(e.playerId, -e.amount);
+        if (e.toPlayerId) add(e.toPlayerId, e.amount);
+        else toBank(e.reason, e.amount);
+        break;
+      case 'collected':
+        add(e.playerId, e.amount);
+        if (e.fromPlayerId) add(e.fromPlayerId, -e.amount);
+        else if (e.reason === 'free_parking') pot -= e.amount;
+        break;
+      case 'built': add(e.playerId, -getTile(e.tileIndex).houseCost); break;
+      case 'sold_house':
+      case 'mortgaged': add(e.playerId, e.amount); break;
+      case 'unmortgaged': add(e.playerId, -e.amount); break;
+      case 'debt_paid':
+        add(e.playerId, -e.amount);
+        if (e.payees) for (const payee of e.payees) add(payee.playerId, payee.amount);
+        else if (e.toPlayerId) add(e.toPlayerId, e.amount);
+        else toBank(e.reason, e.amount);
+        break;
+      case 'bankrupt':
+        expect(cash.get(e.playerId) === e.cash, () => `bankrupt.cash ${e.cash}, events give ${cash.get(e.playerId)}`);
+        cash.set(e.playerId, 0);
+        if (e.toPlayerId) add(e.toPlayerId, e.cash);
+        break;
+      case 'turn_started':
+        expect(!turn.open, 'turn_started while a turn is open');
+        turn.open = true;
+        break;
+      case 'turn_ended':
+        expect(turn.open, 'turn_ended without an open turn');
+        turn.open = false;
+        break;
+      default:
+        break;
+    }
+  }
+  for (const p of next.players) {
+    expect(cash.get(p.id) === p.cash, () => `${p.id} cash ${p.cash}, events give ${cash.get(p.id)}: ${JSON.stringify(events)}`);
+  }
+  expect(pot === next.pot, () => `pot ${next.pot}, events give ${pot}: ${JSON.stringify(events)}`);
 }
 
 /** Every listed action succeeds and every unlisted turn / management action fails (CONTRACT §5). */

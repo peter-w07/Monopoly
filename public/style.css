@@ -399,6 +399,32 @@ kbd {
 .presence { flex: none; width: 9px; height: 9px; border-radius: 50%; background: var(--muted); opacity: .45; }
 .presence.on { background: var(--ok); opacity: 1; }
 
+/* Game panel: each player row opens to show their properties */
+.pdetails > summary { list-style: none; cursor: pointer; }
+.pdetails > summary::-webkit-details-marker { display: none; }
+.pdetails > summary:hover { background: var(--surface-3); }
+.pdetails > summary.current:hover { background: color-mix(in srgb, var(--pc) 20%, var(--surface)); }
+.pdetails[open] > summary { border-bottom-right-radius: 0; border-bottom-left-radius: 0; }
+.prow-chev {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin: 0 3px 3px 0;
+  border-right: 2px solid var(--muted);
+  border-bottom: 2px solid var(--muted);
+  transform: rotate(45deg);
+  transition: transform .15s;
+}
+.pdetails[open] .prow-chev { margin-bottom: -3px; transform: rotate(-135deg); }
+.holdings {
+  padding: 8px 8px 0;
+  border: 1px solid var(--border);
+  border-top: 0;
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+  background: var(--surface);
+}
+.holdings > .muted { margin: 0 0 8px; }
+
 /* ---------------------------------------------------------------- game layout */
 
 .screen-game { padding: 0; }
@@ -474,6 +500,28 @@ kbd {
 .action-bar:empty { display: none; }
 .action-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
 .action-buttons .btn { flex: 1 1 140px; min-height: 44px; }
+.net-note { color: var(--warn); }
+.dialog > .net-note { margin: 0 34px 8px 0; } /* beside the × */
+.panel-dialog > .net-note { margin-bottom: 6px; }
+
+/* Narrow layouts: dialog content inside the panel, above the action bar (see renderDialog) */
+.panel-dialog-slot:empty { display: none; }
+.panel-dialog {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.panel-dialog .deed { margin: 0 0 8px; background: var(--surface); }
+.panel-dialog .deed-kicker { display: none; } /* the turn banner right above asks the question */
+.panel-dialog .deed-rent td { padding: 2px 10px; }
+.panel-dialog .dialog-text { margin: 0; }
+.panel-dialog .dialog-cash { margin: 4px 0 0; }
+.panel-dialog .raise { margin-top: 6px; }
+.panel-dialog .raise-list { max-height: 136px; overflow: auto; }
+
+/* Narrow layouts: the latest log lines */
+.recent-log { display: none; }
 
 /* My properties */
 .bank-line { margin-bottom: 8px; color: var(--muted); font-size: 12px; }
@@ -503,7 +551,8 @@ kbd {
 
 /* ---------------------------------------------------------------- dialogs (over the board) */
 
-/* Anchored low in the board's centre so the renderer's dice stay visible above the card. */
+/* Anchored low on the board and at most ~43% of its height (scrolling inside), so the renderer's
+   turn pill and dice in the upper middle stay visible above the card. */
 .dialog-layer {
   position: absolute;
   inset: 0;
@@ -511,15 +560,15 @@ kbd {
   display: flex;
   align-items: flex-end;
   justify-content: center;
-  padding: 11%;
+  padding: 0 11% 3%;
   pointer-events: none; /* the board stays clickable around the card */
 }
 .dialog-layer:empty { display: none; }
 
 .dialog {
   position: relative;
-  width: min(340px, 100%);
-  max-height: 100%;
+  width: min(360px, 100%);
+  max-height: 44%;
   overflow: auto;
   padding: 16px;
   border: 1px solid var(--border);
@@ -531,15 +580,18 @@ kbd {
   animation: pop .18s ease-out;
 }
 .dialog.shown { animation: none; }
+.dialog:focus { outline: none; } /* focused as a whole only when none of its buttons can take focus */
 .dialog-x {
   position: absolute;
   top: 8px;
   right: 8px;
   width: 28px;
   height: 28px;
+  z-index: 1;
   border: 0;
   border-radius: 50%;
-  background: transparent;
+  background: var(--surface);
+  box-shadow: var(--shadow);
   color: var(--muted);
   font-size: 20px;
   line-height: 1;
@@ -548,7 +600,7 @@ kbd {
 .dialog-x:hover { background: var(--surface-3); color: var(--text); }
 .dialog-title { margin: 0 28px 8px 0; font-size: 18px; }
 .dialog-text { margin: 0 0 8px; }
-.dialog-cash { margin: 8px 0 12px; font-size: 14px; }
+.dialog-cash { margin: 8px 0 10px; font-size: 14px; }
 .dialog-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
 .dialog-btns .btn { flex: 1 1 120px; min-height: 42px; }
 .dialog-btns.stack { flex-direction: column; }
@@ -557,18 +609,39 @@ kbd {
 .neg { color: var(--danger); font-weight: 700; }
 
 /* Game over: a compact card low on the board, so the renderer's winner banner stays visible. */
-.dialog-over { text-align: center; }
-.dialog-over .dialog-title { margin: 0 0 8px; font-size: 20px; }
+.dialog-over .dialog-title { margin: 0 28px 10px 0; font-size: 20px; }
 
-.deed { overflow: hidden; margin: 10px 0; border: 1px solid var(--border); border-radius: 10px; }
-.deed-band { padding: 8px 10px; background: var(--gc); color: var(--gc-text, #fff); text-align: center; }
-.deed-band strong { display: block; font-size: 16px; }
+.deed { overflow: hidden; margin: 8px 0; border: 1px solid var(--border); border-radius: 10px; }
+.dialog .deed:first-of-type { margin-top: 0; }
+.dialog .deed-band { padding-inline: 34px; } /* room for the × */
+.deed-band { padding: 5px 10px; background: var(--gc); color: var(--gc-text, #fff); text-align: center; }
+.deed-band strong { display: block; font-size: 15px; }
 .deed-kicker { display: block; font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; opacity: .85; }
 .deed-rent { width: 100%; border-collapse: collapse; font-size: 13px; }
-.deed-rent td { padding: 3px 12px; }
-.deed-rent td:last-child { font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.deed-rent td { padding: 3px 10px; }
+.deed-rent td:first-child { color: var(--muted); white-space: nowrap; }
+.deed-rent td:last-child { font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
 .deed-rent tr:nth-child(odd) td { background: var(--surface-2); }
-.deed-foot { padding: 6px 12px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; text-align: center; }
+.deed-foot { padding: 4px 10px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; text-align: center; }
+
+/* "Raise cash" list in the buy and debt dialogs */
+.raise { margin-top: 8px; }
+.raise-head { margin-bottom: 6px; color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.raise-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.raise-list li { display: flex; align-items: center; gap: 8px; padding-left: 8px; border-left: 4px solid var(--gc); }
+.raise-name { flex: 1; min-width: 0; overflow: hidden; font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.raise-list .btn { flex: none; }
+
+/* Final standings (game-over dialog) */
+.standings { display: grid; gap: 6px; margin: 0 0 12px; padding: 0; list-style: none; counter-reset: rank; }
+.standings li { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: var(--radius-sm); background: var(--surface-2); counter-increment: rank; }
+.standings li::before { content: counter(rank); width: 1.1em; color: var(--muted); font-weight: 700; text-align: right; }
+.standings li:first-child:not(.out) { background: color-mix(in srgb, var(--pc) 14%, var(--surface)); box-shadow: inset 0 0 0 1px var(--pc); }
+.standings li.out { opacity: .6; }
+.st-token { font-size: 18px; line-height: 1; }
+.st-name { flex: 1; min-width: 0; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.st-worth { font-weight: 800; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.standings li.out .st-worth { color: var(--muted); font-weight: 600; }
 
 /* ---------------------------------------------------------------- toasts */
 
@@ -582,8 +655,10 @@ kbd {
   width: min(360px, calc(100vw - 32px));
   pointer-events: none;
 }
+/* Clicks go through a toast to whatever is underneath; only its × catches them. */
 .toast {
-  padding: 10px 14px;
+  position: relative;
+  padding: 10px 36px 10px 14px;
   border: 1px solid var(--border);
   border-left: 4px solid var(--muted);
   border-radius: 10px;
@@ -591,11 +666,26 @@ kbd {
   color: var(--text);
   box-shadow: var(--shadow-lg);
   font-size: 14px;
-  pointer-events: auto;
-  cursor: pointer;
+  pointer-events: none;
   animation: toast-in .2s ease-out;
   transition: opacity .3s, transform .3s;
 }
+.toast-x {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.toast-x:hover { background: var(--surface-3); color: var(--text); }
 .toast-good { border-left-color: var(--ok); }
 .toast-bad { border-left-color: var(--warn); }
 .toast-error { border-left-color: var(--danger); }
@@ -615,11 +705,41 @@ kbd {
 
 /* ---------------------------------------------------------------- responsive */
 
+/* Wide game layout: toasts sit top-left over the board column, never over the side panel. */
+@media (min-width: 900px) {
+  body[data-screen="game"] .toasts {
+    top: calc(var(--topbar-h) + var(--gap));
+    right: auto;
+    bottom: auto;
+    left: var(--gap);
+    width: min(340px, calc(100vw - var(--panel-w) - 5 * var(--gap)));
+  }
+}
+
+/* Single column: the panel sits under the board, and dialogs move into it (ui.js NARROW). */
 @media (max-width: 899px) {
   .game-layout { grid-template-columns: minmax(0, 1fr); max-width: 720px; padding: 8px; gap: 12px; }
   .board-wrap { width: 100%; min-width: 0; }
   .panel { position: static; max-height: none; min-height: 0; overflow: visible; }
-  .dialog-layer { padding: 6%; }
+  .dialog-layer { display: none; }
+  .recent-log {
+    display: grid;
+    gap: 2px;
+    margin: 0;
+    padding: 8px 12px;
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.4;
+    list-style: none;
+  }
+  .recent-log:empty { display: none; }
+  .recent-log li:last-child { color: var(--text); font-weight: 600; }
+  /* Toasts: compact, at the top (the action bar is further down), at most three. */
+  .toasts { top: calc(var(--topbar-h) + 8px); right: 8px; bottom: auto; left: 8px; width: auto; max-width: 520px; margin: 0 auto; gap: 6px; }
+  .toast { padding: 7px 34px 7px 11px; font-size: 13px; }
+  .toast:nth-last-child(n + 4) { display: none; }
 }
 
 @media (max-width: 700px) {
@@ -627,17 +747,28 @@ kbd {
 }
 
 @media (max-width: 520px) {
-  .screen { padding: 16px 12px 40px; }
+  .screen:not(.screen-game) { padding: 16px 12px 40px; } /* the game screen keeps its 8px edges: a bigger board */
   .topbar { gap: 8px; padding: 0 10px; }
+  /* Tighter panel, so a dialog's raise-cash list and the action bar fit on one phone screen */
+  .panel { gap: 10px; padding: 10px; }
+  .turn-banner { padding: 8px 10px; }
+  .turn-title { font-size: 14px; }
+  .panel-dialog .raise-head { display: none; } /* the "$X short" line says it */
+  .panel-dialog .raise-list { max-height: 112px; }
   .brand { font-size: 16px; }
   body:not([data-screen="home"]) .brand-text { display: none; }
   .code-chip-label { display: none; }
   .settings-grid { grid-template-columns: 1fr; }
-  .dialog-layer { padding: 3%; }
-  .dialog { padding: 12px; }
-  .toasts { right: 8px; bottom: 8px; left: 8px; width: auto; }
 }
 
 @media (hover: none) {
   .kbd-hint { display: none; }
+}
+
+/* Touch screens: bigger targets for the small buttons */
+@media (pointer: coarse) {
+  .btn.small { min-height: 40px; }
+  .prop-btns { gap: 10px; }
+  .dialog-x { width: 40px; height: 40px; }
+  .toast-x { width: 34px; height: 34px; top: 2px; right: 2px; }
 }

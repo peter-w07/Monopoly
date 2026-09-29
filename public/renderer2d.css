@@ -15,6 +15,8 @@
   --r2d-house: #1f9d48;
   --r2d-hotel: #d8232f;
   --r2d-token-bg: #fff;
+  --r2d-info-bg: #ffffff;
+  --r2d-info-ring: #2b7de9;
 
   position: relative;
   box-sizing: border-box;
@@ -140,6 +142,9 @@
   overflow-wrap: anywhere;
   hyphens: auto;
 }
+.r2d-name-short {
+  display: none; /* phone boards only, see the end of this file */
+}
 
 .r2d-icon {
   font-size: clamp(8px, 2.5cqi, 30px);
@@ -201,6 +206,14 @@
   box-shadow: 0 1px 3px rgb(0 0 0 / 0.4);
 }
 .r2d-tile.is-mortgaged .r2d-mbadge { display: grid; }
+
+.r2d-tile {
+  cursor: pointer; /* opens the tile info card */
+}
+.r2d-tile.is-inspected {
+  z-index: 3;
+  box-shadow: inset 0 0 0 max(2px, 0.35cqi) var(--r2d-info-ring);
+}
 
 /* The tile awaiting a buy/decline decision. */
 .r2d-tile.is-pending {
@@ -625,6 +638,51 @@
   opacity: 0.8;
 }
 
+/* ---- tile info card (tap a tile) ---------------------------------------------- */
+
+.r2d-info {
+  position: absolute;
+  z-index: 8;
+  width: clamp(150px, 36cqi, 270px);
+  overflow: hidden;
+  border: 1px solid var(--r2d-line);
+  border-radius: max(6px, 1.2cqi);
+  background: var(--r2d-info-bg);
+  box-shadow: 0 1cqi 3.5cqi rgb(0 0 0 / 0.35);
+  color: var(--r2d-ink);
+  font-size: clamp(11px, 1.6cqi, 15px);
+  line-height: 1.35;
+  cursor: pointer;
+}
+.r2d-info-head {
+  padding: 0.45em 0.75em;
+  border-bottom: 1px solid var(--r2d-line);
+  background: var(--band, var(--r2d-green));
+}
+.r2d-info-name {
+  display: inline-block;
+  padding: 0.05em 0.4em;
+  border-radius: 4px;
+  background: var(--r2d-info-bg);
+  font-weight: 800;
+}
+.r2d-info-status {
+  padding: 0.45em 0.75em 0.2em;
+  font-weight: 600;
+}
+.r2d-info-owner {
+  padding-left: 0.5em;
+  border-left: 0.35em solid var(--owner);
+}
+.r2d-info-rent {
+  font-weight: 800;
+}
+.r2d-info-facts {
+  padding: 0.3em 0.75em 0.5em;
+  color: var(--r2d-muted);
+  font-size: 0.88em;
+}
+
 /* ---- small boards (phones): drop decoration that can't fit ------------------- */
 
 @container (max-width: 480px) {
@@ -632,6 +690,29 @@
   .r2d-side-left .r2d-icon,
   .r2d-side-right .r2d-icon {
     display: none;
+  }
+  /* Full names would render at ~5px: show whole-word short labels instead (tap a tile for its full
+     name). Chance and Community Chest go by their icon. */
+  .r2d-name {
+    font-size: max(7px, 1.9cqi);
+    overflow-wrap: normal;
+    hyphens: manual;
+  }
+  .r2d-name-full {
+    display: none;
+  }
+  .r2d-name-short {
+    display: inline;
+    letter-spacing: -0.02em;
+  }
+  .r2d-type-chance .r2d-name,
+  .r2d-type-community .r2d-name,
+  .r2d-tax-pay {
+    display: none;
+  }
+  .r2d-price,
+  .r2d-clabel {
+    font-size: max(7px, 1.6cqi);
   }
 }
 
@@ -647,6 +728,8 @@
     --r2d-panel: rgb(16 24 19 / 0.78);
     --r2d-accent: #e0303f;
     --r2d-token-bg: #f2f2ee;
+    --r2d-info-bg: #1b221e;
+    --r2d-info-ring: #6aa8ff;
   }
   .r2d-card {
     background: #3a2a12;

@@ -4,11 +4,18 @@
 // and reconnects with exponential backoff + full random jitter so a server restart doesn't cause
 // a reconnect stampede. It never reconnects after the server says this seat was opened
 // elsewhere (close code 4000 / error REPLACED); the UI offers "Use here" instead.
+//
+// A socket can also die silently (laptop asleep, phone locked, Wi-Fi changed): it still looks open
+// but nothing arrives. So every connect and every ping must be answered within DEAD_AFTER_MS, and
+// when the tab becomes visible again or the network comes back, a socket that isn't open or has
+// been quiet for too long is replaced right away instead of waiting out the backoff.
 
 const BASE_DELAY_MS = 500;
 const MAX_DELAY_MS = 15_000;
 const STABLE_AFTER_MS = 10_000; // a connection that survives this long resets the backoff
 const PING_EVERY_MS = 25_000;
+const DEAD_AFTER_MS = 10_000; // no message this long after opening or a ping = dead socket
+const QUIET_AFTER_MS = 30_000; // on wake / online: silence longer than this = reconnect now
 const CLOSE_REPLACED = 4000;
 
 /**
@@ -24,7 +31,7 @@ const CLOSE_REPLACED = 4000;
  * @param {(s: {status: string, retryAt?: number}) => void} [handlers.onStatus]
  *        status: 'connecting' | 'connected' | 'reconnecting' | 'replaced' | 'closed';
  *        retryAt (epoch ms) is set while waiting to retry.
- * @returns {{ send(action: object): boolean, reconnect(): void, close(): void }}
+ * @returns {{ send(action: object, seq?: number): boolean, reconnect(): void, close(): void }}
  */
 export function connectGame(gameId, handlers) {
   let ws = null;
@@ -33,6 +40,9 @@ export function connectGame(gameId, handlers) {
   let retryTimer = null;
   let stableTimer = null;
   let pingTimer = null;
+  let deadTimer = null;
+  let openedAt = 0;
+  let lastMessageAt = 0;
 
   const setStatus = (status, extra = {}) => handlers.onStatus?.({ status, ...extra });
 
@@ -40,7 +50,32 @@ export function connectGame(gameId, handlers) {
     clearTimeout(retryTimer);
     clearTimeout(stableTimer);
     clearInterval(pingTimer);
-    retryTimer = stableTimer = pingTimer = null;
+    clearTimeout(deadTimer);
+    retryTimer = stableTimer = pingTimer = deadTimer = null;
+  }
+
+  // Something must arrive within DEAD_AFTER_MS (the hello's state, a pong), else start over.
+  function expectReply() {
+    const since = Date.now();
+    clearTimeout(deadTimer);
+    deadTimer = setTimeout(() => {
+      if (lastMessageAt < since) restart();
+    }, DEAD_AFTER_MS);
+  }
+
+  // Replace the current socket with a fresh one right away (resets the backoff).
+  function restart() {
+    stopped = false;
+    attempt = 0;
+    drop();
+    open();
+  }
+
+  // Back from sleep / a hidden tab / offline: don't wait for a retry timer or a ping to notice.
+  function onWake() {
+    if (stopped || document.visibilityState === 'hidden') return;
+    if (ws?.readyState === WebSocket.CONNECTING) return; // expectReply() covers a hanging connect
+    if (ws?.readyState !== WebSocket.OPEN || Date.now() - Math.max(openedAt, lastMessageAt) > QUIET_AFTER_MS) restart();
   }
 
   function sendRaw(message) {
@@ -85,6 +120,7 @@ export function connectGame(gameId, handlers) {
       return;
     }
     ws = sock;
+    expectReply(); // a connect that hangs (e.g. a half-open network) is abandoned too
 
     sock.onopen = () => {
       const seat = handlers.getSeat?.();
@@ -94,12 +130,17 @@ export function connectGame(gameId, handlers) {
         hello.token = seat.token;
       }
       sock.send(JSON.stringify(hello));
+      openedAt = Date.now();
+      expectReply();
       setStatus('connected');
       stableTimer = setTimeout(() => { attempt = 0; }, STABLE_AFTER_MS);
-      pingTimer = setInterval(() => sendRaw({ t: 'ping' }), PING_EVERY_MS);
+      pingTimer = setInterval(() => {
+        if (sendRaw({ t: 'ping' })) expectReply();
+      }, PING_EVERY_MS);
     };
 
     sock.onmessage = (event) => {
+      lastMessageAt = Date.now(); // anything counts, including pong
       let msg;
       try { msg = JSON.parse(event.data); } catch { return; }
       if (msg.t === 'state') handlers.onState?.(msg);
@@ -122,21 +163,23 @@ export function connectGame(gameId, handlers) {
     sock.onerror = () => { /* a close event always follows; reconnect is handled there */ };
   }
 
+  document.addEventListener('visibilitychange', onWake);
+  window.addEventListener('online', onWake);
   open();
 
   return {
-    /** Send a game action; returns false when not connected. */
-    send: (action) => sendRaw({ t: 'action', action }),
+    /**
+     * Send a game action; returns false when not connected. `seq` is the state.seq the player was
+     * looking at, so the server can refuse an action that was meant for an older state.
+     */
+    send: (action, seq) => sendRaw(Number.isInteger(seq) ? { t: 'action', action, seq } : { t: 'action', action }),
     /** Reconnect right away (Retry now / Use here / seat takeover), re-reading the seat. */
-    reconnect() {
-      stopped = false;
-      attempt = 0;
-      drop();
-      open();
-    },
+    reconnect: restart,
     /** Close for good (leaving the table). */
     close() {
       stopped = true;
+      document.removeEventListener('visibilitychange', onWake);
+      window.removeEventListener('online', onWake);
       drop();
       setStatus('closed');
     },

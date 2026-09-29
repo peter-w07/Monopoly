@@ -1,8 +1,10 @@
 // TIMEOUT auto-actions per phase (CONTRACT §4.9) and autoRaise order (§4.10).
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { legalActions, liquidationValue } from '../engine/index.js';
 import {
-  newGame, lobby, act, reject, roll, withDice, player, tile, current, give, jail, setCash, assertEvent,
+  newGame, lobby, act, reject, roll, withDice, player, tile, current, give, jail, setCash, setPosition,
+  stackDeck, assertEvent, assertNoEvent, ofType,
 } from './helpers.js';
 
 const timeout = (playerId = 'p1') => ({ type: 'TIMEOUT', playerId });
@@ -94,14 +96,82 @@ describe('TIMEOUT', () => {
     assert.equal(state.turn.phase, 'end_turn');
   });
 
+  test('autoRaise: loose tiles are mortgaged first, then buildings sold, then the rest mortgaged', () => {
+    let s = give(give(give(newGame(), 'p1', 1, { houses: 1 }), 'p1', 3, { houses: 1 }), 'p1', 5);
+    s = owingTax(s, 20); // 20 + Reading 100 + 2 houses × 25 = 170; Mediterranean's 30 makes 200
+    const { state, events } = act(s, timeout());
+    const steps = events.filter((e) => ['mortgaged', 'sold_house', 'debt_paid'].includes(e.type)).map((e) => `${e.type}:${e.tileIndex ?? ''}`);
+    assert.deepEqual(steps, ['mortgaged:5', 'sold_house:1', 'sold_house:3', 'mortgaged:1', 'debt_paid:']);
+    assert.equal(tile(state, 3).mortgaged, false, 'stops once the debt is covered');
+    assert.equal(player(state, 'p1').cash, 0);
+  });
+
+  test('autoRaise keeps buildings when mortgaging a railroad covers the debt', () => {
+    let s = give(give(give(newGame(), 'p1', 1, { houses: 2 }), 'p1', 3, { houses: 2 }), 'p1', 5);
+    s = owingTax(s, 150);
+    const { state, events } = act(s, timeout());
+    assertNoEvent(events, 'sold_house');
+    assert.deepEqual([tile(state, 1).houses, tile(state, 3).houses], [2, 2]);
+    assert.equal(tile(state, 5).mortgaged, true);
+    assert.equal(player(state, 'p1').cash, 50);
+  });
+
+  test('collect_each auto-liquidates an off-turn player the same way: railroad before hotel', () => {
+    let s = give(give(give(newGame(), 'p2', 37, { houses: 5 }), 'p2', 39, { houses: 5 }), 'p2', 5);
+    s = stackDeck(setPosition(setCash(s, 'p2', 5), 'p1', 12), 'community', [8]); // birthday: $10 from each
+    const { state, events } = roll(s, 'p1', 2, 3); // → 17 Community Chest
+    assertEvent(events, 'mortgaged', { playerId: 'p2', tileIndex: 5, amount: 100 });
+    assertNoEvent(events, 'sold_house');
+    assertEvent(events, 'collected', { playerId: 'p1', fromPlayerId: 'p2', amount: 10 });
+    assert.equal(tile(state, 37).houses, 5);
+    assert.equal(player(state, 'p2').cash, 95);
+  });
+
   test('paying and unable to raise enough → bankruptcy', () => {
     let s = give(newGame({ players: 3 }), 'p1', 6);
     s = owingTax(s, 100); // 100 + 50 mortgage < 200
     const { state, events } = act(s, timeout());
+    assertNoEvent(events, 'mortgaged');
     assertEvent(events, 'bankrupt', { playerId: 'p1', toPlayerId: null });
     assert.equal(player(state, 'p1').bankrupt, true);
     assert.equal(tile(state, 6).ownerId, null);
     assert.equal(current(state), 'p2');
+  });
+
+  test('a hopeless debt to a player: nothing is mortgaged, the creditor gets clean tiles', () => {
+    let s = give(give(newGame(), 'p2', 39, { houses: 5 }), 'p2', 37, { houses: 5 });
+    for (const i of [5, 12, 15, 25, 28, 35]) s = give(s, 'p1', i);
+    s = roll(setPosition(setCash(s, 'p1', 50), 'p1', 32), 'p1', 3, 4).state; // Boardwalk hotel: $2000
+    assert.equal(liquidationValue(s, 'p1'), 600);
+    const { state, events } = act(s, timeout());
+    assertNoEvent(events, 'mortgaged');
+    assertEvent(events, 'bankrupt', { playerId: 'p1', toPlayerId: 'p2', cash: 50 });
+    for (const i of [5, 12, 15, 25, 28, 35]) assert.deepEqual(tile(state, i), { index: i, ownerId: 'p2', houses: 0, mortgaged: false });
+    assert.equal(player(state, 'p2').cash, 1550);
+  });
+
+  test('a debtor whose only assets are hotels can sell them during a house shortage (and TIMEOUT pays)', () => {
+    let s = give(give(newGame(), 'p1', 37, { houses: 5 }), 'p1', 39, { houses: 5 });
+    // p2 holds 30 of the bank's 32 houses: oranges and reds 4/4/4, light blues 2/2/2.
+    for (const i of [16, 18, 19, 21, 23, 24]) s = give(s, 'p2', i, { houses: 4 });
+    for (const i of [6, 8, 9]) s = give(s, 'p2', i, { houses: 2 });
+    assert.equal(s.bank.houses, 2);
+    s = roll(setPosition(setCash(s, 'p1', 100), 'p1', 14), 'p1', 3, 4).state; // Kentucky, 4 houses: $875
+    assert.deepEqual(s.turn.pendingDebt, { toPlayerId: 'p2', amount: 875, reason: 'rent' });
+
+    assert.deepEqual(legalActions(s, 'p1').sellHouse, [37, 39]);
+    act(s, { type: 'SELL_HOUSE', playerId: 'p1', tileIndex: 39 });
+
+    const { state, events } = act(s, timeout());
+    // Park Place breaks into the bank's last 2 houses ($300), Boardwalk into none ($500).
+    assert.deepEqual(ofType(events, 'sold_house').map((e) => [e.tileIndex, e.houses, e.amount]), [[37, 2, 300], [39, 0, 500]]);
+    assertEvent(events, 'debt_paid', { playerId: 'p1', toPlayerId: 'p2', amount: 875, reason: 'rent' });
+    assertNoEvent(events, 'bankrupt');
+    assertNoEvent(events, 'game_over');
+    assert.equal(player(state, 'p1').cash, 25);
+    assert.equal(player(state, 'p2').cash, 1500 + 875);
+    assert.equal(state.status, 'active');
+    assert.equal(state.turn.phase, 'end_turn');
   });
 
   test('only the current player can time out, and only in an active game', () => {

@@ -164,7 +164,11 @@
         </div>
         <aside class="panel" aria-label="Game panel">
           <div id="turn-banner"></div>
+          <!-- Narrow layouts: the buy / debt / jail / game-over details (wide layouts use #dialog-layer) -->
+          <div id="panel-dialog" class="panel-dialog-slot"></div>
           <div id="action-bar" class="action-bar"></div>
+          <!-- Narrow layouts: the latest log lines (the board's own log is tiny there) -->
+          <ol id="recent-log" class="recent-log" aria-label="Recent events"></ol>
           <section class="panel-section">
             <h2 class="section-title">Players</h2>
             <ul id="game-players" class="plist"></ul>

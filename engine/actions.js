@@ -8,8 +8,8 @@ import { BOARD, TILES, getTile } from './board.js';
 import { getCard } from './cards.js';
 import { rollDice, shuffle } from './rng.js';
 import {
-  activePlayers, buildingRefund, canMortgage, canSellHouse, currentPlayerId,
-  getPlayer, getTileState, rentFor, unmortgageCost, validateAction,
+  activePlayers, buildingRefund, canMortgage, currentPlayerId,
+  getPlayer, getTileState, liquidationValue, rentFor, unmortgageCost, validateAction,
 } from './rules.js';
 
 const LOG_LIMIT = 100;
@@ -19,10 +19,13 @@ const POT_REASONS = new Set(['tax', 'card', 'jail_fine']);
 
 export function applyAction(state, action) {
   try {
-    const error = validateAction(state, action);
+    // Validation and the handler read one shallow copy, so an action whose fields change between
+    // reads (getters, proxies) can't pass validation as one action and then run as another.
+    const a = action !== null && typeof action === 'object' ? { ...action } : action;
+    const error = validateAction(state, a);
     if (error) return { state, events: [], error };
     const ctx = { s: cloneState(state), events: [] };
-    HANDLERS[action.type](ctx, action);
+    HANDLERS[a.type](ctx, a);
     ctx.s.seq = (ctx.s.seq ?? 0) + 1;
     return { state: ctx.s, events: ctx.events };
   } catch (e) {
@@ -90,8 +93,11 @@ const HANDLERS = {
       emit(ctx, 'player_left', { playerId: p.id });
       log(ctx, `${p.name} left the game.`);
     } else {
+      // Resigning is bankruptcy to the bank, except that a debtor who owes one player (the current
+      // player in the paying phase) goes bankrupt to that creditor, exactly as DECLARE_BANKRUPTCY.
+      const owing = s.turn.phase === 'paying' && currentPlayerId(s) === p.id;
       log(ctx, `${p.name} resigned.`);
-      goBankrupt(ctx, p, null);
+      goBankrupt(ctx, p, owing ? debtCreditor(s.turn.pendingDebt) : null);
     }
   },
 
@@ -168,20 +174,15 @@ const HANDLERS = {
       transfer(ctx, p, debt.toPlayerId, debt.amount, debt.reason);
     }
     emit(ctx, 'debt_paid', {
-      playerId: p.id, toPlayerId: debt.toPlayerId, amount: debt.amount,
+      playerId: p.id, toPlayerId: debt.toPlayerId, amount: debt.amount, reason: debt.reason,
       ...(debt.payees ? { payees: debt.payees.map((x) => ({ ...x })) } : {}),
     });
     log(ctx, `${p.name} paid the ${money(debt.amount)} debt${recipientText(ctx, debt)}.`);
-    if (debt.then?.kind === 'jail_move') {
-      leaveJailAndMove(ctx, p, debt.then.steps);
-    } else {
-      s.turn.phase = 'end_turn'; // rollAgain is preserved
-    }
+    debtSettled(ctx, p, debt);
   },
 
   DECLARE_BANKRUPTCY(ctx, a) {
-    const debt = ctx.s.turn.pendingDebt;
-    goBankrupt(ctx, actor(ctx, a), debt && !debt.payees ? debt.toPlayerId : null);
+    goBankrupt(ctx, actor(ctx, a), debtCreditor(ctx.s.turn.pendingDebt));
   },
 
   BUILD(ctx, a) {
@@ -614,6 +615,45 @@ function startDebt(ctx, p, debt) {
   log(ctx, `${p.name} owes ${money(debt.amount)}${recipientText(ctx, debt)} but has only ${money(p.cash)}.`);
 }
 
+/** Who a debtor goes bankrupt to: the single player they owe, else (bank debts, payees debts) the bank. */
+function debtCreditor(debt) {
+  return debt && !debt.payees ? debt.toPlayerId : null;
+}
+
+/** The pending debt is gone (paid or cancelled): run its continuation, else back to end_turn. */
+function debtSettled(ctx, p, debt) {
+  if (debt.then?.kind === 'jail_move') {
+    leaveJailAndMove(ctx, p, debt.then.steps);
+  } else {
+    ctx.s.turn.phase = 'end_turn'; // rollAgain is preserved
+  }
+}
+
+/**
+ * A player the current player owes money to went bankrupt (they resigned): their share of the
+ * pending debt is cancelled — it is not re-routed to the bank or the pot. Nothing is paid
+ * automatically; if something is still owed the debtor stays in the paying phase.
+ */
+function cancelDebtShare(ctx, gone) {
+  const t = ctx.s.turn;
+  const debt = t.pendingDebt;
+  const share = debt.payees
+    ? debt.payees.filter((x) => x.playerId === gone.id).reduce((sum, x) => sum + x.amount, 0)
+    : (debt.toPlayerId === gone.id ? debt.amount : 0);
+  if (share === 0) return;
+  const debtor = getPlayer(ctx.s, currentPlayerId(ctx.s));
+  if (debt.payees) debt.payees = debt.payees.filter((x) => x.playerId !== gone.id);
+  debt.amount -= share;
+  emit(ctx, 'debt_reduced', { playerId: debtor.id, amount: debt.amount });
+  if (debt.amount > 0) {
+    log(ctx, `${debtor.name} no longer owes ${gone.name} ${money(share)}; ${money(debt.amount)} is still due.`);
+    return;
+  }
+  log(ctx, `${debtor.name} no longer owes ${gone.name} anything.`);
+  t.pendingDebt = null;
+  debtSettled(ctx, debtor, debt);
+}
+
 // ---------------------------------------------------------------------------
 // Buildings & mortgages (shared by the handlers and autoRaise; callers have validated)
 // ---------------------------------------------------------------------------
@@ -634,20 +674,29 @@ function buildOne(ctx, p, index) {
   log(ctx, `${p.name} built ${ts.houses === 5 ? 'a hotel' : `house ${ts.houses}`} on ${tile.name} for ${money(tile.houseCost)}.`);
 }
 
+/**
+ * Sells one building level. A hotel breaks back down into four houses — or, when the bank is short
+ * of houses, into as many as it has (0–3), and every level that can't stay as a house is refunded too.
+ */
 function sellOne(ctx, p, index) {
   const { s } = ctx;
   const ts = getTileState(s, index);
-  const refund = buildingRefund(index);
-  if (ts.houses === 5) {
+  const before = ts.houses;
+  if (before === 5) {
+    const houses = Math.min(4, s.bank.houses);
     s.bank.hotels += 1;
-    s.bank.houses -= 4; // a hotel breaks back down into four houses
+    s.bank.houses -= houses;
+    ts.houses = houses;
   } else {
     s.bank.houses += 1;
+    ts.houses -= 1;
   }
-  ts.houses -= 1;
-  p.cash += refund;
-  emit(ctx, 'sold_house', { playerId: p.id, tileIndex: index, houses: ts.houses });
-  log(ctx, `${p.name} sold a building on ${tileName(index)} for ${money(refund)}.`);
+  const amount = (before - ts.houses) * buildingRefund(index);
+  p.cash += amount;
+  emit(ctx, 'sold_house', { playerId: p.id, tileIndex: index, houses: ts.houses, amount });
+  log(ctx, before - ts.houses > 1
+    ? `${p.name} sold a hotel on ${tileName(index)} (bank short of houses) for ${money(amount)}.`
+    : `${p.name} sold a building on ${tileName(index)} for ${money(amount)}.`);
 }
 
 function mortgageOne(ctx, p, index) {
@@ -659,26 +708,33 @@ function mortgageOne(ctx, p, index) {
 }
 
 /**
- * Deterministic liquidation (CONTRACT §4.10): sell one building level at a time from the tile with
- * the most buildings (ties → lowest index, skipping sales the rules forbid, e.g. a hotel the bank
- * can't break), then mortgage tiles in ascending index order. Stops once cash ≥ target.
+ * Deterministic liquidation (CONTRACT §4.10), stopping as soon as cash ≥ target:
+ * 0. if even full liquidation can't reach the target, do nothing — the caller bankrupts the player
+ *    and the creditor gets the assets intact (liquidationValue is exact);
+ * 1. mortgage tiles whose colour group has no buildings (railroads, utilities, unbuilt lots), ascending;
+ * 2. sell one building level at a time from the tile with the most buildings (ties → lowest index;
+ *    that tile is always the group's maximum, so the even-sell rule allows it);
+ * 3. mortgage the remaining tiles (whose buildings are now gone), ascending.
  */
 function autoRaise(ctx, p, target) {
   const { s } = ctx;
+  if (liquidationValue(s, p.id) < target) return;
+  const mortgageUnbuilt = () => { // canMortgage: owned, not mortgaged, no buildings in the group
+    for (const ts of s.tiles) {
+      if (p.cash >= target) return;
+      if (ts.ownerId === p.id && canMortgage(s, p.id, ts.index).ok) mortgageOne(ctx, p, ts.index);
+    }
+  };
+  mortgageUnbuilt();
   while (p.cash < target) {
     let best = null;
     for (const ts of s.tiles) {
-      if (ts.ownerId !== p.id || ts.houses === 0) continue;
-      if ((!best || ts.houses > best.houses) && canSellHouse(s, p.id, ts.index).ok) best = ts;
+      if (ts.ownerId === p.id && ts.houses > (best ? best.houses : 0)) best = ts;
     }
-    if (best) {
-      sellOne(ctx, p, best.index);
-      continue;
-    }
-    const next = s.tiles.find((ts) => ts.ownerId === p.id && canMortgage(s, p.id, ts.index).ok);
-    if (!next) return;
-    mortgageOne(ctx, p, next.index);
+    if (!best) break;
+    sellOne(ctx, p, best.index);
   }
+  mortgageUnbuilt();
 }
 
 // ---------------------------------------------------------------------------
@@ -696,12 +752,14 @@ function goBankrupt(ctx, p, creditorId) {
   // 1. Every building goes back to the bank at half price.
   for (const ts of owned) {
     if (ts.houses === 0) continue;
-    p.cash += ts.houses * buildingRefund(ts.index);
+    const amount = ts.houses * buildingRefund(ts.index);
+    p.cash += amount;
     if (ts.houses === 5) s.bank.hotels += 1;
     else s.bank.houses += ts.houses;
     ts.houses = 0;
-    emit(ctx, 'sold_house', { playerId: p.id, tileIndex: ts.index, houses: 0 });
+    emit(ctx, 'sold_house', { playerId: p.id, tileIndex: ts.index, houses: 0, amount });
   }
+  const cash = p.cash; // goes to the creditor, or leaves the game with a bank bankruptcy
 
   // 2. Assets go to the creditor, or back to the bank.
   if (creditor) {
@@ -722,22 +780,21 @@ function goBankrupt(ctx, p, creditorId) {
   if (wasCurrent) {
     t.pendingDebt = null;
     t.pendingPurchase = null;
-  } else if (t.pendingDebt) {
-    // Money the current player owed to the bankrupt player now goes to the bank.
-    if (t.pendingDebt.toPlayerId === p.id) t.pendingDebt.toPlayerId = null;
-    for (const payee of t.pendingDebt.payees ?? []) if (payee.playerId === p.id) payee.playerId = null;
   }
-  emit(ctx, 'bankrupt', { playerId: p.id, toPlayerId: creditor ? creditor.id : null });
+  emit(ctx, 'bankrupt', { playerId: p.id, toPlayerId: creditor ? creditor.id : null, cash });
   log(ctx, `${p.name} is bankrupt${creditor ? `; everything goes to ${creditor.name}` : ''}.`);
 
-  // 4. Game over, or pass the turn on.
+  // 4. Game over, or pass the turn on, or (someone else's turn) cancel what the current player owed them.
   const remaining = activePlayers(s);
   if (remaining.length <= 1) endGame(ctx, remaining[0] ?? null);
   else if (wasCurrent) advanceTurn(ctx);
+  else if (t.pendingDebt) cancelDebtShare(ctx, p);
 }
 
+/** Ends the game. turn.currentIndex has no meaning afterwards. */
 function endGame(ctx, winner) {
   const { s } = ctx;
+  emit(ctx, 'turn_ended', { playerId: currentPlayerId(s) }); // every turn_started gets its turn_ended
   s.status = 'finished';
   s.winnerId = winner ? winner.id : null;
   Object.assign(s.turn, { phase: 'game_over', rollAgain: false, pendingPurchase: null, pendingDebt: null });

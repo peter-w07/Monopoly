@@ -1,4 +1,5 @@
 // HTTP + WebSocket bootstrap: JSON API, static files from /public, /ws, /health, graceful shutdown.
+// Abuse limits (connections per IP, message rates, game creation) live in limits.js.
 
 import http from 'node:http';
 import fs from 'node:fs';
@@ -7,8 +8,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { BOARD } from '../engine/index.js';
-import { initPersist } from './persist.js';
+import { initPersist, acquireInstanceLock, releaseInstanceLock } from './persist.js';
 import * as rooms from './rooms.js';
+import { clientIp, admitUpgrade, trackSocket, takeCreate } from './limits.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -19,6 +21,9 @@ const BODY_LIMIT = 16 * 1024;
 const WS_MAX_PAYLOAD = 64 * 1024;
 const HEARTBEAT_MS = 30_000;
 const FORCE_EXIT_MS = 10_000;
+// Longer than a reverse proxy's idle timeout for kept-alive upstream connections (Traefik: 90 s),
+// so Node never closes a connection the proxy is about to reuse (→ sporadic 502s).
+const KEEP_ALIVE_MS = 95_000;
 
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -102,6 +107,12 @@ function readJsonBody(req) {
 // Routes
 
 async function createGameRoute(req, res) {
+  if (shuttingDown) return sendJson(res, 503, { error: 'Server is restarting, try again shortly' });
+  const waitMs = takeCreate(clientIp(req));
+  if (waitMs > 0) {
+    const retryAfter = Math.ceil(waitMs / 1000);
+    return sendJson(res, 429, { error: 'Too many new games from your address, try again later' }, { 'Retry-After': String(retryAfter) });
+  }
   let body;
   try {
     body = (await readJsonBody(req)) ?? {};
@@ -199,6 +210,8 @@ const server = http.createServer((req, res) => {
     else res.destroy();
   });
 });
+server.keepAliveTimeout = KEEP_ALIVE_MS;
+server.headersTimeout = KEEP_ALIVE_MS + 1000; // must exceed keepAliveTimeout
 
 // ---------------------------------------------------------------------------
 // WebSocket
@@ -206,13 +219,35 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD });
 wss.on('error', (err) => console.error('[ws] server error:', err));
 
+// Refuse an upgrade with a plain HTTP response, then drop the connection.
+function rejectUpgrade(socket, status, message) {
+  const body = JSON.stringify({ error: message });
+  socket.once('finish', () => socket.destroy());
+  socket.once('error', () => socket.destroy());
+  const headers = [
+    `HTTP/1.1 ${status} ${http.STATUS_CODES[status]}`,
+    'Connection: close',
+    'Content-Type: application/json; charset=utf-8',
+    `Content-Length: ${Buffer.byteLength(body)}`,
+    ...(status === 429 ? ['Retry-After: 1'] : []),
+  ];
+  socket.end(`${headers.join('\r\n')}\r\n\r\n${body}`);
+}
+
 server.on('upgrade', (req, socket, head) => {
   const pathname = (req.url ?? '').split('?', 1)[0];
   if (pathname !== '/ws' || shuttingDown) {
     socket.destroy();
     return;
   }
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  const ip = clientIp(req);
+  const refusal = admitUpgrade(ip);
+  if (refusal) return rejectUpgrade(socket, refusal.status, refusal.message);
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    ws.ip = ip;
+    ws.once('close', trackSocket(ip));
+    wss.emit('connection', ws, req);
+  });
 });
 
 wss.on('connection', (ws) => {
@@ -278,7 +313,8 @@ async function shutdown(reason) {
     exitCode = 1;
   }
   await closeAllSockets(1012, 'Server restarting');
-  console.log('[server] bye');
+  releaseInstanceLock();
+  console.log(exitCode === 0 ? '[server] bye' : '[server] exiting with unsaved games (see above)');
   process.exit(exitCode);
 }
 
@@ -297,11 +333,20 @@ process.on('unhandledRejection', (err) => console.error('[server] unhandled reje
 
 server.on('error', (err) => {
   console.error(`[server] ${err.code === 'EADDRINUSE' ? `port ${PORT} is already in use` : err.message}`);
+  releaseInstanceLock();
   process.exit(1);
 });
 
 try {
   await initPersist(DATA_DIR);
+  const other = await acquireInstanceLock();
+  if (other) {
+    console.error(
+      `[server] another instance is using DATA_DIR (${other.hostname}/${other.pid}); run only one instance — ` +
+        "in Coolify enable 'Consistent Container Names'",
+    );
+    process.exit(1);
+  }
   await rooms.loadRooms();
 } catch (err) {
   console.error(`[server] could not load games from ${DATA_DIR}:`, err);

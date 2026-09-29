@@ -127,7 +127,7 @@ describe('SELL_HOUSE', () => {
     assert.deepEqual(houses(state), [1, 1]);
     assert.equal(player(state, 'p1').cash, 1525);
     assert.equal(state.bank.houses, s.bank.houses + 1);
-    assertEvent(events, 'sold_house', { playerId: 'p1', tileIndex: 1, houses: 1 });
+    assertEvent(events, 'sold_house', { playerId: 'p1', tileIndex: 1, houses: 1, amount: 25 });
   });
 
   test('evenBuild: false allows uneven selling', () => {
@@ -148,17 +148,54 @@ describe('SELL_HOUSE', () => {
   test('selling a hotel breaks it into 4 houses', () => {
     const s = browns(5, 5);
     assert.equal(s.bank.houses, 32);
-    const { state } = act(s, sell(1));
+    const { state, events } = act(s, sell(1));
     assert.deepEqual(houses(state), [4, 5]);
     assert.equal(state.bank.houses, 28);
     assert.equal(state.bank.hotels, 11);
     assert.equal(player(state, 'p1').cash, 1525);
+    assertEvent(events, 'sold_house', { playerId: 'p1', tileIndex: 1, houses: 4, amount: 25 });
   });
 
-  test('breaking a hotel needs 4 houses in the bank', () => {
-    const s = edit(browns(5, 5), (x) => { x.bank.houses = 3; });
-    reject(s, sell(1), 'BANK_SHORTAGE');
-    assert.deepEqual(legalActions(s, 'p1').sellHouse, []);
+  describe('a hotel can always be sold, even when the bank is short of houses', () => {
+    test('bank has 2 houses: the hotel becomes 2 houses and 3 levels are refunded', () => {
+      const s = edit(browns(5, 5), (x) => { x.bank.houses = 2; });
+      assert.deepEqual(legalActions(s, 'p1').sellHouse, [1, 3]);
+      const { state, events } = act(s, sell(1));
+      assert.deepEqual(houses(state), [2, 5]);
+      assert.equal(player(state, 'p1').cash, 1500 + 3 * 25);
+      assert.deepEqual(state.bank, { houses: 0, hotels: s.bank.hotels + 1 });
+      assertEvent(events, 'sold_house', { playerId: 'p1', tileIndex: 1, houses: 2, amount: 75 });
+    });
+
+    test('bank has no houses: the hotel goes entirely and all 5 levels are refunded', () => {
+      const s = edit(browns(5, 5), (x) => { x.bank.houses = 0; });
+      const { state, events } = act(s, sell(3));
+      assert.deepEqual(houses(state), [5, 0]);
+      assert.equal(player(state, 'p1').cash, 1500 + 5 * 25);
+      assert.deepEqual(state.bank, { houses: 0, hotels: s.bank.hotels + 1 });
+      assertEvent(events, 'sold_house', { playerId: 'p1', tileIndex: 3, houses: 0, amount: 125 });
+    });
+
+    test('evenBuild: a [5,5,5] group with 4 houses in the bank can be sold off completely', () => {
+      // p2's houses (oranges 4/4/4, reds 4/4/4, pinks 2/1/1) leave exactly 4 in the bank.
+      let s = newGame();
+      for (const i of [16, 18, 19, 21, 23, 24]) s = give(s, 'p2', i, { houses: 4 });
+      s = give(give(give(s, 'p2', 11, { houses: 2 }), 'p2', 13, { houses: 1 }), 'p2', 14, { houses: 1 });
+      for (const i of [6, 8, 9]) s = give(s, 'p1', i, { houses: 5 });
+      assert.deepEqual(s.bank, { houses: 4, hotels: 9 });
+
+      const sold = [];
+      for (let legal = legalActions(s, 'p1').sellHouse; legal.length > 0; legal = legalActions(s, 'p1').sellHouse) {
+        const r = act(s, sell(legal[0]));
+        sold.push([legal[0], ...[6, 8, 9].map((i) => tile(r.state, i).houses)]);
+        s = r.state;
+      }
+      assert.deepEqual(sold.slice(0, 3), [[6, 4, 5, 5], [8, 4, 0, 5], [9, 4, 0, 0]]);
+      assert.deepEqual([6, 8, 9].map((i) => tile(s, i).houses), [0, 0, 0]);
+      assert.equal(player(s, 'p1').cash, 1500 + 15 * 25, 'every one of the 15 levels is refunded');
+      assert.deepEqual(s.bank, { houses: 4, hotels: 12 });
+      assert.deepEqual(legalActions(s, 'p1').mortgage, [6, 8, 9]);
+    });
   });
 });
 
