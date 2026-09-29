@@ -123,8 +123,20 @@ export function liquidationValue(state, playerId)        // cash + buildingRefun
        // once its group's buildings are gone.
 export function netWorth(state, playerId)                // cash + price of owned (mortgage value if mortgaged) + houseCost of buildings — for UI
 export function validateAction(state, action)            // → null if the action would succeed, else { code, message } (§4.1)
-export const ACTION_TYPES                                // every action type the engine knows (incl. stubs and TIMEOUT)
+export const ACTION_TYPES                                // every action type the engine knows (incl. TIMEOUT)
 export function legalActions(state, playerId)            // see §5
+// Trading (§4.13)
+export function validateTrade(state, fromPlayerId, offer) // offer = { toPlayerId, give, get } → null | { code, message }.
+       // Shared by PROPOSE_TRADE and ACCEPT_TRADE; ignores turn and phase. Checks, first failure wins: shape (BAD_PAYLOAD),
+       // proposer active (NO_PLAYER), target ≠ proposer (BAD_PAYLOAD), target exists and active (NO_PLAYER), EMPTY_TRADE,
+       // NOT_OWNER, HAS_BUILDINGS, INSUFFICIENT_FUNDS, NO_JAIL_CARD (each check: proposer's side first).
+export function tradeableTiles(state, playerId)          // → ascending indices of the player's tiles that can be traded now
+       // (railroads, utilities, and properties whose colour group has no buildings)
+export function tradeFees(state, fromPlayerId, offer)    // → { [fromPlayerId]: n, [toPlayerId]: m }: 10% fees each party pays
+       // for the mortgaged tiles it would receive (0 when none)
+export function mortgageTransferFee(tileIndex)           // mortgage × unmortgageInterest (10%), rounded up like unmortgageCost ($75 → $8)
+export function normalizeTradeSide(side)                 // → { cash, tiles, jailCards } with absent fields filled in (0 / [])
+export const MAX_TRADES_PER_TURN                         // 5: PROPOSE_TRADE per turn (TRADE_LIMIT after that, §4.13)
 ```
 
 ### `engine/actions.js`
@@ -135,8 +147,9 @@ export function applyAction(state, action) // → { state, events }            o
 - Never throws (wrap in try/catch; an unexpected exception returns `{ error: { code: "INTERNAL", message } }` with the untouched input state).
 - Never mutates the input: deep-copy the state first, mutate the copy. (The state is plain JSON, so the engine uses a
   small recursive copy; it is ~7× faster than `structuredClone`, which matters to bots and simulations.)
-- Reads the action once: validation and the handler share one shallow copy (`{...action}`), so getters or proxies
-  can't make an action validate as one thing and run as another.
+- Reads the action once: validation and the handler share one shallow copy (`{...action}`; for PROPOSE_TRADE the
+  `give` / `get` objects and their `tiles` arrays are copied too), so getters or proxies can't make an action validate
+  as one thing and run as another.
 - Deterministic: same input state + action → deep-equal output.
 - Every successful action increments `state.seq` by 1.
 
@@ -179,20 +192,32 @@ Exactly the spec's shape, plus the documented extensions marked **(ext)**:
     "pendingPurchase": null,                // tile index
     "pendingDebt": null,                    // { toPlayerId|null, amount, reason, payees?, then? } — see §4.6
                                             //   reason: "rent" | "tax" | "card" | "jail_fine"
+    "tradesProposed": 0,                    // (ext) PROPOSE_TRADEs this turn (§4.13 limit); 0 at START_GAME and each
+                                            //   END_TURN / turn change. Absent in older saves = 0.
     "deadlineAt": null                      // server sets; engine copies through untouched
   },
   "tiles": [ { "index": 1, "ownerId": null, "houses": 0, "mortgaged": false } ],
                                             // ONLY the 28 ownable tiles, sorted by index. houses: 0-4, 5 = hotel
   "bank": { "houses": 32, "hotels": 12 },
   "decks": { "chance": { "order": [...16 ids], "pos": 0 }, "community": { "order": [...], "pos": 0 } },
-  "auction": null, "trade": null,           // stubs
+  "auction": null,                          // while phase is "auction" (§4.12):
+      // { "tileIndex": 21, "highBid": 0, "highBidderId": null,
+      //   "bids": [ { "playerId": "p_a", "amount": 10 } ],   // history, oldest first
+      //   "participants": ["p_a", "p_b"],                     // non-bankrupt players at the start, in turn order (incl. the decliner)
+      //   "passed": ["p_b"] }                                 // participants who dropped out (or resigned)
+  "trade": null,                            // while phase is "trading" (§4.13):
+      // { "id": "t_42", "fromPlayerId": "p_a", "toPlayerId": "p_b",
+      //   "give": { "cash": 100, "tiles": [1, 3], "jailCards": 0 },   // from proposer to target
+      //   "get":  { "cash": 0,   "tiles": [39],   "jailCards": 1 },   // from target to proposer
+      //   "returnPhase": "end_turn" }                                 // the phase the trade interrupted
   "log": []                                 // human-readable strings, newest last, capped at 100
 }
 ```
 
 Phases (`turn.phase`): `lobby`, `rolling`, `jail_decision`, `buying_or_auction`, `paying`,
-`end_turn`, `game_over`. (`resolving` is internal to a single `applyAction` call and is never
-the phase of a returned state. `auction` / `trading` are reserved, unused.)
+`end_turn`, `auction`, `trading`, `game_over`. (`resolving` is internal to a single `applyAction` call and is never
+the phase of a returned state.) `phase === "auction"` ⇔ `auction !== null`; `phase === "trading"` ⇔ `trade !== null`.
+While trading, `pendingDebt` stays set when `returnPhase` is `paying`; `pendingPurchase` is null in both phases.
 
 Host: `hostId` is the first player to JOIN. If the host LEAVEs the lobby, `hostId` becomes the
 new `players[0].id` (or `null` if empty). START_GAME may be sent by the host or — while the host's
@@ -210,19 +235,24 @@ are skipped.
 Lobby: `JOIN {name, token}` (playerId is supplied by the server), `LEAVE {lobbyOnly?: boolean}`, `START_GAME` (host or stand-in, ≥2 players).
 Turn: `ROLL`, `BUY`, `DECLINE`, `END_TURN`. Jail: `PAY_JAIL_FINE`, `USE_JAIL_CARD`.
 Money: `PAY_DEBT`, `DECLARE_BANKRUPTCY`. Build: `BUILD|SELL_HOUSE|MORTGAGE|UNMORTGAGE {tileIndex}`.
-Stubs → error `NOT_IMPLEMENTED` (after checking game is active): `START_AUCTION, BID, PROPOSE_TRADE, ACCEPT_TRADE, REJECT_TRADE`.
+Auction (4.12): `START_AUCTION`, `BID {amount}`, `PASS_AUCTION`. Trade (4.13): `PROPOSE_TRADE {toPlayerId, give, get}`,
+`ACCEPT_TRADE {tradeId?}`, `REJECT_TRADE {tradeId?}`. BID and PASS_AUCTION may come from any participant, ACCEPT/REJECT_TRADE from a trade party —
+not only from the current player.
 Server-only: `TIMEOUT` (see 4.9). The engine accepts it; the **server** refuses it from clients.
 
 Validation order: known type (`type` must be a string naming an engine action, else `UNKNOWN_ACTION` — so `['ROLL']`
 is rejected) → `playerId` a non-empty string (`BAD_PAYLOAD`) → payload shape (`BAD_PAYLOAD`: JOIN name/token strings,
-integer `tileIndex`, LEAVE `lobbyOnly` absent or boolean) → game status → player exists & not bankrupt → is it this
-player's turn (where required) → phase → rule checks. First failure wins.
+integer `tileIndex`, LEAVE `lobbyOnly` absent or boolean, BID integer `amount`, PROPOSE_TRADE per 4.13, ACCEPT/REJECT_TRADE
+`tradeId` absent or a string) → game status →
+player exists & not bankrupt → is it this player's turn (where required) → phase → rule checks. First failure wins.
+(The auction and trade actions order their checks as listed in 4.12 / 4.13.)
 
 Error codes: `UNKNOWN_ACTION, BAD_PAYLOAD, NOT_IN_LOBBY, GAME_NOT_ACTIVE, NO_PLAYER, ALREADY_JOINED,
 GAME_FULL, BAD_NAME, BAD_TOKEN, TOKEN_TAKEN, NOT_HOST, NOT_ENOUGH_PLAYERS, NOT_YOUR_TURN, WRONG_PHASE,
 MUST_ROLL_AGAIN, INSUFFICIENT_FUNDS, NO_JAIL_CARD, NOT_IN_JAIL, INVALID_TILE, NOT_OWNER, NOT_MONOPOLY,
 MORTGAGED_IN_GROUP, UNEVEN_BUILD, MAX_BUILDINGS, NO_BUILDINGS, BANK_SHORTAGE (BUILD only), HAS_BUILDINGS,
-ALREADY_MORTGAGED, NOT_MORTGAGED, NOT_IMPLEMENTED, INTERNAL`.
+ALREADY_MORTGAGED, NOT_MORTGAGED, AUCTIONS_DISABLED, BID_TOO_LOW, ALREADY_HIGH_BIDDER, ALREADY_PASSED, NOT_PARTICIPANT,
+TRADE_PENDING, NO_TRADE, NOT_TRADE_PARTY, EMPTY_TRADE, UNFAIR_TRADE, TRADE_LIMIT, INTERNAL`.
 
 ### 4.2 Lobby
 - JOIN: status lobby; `playerId` not already present (`ALREADY_JOINED`); name trimmed 1–20 characters (code points) (`BAD_NAME`);
@@ -232,9 +262,22 @@ ALREADY_MORTGAGED, NOT_MORTGAGED, NOT_IMPLEMENTED, INTERNAL`.
 - LEAVE in the lobby (with or without `lobbyOnly`): remove the player (`NO_PLAYER` if not in the game).
   LEAVE after the lobby:
   - `lobbyOnly: true` → `NOT_IN_LOBBY`, state untouched (a "leave the lobby" click that arrives late never resigns).
-  - otherwise, while active: **resign**, allowed any time, even off-turn: bankrupt to the bank (4.8) — except when the
-    leaver is the current player in `paying` with a single-creditor debt (no `payees`): then bankrupt to that creditor,
-    exactly as DECLARE_BANKRUPTCY. In a finished game → `GAME_NOT_ACTIVE`.
+  - otherwise, while active: **resign**, allowed any time, even off-turn and during an auction or a trade: bankrupt to
+    the bank (4.8) — except when the leaver is the current player in `paying` with a single-creditor debt (no `payees`):
+    then bankrupt to that creditor, exactly as DECLARE_BANKRUPTCY. In a finished game → `GAME_NOT_ACTIVE`.
+    A pending trade or running auction is dealt with around the bankruptcy, in this order:
+    1. a pending trade is cancelled (`trade_cancelled {reason:"resigned"}`, phase = `returnPhase`) if the leaver is a
+       party to it, or if `returnPhase` is `paying` and part of the proposer's `pendingDebt` is owed to the leaver (4.8
+       step 4 is about to change that debt). A third party's resignation otherwise leaves the trade pending;
+    2. if the leaver is the current player, a running auction is cancelled (`auction_unsold`, tile unowned, phase
+       `end_turn`) before the turn passes on;
+    3. the bankruptcy (4.8), using the phase as restored in step 1 (so a proposer who was `paying` goes bankrupt to
+       their creditor);
+    4. if an auction is still running and the game is not over: the leaver counts as passed (`auction_passed`, if they
+       were a participant who hadn't passed); if they had the high bid, `highBid` / `highBidderId` fall back to the
+       best (= latest) bid in `bids` by a player who is still in the auction (not bankrupt, not passed), or 0 / null;
+       then the auction closes if its end condition (4.12) holds. If the bankruptcy ended the game, the auction is cancelled
+       (`auction_unsold`) just before the final `turn_ended`.
 - START_GAME: check order `NOT_IN_LOBBY, NO_PLAYER, NOT_HOST` (not the host or the stand-in, §3), `NOT_ENOUGH_PLAYERS` (<2).
   status → active, order = player ids in join order, currentIndex 0, number 1, phase `rolling`. Events `game_started`, `turn_started`.
 
@@ -260,8 +303,8 @@ ALREADY_MORTGAGED, NOT_MORTGAGED, NOT_IMPLEMENTED, INTERNAL`.
 - chance / community → draw (4.5) and apply. A card that moves you resolves the new landing (recursively).
 - go_to_jail → go to jail. free_parking → if `settings.freeParkingPot` and `pot > 0`, collect the pot.
 - go / jail (just visiting) → nothing.
-- BUY: cash ≥ price → owner = player, phase `end_turn`. DECLINE → stays unowned, phase `end_turn`
-  (log "auctions are not implemented yet" when `auctionOnDecline`).
+- BUY: cash ≥ price → owner = player, phase `end_turn`. DECLINE (event `declined`) → if `settings.auctionOnDecline`,
+  an auction for the tile starts (4.12); otherwise it stays unowned, phase `end_turn`. Either way `pendingPurchase = null`.
 
 ### 4.5 Cards
 Draw: `id = decks[d].order[pos]`, `pos++`; when `pos` reaches the end, reshuffle `order` with `shuffle(state.rng, ...)`
@@ -279,7 +322,9 @@ matching entry — the card becomes drawable again.
 - `collect_each`: each other player who can't pay is auto-liquidated (`autoRaise`, 4.10); if still short they go
   bankrupt to the collector (4.8). No pendingDebt for off-turn players.
 - `paying` phase: only the debtor (current player) acts: SELL_HOUSE, MORTGAGE, PAY_DEBT (needs cash ≥ amount),
-  DECLARE_BANKRUPTCY (and LEAVE, 4.2). After PAY_DEBT: if `pendingDebt.then` exists run it, else phase `end_turn` (rollAgain preserved).
+  DECLARE_BANKRUPTCY, PROPOSE_TRADE (to raise cash: selling is fine, giving away is `UNFAIR_TRADE`; the debt stays pending
+  while trading, 4.13) (and LEAVE, 4.2).
+  After PAY_DEBT: if `pendingDebt.then` exists run it, else phase `end_turn` (rollAgain preserved).
 - `then` is used only for the forced jail fine: `{ kind: "jail_move", steps }` → after paying, move `steps` and resolve.
 - A creditor who goes bankrupt (resigns) while owed: see 4.8 step 4 — their share is cancelled.
 
@@ -305,7 +350,8 @@ A creditor who is bankrupt (or the debtor) counts as the bank.
    interest charged), and jail cards. Creditor is the bank → properties become unowned + unmortgaged; jail cards return
    to their decks; cash leaves the game.
 3. Debtor: `bankrupt true, cash 0, jailCards [], getOutOfJailCards 0, inJail false, jailTurns 0`. If they were the
-   current player: `pendingDebt null, pendingPurchase null`. Event `bankrupt {playerId, toPlayerId, cash}`.
+   current player: `pendingDebt null, pendingPurchase null`. Event `bankrupt {playerId, toPlayerId, cash, reason}`
+   (`reason`: `"resigned"` for LEAVE, else `"debt"`).
 4. Then the first of these that applies (else nothing more happens):
    - ≤1 non-bankrupt player remains → events `turn_ended {playerId: current player}` then `game_over`;
      `status finished`, `phase game_over`, `winnerId`, `rollAgain false`, pending purchase/debt cleared.
@@ -318,9 +364,13 @@ A creditor who is bankrupt (or the debtor) counts as the bank.
      automatically.
 
 ### 4.9 TIMEOUT `{ type:"TIMEOUT", playerId }` — playerId must be the current player
-Emits `{type:"timeout", playerId, phase}` then: `rolling`→ROLL; `jail_decision`→ROLL (never uses a jail card);
-`buying_or_auction`→DECLINE; `end_turn`→ rollAgain ? ROLL : END_TURN; `paying`→ if cash < amount `autoRaise` (4.10),
-then PAY_DEBT if affordable, else DECLARE_BANKRUPTCY. Other phases → `WRONG_PHASE`.
+Emits `{type:"timeout", playerId, phase}` (and the log line "<name> ran out of time.", except in `auction`, where the
+clock running out is simply how auctions end) then: `rolling`→ROLL; `jail_decision`→ROLL (never uses a jail card);
+`buying_or_auction`→DECLINE (which starts an auction when `auctionOnDecline`); `end_turn`→ rollAgain ? ROLL : END_TURN;
+`paying`→ if cash < amount `autoRaise` (4.10), then PAY_DEBT if affordable, else DECLARE_BANKRUPTCY;
+`auction`→ the auction ends now (4.12: the high bidder wins, or unsold); `trading`→ the trade is cancelled
+(`trade_cancelled {reason:"timeout"}`), the phase goes back to `returnPhase`, and that phase's TIMEOUT action above
+follows in the same call (`timeout.phase` is `"trading"`). Other phases → `WRONG_PHASE`.
 
 ### 4.10 Building, selling, mortgaging
 - BUILD: property owned by actor; owns full group (`NOT_MONOPOLY`); no tile in group mortgaged (`MORTGAGED_IN_GROUP`);
@@ -345,18 +395,117 @@ Only the current player, only while status active.
 BUILD, UNMORTGAGE: phases `rolling`, `jail_decision`, `end_turn`, `buying_or_auction`.
 SELL_HOUSE, MORTGAGE: those phases **and** `paying`.
 (Spec says rolling/end_turn; `jail_decision` and `buying_or_auction` are a deliberate extension so a player can raise
-cash to pay a jail fine or buy a property.)
+cash to pay a jail fine or buy a property.) Never during `auction` or `trading` (`WRONG_PHASE`).
+
+### 4.12 Auctions
+An open ascending auction; anyone taking part may bid at any time, not just the current player, who stays the
+current player throughout.
+- Start: DECLINE in `buying_or_auction` with `settings.auctionOnDecline` (4.4), or `START_AUCTION`, which is identical
+  (same state, same events). START_AUCTION checks: game active, player active, current player (`NOT_YOUR_TURN`), phase
+  `buying_or_auction` (`WRONG_PHASE`), then `auctionOnDecline` (`AUCTIONS_DISABLED`). State: `pendingPurchase = null`,
+  `auction = { tileIndex, highBid: 0, highBidderId: null, bids: [], participants, passed: [] }` with `participants` =
+  `activePlayers` (non-bankrupt, in `turn.order` order, the decliner included); phase `auction`. Events `declined`,
+  `auction_started {tileIndex, participants}`.
+- `BID {amount}` checks, first failure wins: `amount` an integer (`BAD_PAYLOAD`, before the status check) → game active
+  (`GAME_NOT_ACTIVE`) → player active (`NO_PLAYER`) → phase `auction` (`WRONG_PHASE`) → in `participants`
+  (`NOT_PARTICIPANT`) → not in `passed` (`ALREADY_PASSED`) → not the high bidder (`ALREADY_HIGH_BIDDER`) →
+  `amount > highBid` and `amount >= 1` (`BID_TOO_LOW`) → `amount <= cash` (`INSUFFICIENT_FUNDS`; bidding all your cash is
+  fine). Effect: `highBid = amount`, `highBidderId = player`, `bids.push({playerId, amount})`; event `auction_bid`.
+- `PASS_AUCTION` checks the same chain without the amount (so the high bidder can't pass: `ALREADY_HIGH_BIDDER`).
+  Effect: `passed.push(player)`; event `auction_passed`.
+- End condition, checked after every BID, PASS_AUCTION and resignation: no participant other than the high bidder is
+  still in (i.e. every other participant has passed or is bankrupt). With a high bidder that means everyone else passed;
+  without one, everyone passed. (So a bid made when everyone else has already passed wins at once.)
+- `TIMEOUT` (current player) in `auction` ends it now, whatever the end condition says.
+- Ending: the high bidder pays `highBid` to the bank (never the pot) and owns the tile (unmortgaged, no buildings) →
+  `auction_won {playerId, tileIndex, amount}`; no high bidder → `auction_unsold {tileIndex}` and the tile stays unowned.
+  `auction = null`, phase `end_turn` (`rollAgain` preserved, so after a doubles roll the player must ROLL next).
+- Nothing else is legal during an auction: no turn, management or trade actions for anyone (`WRONG_PHASE`), except
+  LEAVE (resign, 4.2) and the server's TIMEOUT.
+- Invariants: `highBid === 0` ⇔ `highBidderId === null`; `highBid` ≤ the high bidder's cash (cash can't change during
+  an auction); bids by players still in the auction (not passed, not bankrupt) rise strictly, and `highBid` is the latest
+  of them (or 0). A player who passed is never the high bidder.
+
+### 4.13 Trading
+One pending trade at a time, proposed by the current player on their own turn to one other active player.
+- `PROPOSE_TRADE {toPlayerId, give, get}`, `give` = what the proposer hands over, `get` = what the target hands over.
+  Shape (`BAD_PAYLOAD`, checked before the game status): `toPlayerId` a string; `give` and `get` plain objects whose
+  `cash` and `jailCards` are absent or non-negative integers and whose `tiles` is absent or an array of distinct
+  integers that are ownable tile indices. Absent fields mean 0 / `[]` (the stored trade always has all three).
+  Then: game active → player active → current player (`NOT_YOUR_TURN`) → no trade pending (`TRADE_PENDING`) → phase
+  `rolling`, `jail_decision`, `end_turn` or `paying` (`WRONG_PHASE`) → fewer than `MAX_TRADES_PER_TURN` (5) proposals
+  this turn (`TRADE_LIMIT`) → `validateTrade` (§2: target ≠ self `BAD_PAYLOAD`, target exists and active `NO_PLAYER`,
+  `EMPTY_TRADE` when both sides are empty, then ownership, buildings, cash, cards) → in `paying` only, the debt rule below
+  (`UNFAIR_TRADE`).
+  Effect: `trade = { id: "t_" + seq, fromPlayerId, toPlayerId, give, get, returnPhase: <current phase> }` where `seq` is
+  the `state.seq` the action was applied to; phase `trading`; `turn.tradesProposed += 1`. Event `trade_proposed`.
+- Proposals per turn: at most `MAX_TRADES_PER_TURN` (5), answered or not, so a player can't flood the table (and the log)
+  with offer/withdraw cycles. The count is `turn.tradesProposed`, reset when the turn passes.
+- Debt rule (`UNFAIR_TRADE`, when proposed from `paying` and checked again on ACCEPT when `returnPhase` is `paying`): a
+  debtor may sell but not give anything away, so their assets can't be handed to someone other than their creditor just
+  before a bankruptcy. The trade must not lower the proposer's `liquidationValue`: cash received − cash given − the
+  proposer's 10% fees + the mortgage value of the unmortgaged tiles received − that of the unmortgaged tiles given ≥ 0.
+  Mortgaged tiles and jail cards count as $0 (they raise nothing). Outside a debt any offer is allowed, gifts included.
+- Validity (`validateTrade`, on PROPOSE and again on ACCEPT): each side owns the tiles it gives (`NOT_OWNER`); no tile in
+  the colour group of any traded property has buildings (`HAS_BUILDINGS`; railroads and utilities are always fine); each
+  side has the cash (`INSUFFICIENT_FUNDS`) and the jail cards (`NO_JAIL_CARD`, counted by `getOutOfJailCards`) it gives.
+- Mortgaged tiles change hands still mortgaged; the RECEIVER immediately pays the bank (never the pot)
+  `mortgageTransferFee` (10% of the mortgage value, rounded up) per mortgaged tile received. ACCEPT fails with
+  `INSUFFICIENT_FUNDS` if either side couldn't pay its fees from its cash after the cash exchange (PROPOSE doesn't check
+  fees).
+- Phase `trading`: the target may `ACCEPT_TRADE` or `REJECT_TRADE`; the proposer may `REJECT_TRADE` (withdraw). Nothing
+  else is legal for anyone (`WRONG_PHASE` for turn and management actions) except LEAVE and the server's TIMEOUT.
+  ACCEPT / REJECT checks: game active → player active → a trade pending, and when the action carries `tradeId`, it is
+  that trade's id (`NO_TRADE` otherwise: the offer the player read was withdrawn or replaced) → ACCEPT: player is the
+  target, REJECT: player is either party (`NOT_TRADE_PARTY` otherwise; also for the proposer trying to ACCEPT) → ACCEPT
+  only: `validateTrade` again, the debt rule (when `returnPhase` is `paying`), then the fee check. `tradeId` is
+  optional; the client always sends it.
+- `ACCEPT_TRADE`: cash moves both ways; each traded tile's `ownerId` changes (mortgage state kept); jail cards move
+  from the END of the giver's `jailCards` to the end of the receiver's, `getOutOfJailCards` adjusted on both; fees are
+  charged; `trade = null`; phase = `returnPhase`. Event `trade_accepted {..., fees}` with `fees = { [fromPlayerId]: n,
+  [toPlayerId]: m }` (both keys, 0 when none).
+- `REJECT_TRADE`: `trade = null`; phase = `returnPhase`. Event `trade_rejected {tradeId, byPlayerId}`.
+- The turn resumes exactly where it was: `turn` is unchanged apart from the phase and `tradesProposed` (a pending debt
+  stays pending, `rollAgain` is kept). `TIMEOUT` → 4.9; resignations → 4.2.
+
+Settled here where the auction/trading feature spec left a choice (engine and tests both pin these; real-Monopoly-like
+where it matters):
+- BID: `ALREADY_HIGH_BIDDER` is checked before the amount; an integer below 1 is `BID_TOO_LOW` (a non-integer `BAD_PAYLOAD`).
+- A resigned high bidder's bid falls back only to a bid by a player still in the auction. A player who passed dropped out
+  and is never made to buy (so their old bid no longer counts, and a later bid may be lower than it).
+- The auction price and the mortgage-transfer fee go to the bank, never to the free-parking pot.
+- PROPOSE_TRADE: to yourself, or a non-string `toPlayerId` → `BAD_PAYLOAD`; an unknown or bankrupt target → `NO_PLAYER`;
+  non-ownable or repeated tile indices → `BAD_PAYLOAD`; a second proposal → `TRADE_PENDING` (checked before the phase).
+- ACCEPT_TRADE / REJECT_TRADE with no trade pending, or naming another trade (`tradeId`) → `NO_TRADE` for anyone (on or
+  off turn); the proposer trying to ACCEPT → `NOT_TRADE_PARTY`.
+- Gifts are allowed outside a debt (official rules allow a sale "for any amount"), so a player about to resign can still
+  give their things away; only the debtor's gift to someone other than the creditor is blocked (debt rule above).
+- `trade.id` = `"t_" + seq` of the state the proposal was applied to; `trade_accepted.fees` always has both keys.
+- A third player's resignation leaves a pending trade alone, as at a real table, unless the proposer is paying a debt
+  partly owed to the leaver (4.2 step 1).
+- `START_AUCTION` is listed wherever it would succeed, alongside DECLINE (same effect).
 
 ---
 
 ## 5. `legalActions(state, playerId)`
 ```js
-→ { actions: string[], build: number[], sellHouse: number[], mortgage: number[], unmortgage: number[] }
+→ { actions: string[], build: number[], sellHouse: number[], mortgage: number[], unmortgage: number[],
+    auction: { minBid, maxBid } | null, tradeTargets: string[] }
 ```
 `actions` lists action types (other than the four management ones) that would **succeed right now** for this
-player. The management arrays list tile indices (ascending) for which that action would succeed. `playerId` may be null
-(spectator): lobby with room → `["JOIN"]`, else empty. Stub and TIMEOUT actions are never listed.
-Invariant (tested by the simulator): every listed action succeeds when applied; unlisted turn actions fail.
+player — any player, not only the current one (BID / PASS_AUCTION for auction participants, ACCEPT / REJECT_TRADE for
+trade parties). The management arrays list tile indices (ascending) for which that action would succeed. `playerId`
+may be null (spectator): lobby with room → `["JOIN"]`, else empty (`auction: null`, `tradeTargets: []`). TIMEOUT is
+never listed.
+- `BID` is listed, and `auction` is `{ minBid: highBid + 1, maxBid: player's cash }`, when a bid of `minBid` would
+  succeed; then every integer amount in that range succeeds. Otherwise `auction` is null.
+- `PROPOSE_TRADE` is listed when the player may open a trade at all (game active, their turn, no trade pending, a
+  proposing phase, proposals left this turn); `tradeTargets` then lists every other active player (in turn order), else
+  it is empty. Whether a particular offer is valid is only known on send (`validateTrade`, and in `paying` the debt rule).
+- `ACCEPT_TRADE` is listed for the target only if accepting would succeed right now (including the fee check);
+  `REJECT_TRADE` for both parties. `START_AUCTION` is listed wherever it would succeed (alongside DECLINE).
+Invariant (tested by the simulator): every listed action succeeds when applied (BID at `minBid` and `maxBid`,
+PROPOSE_TRADE with a valid offer to each target); unlisted actions fail.
 It gives the same result on the public state (§7: no `rng`, decks reduced to `{size}`), so clients may call it.
 `START_GAME` depends on `players[].connected` (§3 stand-in); the server broadcasts every connection change, so the
 list stays current.
@@ -386,11 +535,21 @@ mortgaged {playerId, tileIndex, amount}      unmortgaged {playerId, tileIndex, a
 debt_started {playerId, toPlayerId, amount, reason}
 debt_paid {playerId, toPlayerId, amount, reason, payees?}    // payees: [{playerId, amount}] for pay_each debts
 debt_reduced {playerId, amount}                    // a creditor went bankrupt; amount = what is still owed (4.8)
-bankrupt {playerId, toPlayerId, cash}              // cash = after the building sale; goes to the creditor or leaves the game
+bankrupt {playerId, toPlayerId, cash, reason}      // cash = after the building sale; goes to the creditor or leaves the game
+                                                   // reason: "resigned" (LEAVE) | "debt"
 game_over {winnerId}
 timeout {playerId, phase}                          // always the first event of a TIMEOUT
+auction_started {tileIndex, participants}          auction_bid {playerId, amount}      auction_passed {playerId}
+auction_won {playerId, tileIndex, amount}          auction_unsold {tileIndex}          // amount paid to the bank
+trade_proposed {tradeId, fromPlayerId, toPlayerId, give, get}
+trade_accepted {tradeId, fromPlayerId, toPlayerId, give, get, fees}   // fees: { [playerId]: amount } for both parties
+trade_rejected {tradeId, byPlayerId}               trade_cancelled {tradeId, reason:"timeout"|"resigned"}
 ```
 Ordering notes: every `turn_started` gets a `turn_ended`; a game-over batch ends `[..., turn_ended, game_over]`.
+Every `auction_started` gets exactly one `auction_won` or `auction_unsold` (a cancelled auction is `auction_unsold`,
+emitted before the `turn_ended` of the turn that passes or ends). Every `trade_proposed` gets exactly one
+`trade_accepted`, `trade_rejected` or `trade_cancelled`. A DECLINE / START_AUCTION batch is `[declined, auction_started]`.
+Cash in `give` / `get` and `fees` is part of `trade_accepted`; there are no separate `paid` events for it.
 When a forced jail fine is paid later (PAY_DEBT or TIMEOUT in `paying`), that batch has `left_jail {method:"forced_fine"}`
 and `moved {via:"roll"}` but no `dice_rolled`; the dice are in `state.turn.lastRoll`.
 
@@ -414,11 +573,19 @@ Client → server:
 - `{ t:"action", seq?, action:{ type, ...payload } }` — the server sets `action.playerId` from the socket's seat and ignores
   any client value. `type` must be a non-empty string of ≤ 40 chars (`BAD_MESSAGE`). If `seq` is a number and differs from
   the current `state.seq`, the reply is error `STALE_STATE` ("The game moved on — try again") and nothing is applied;
-  without `seq`, no check. `JOIN` from a seatless socket: error `ALREADY_SEATED` if this socket already created a seat in
-  this game that still exists; else the server creates `playerId` (`p_` + 8 chars of the game-id alphabet) and a secret
-  `token` (32 hex), applies JOIN, binds the socket, sends `welcome`, then broadcasts `state`. Other actions from a seatless
-  socket → `NOT_SEATED`. `TIMEOUT` from a client → `FORBIDDEN`. Engine errors are forwarded as `{code, message}` (§4.1).
+  without `seq`, no check. Exception, because bids race each other: for `BID` and `PASS_AUCTION` any `seq` from the
+  running auction (≥ the `seq` of the state in which it started, ≤ the current one) passes, and the engine judges the
+  action against the current state (a bid that was overtaken gets `BID_TOO_LOW`); a `seq` from before the auction is
+  still `STALE_STATE`, so a late bid never lands in a later auction. `JOIN` from a seatless socket: error
+  `ALREADY_SEATED` if this socket already created a seat in this game that still exists; else the server creates
+  `playerId` (`p_` + 8 chars of the game-id alphabet) and a secret `token` (32 hex), applies JOIN, binds the socket, sends
+  `welcome`, then broadcasts `state`. Other actions from a seatless socket → `NOT_SEATED`. `TIMEOUT` from a client →
+  `FORBIDDEN`. Engine errors are forwarded as `{code, message}` (§4.1).
 - `{ t:"ping" }` → `{ t:"pong" }` (app-level keepalive).
+- The server handles a socket's messages one at a time, in order, and sends everything a message causes (its `error`,
+  or the `state` broadcast of the change it made) before it reads the next one. So a `ping` sent right after an action
+  is answered after that action's result, even when other players' moves arrive in between (scripts/bot-client.js
+  settles its actions this way).
 
 Server → client:
 - `{ t:"welcome", gameId, playerId, token }`
@@ -467,16 +634,44 @@ Game ids: `g_` + 6 chars from `abcdefghjkmnpqrstuvwxyz23456789` (never reusing a
 ---
 
 ## 8. Client ownership rules
-- `public/renderer2d.js` exports **only** `render(state, events, myPlayerId)`. It is the only file that touches the
-  board DOM: everything inside `<div id="board">`, including a tile info card (tap/click a tile). It fetches `/api/board`
-  itself (top-level await) and injects its own stylesheet `public/renderer2d.css`. To close the info card it registers
-  document-level `click` (capture) and `keydown` (Escape) listeners and a window `resize` listener. On boards ≤ 480px wide,
-  tiles show short labels (`.r2d-name-full` / `.r2d-name-short`). `ui.js` imports it in one place
-  (`import { render as renderBoard } from './renderer2d.js'`) and ignores clicks inside `#board`; swapping in another
-  renderer (e.g. Three.js) means replacing this module or that one import, nothing else.
+- `public/renderer-switch.js` is the board module `ui.js` imports (one line:
+  `import { render as renderBoard, busyUntil as boardBusyUntil } from './renderer-switch.js'`). It exports
+  `render(state, events, myPlayerId)` (the renderer contract below) plus `busyUntil()` (the `Date.now()` ms at which the
+  board's running animation lands; 0 when idle or in 2D — ui.js holds dialogs until then), `getMode()`,
+  `setMode('2d'|'3d', {persist})`, `onModeChange(cb)` and `setBoardToggle(visible)`. It hands `#board` to exactly one
+  renderer at a time and draws a small 2D|3D toggle inside `#board`. `localStorage["monopoly.renderer"]` = `'2d'|'3d'`
+  (default `'2d'`; `?renderer=3d` forces 3D for one page load). If 3D can't run (no WebGL2, start failure, lost GPU
+  context) it shows 2D for that page without changing the saved choice.
+- Renderers — `public/renderer2d.js` (DOM, `renderer2d.css`) and `public/renderer3d.js` (Three.js; pieces in
+  `public/r3d/`, styles in `public/r3d/r3d.css`, three r186 vendored in `public/vendor/three/`, downloaded only when 3D is
+  chosen) — each export `render(state, events, myPlayerId)` and `dispose()` (renderer3d also `busyUntil()`), own
+  everything inside `<div id="board">` while active, fetch `/api/board` themselves and inject their own stylesheet. No
+  other module touches the board DOM; `ui.js` ignores clicks inside `#board`.
+- renderer2d specifics: a tile info card (tap/click a tile); to close it, document-level `click` (capture) and `keydown`
+  (Escape) listeners and a window `resize` listener. On boards ≤ 480px wide, tiles show short labels
+  (`.r2d-name-full` / `.r2d-name-short`).
 - `public/ui.js` owns everything outside `#board`: screens, side panel, buttons (driven by `legal`), dialogs, countdown.
-  - `index.html` panel slots owned by ui.js: `#panel-dialog` (buy / debt / jail / game-over details on narrow layouts,
-    above `#action-bar`) and `#recent-log` (last 5 log lines on narrow layouts). At ≤ 899px `#dialog-layer` is unused.
+  - `index.html` panel slots owned by ui.js: `#panel-dialog` (buy / debt / jail / trade / game-over details on narrow
+    layouts, above `#action-bar`), `#recent-log` (last 5 log lines on narrow layouts) and `#auction-sheet` (the running
+    auction, for everyone at the table on every layout: deed, high bid, clock, quick bids / own amount / pass from
+    `legal`, read-only for spectators). At ≤ 899px `#dialog-layer` is unused. There, when an auction starts and the
+    player can bid or pass, the sheet is scrolled into view (instead of the "up for auction" toast, which would cover it).
+  - Quick bids (+$1 / +$10 / +$50 / +$100 over the high bid) keep fixed slots: a step the bidder can't afford stays in
+    its slot, disabled (never turned into "all in"); the bid box's Max button fills in all their cash, and Bid sends it.
+    Whenever the high bid changes, the quick bids ignore clicks for 700 ms, so a click aimed at the old amount can't bid
+    the new one.
+  - Trading: "Trade" (when `legal.actions` has PROPOSE_TRADE) opens a builder dialog (target from `legal.tradeTargets`,
+    tradeable tiles, cash, jail cards, the 10% fees) that refuses to send an offer `validateTrade` or the ACCEPT fee check
+    would reject (in debt, also the debt rule's `UNFAIR_TRADE`). The target gets the offer as a dialog (Accept only when
+    legal, and not until the offer has been on screen for 1 s, so an offer swapped in at the last moment isn't accepted
+    by a click meant for the one before; the dialog says which colour sets the trade completes), the proposer can
+    withdraw (REJECT_TRADE), everyone else sees it in the banner and action bar. ACCEPT_TRADE / REJECT_TRADE carry the
+    `tradeId` of the offer on screen. Accept / Reject never receive focus automatically, and a focus remembered from an
+    earlier offer never lands on a new offer's buttons. A BID / PASS_AUCTION refused because someone was quicker
+    (`BID_TOO_LOW`, `ALREADY_*`, the auction just ended) gets a mild info toast, not an error.
+  - Debt: once the player has the cash to pay, the banner says so and Declare bankruptcy is not offered (Resign still is).
+  - The create form's settings: starting cash, turn timer, max players, Free Parking pot, build evenly, auctions
+    (`auctionOnDecline`); the lobby lists all six.
   - After `POST /api/games` the creating tab joins the new lobby automatically (JOIN with the home-screen name and the
     first free token), so the creator becomes host. With no name it focuses the lobby's join form instead.
   - "Start game" is shown to any seated player whose `legal.actions` includes START_GAME (e.g. the stand-in).
@@ -516,7 +711,17 @@ Turn timer (`server/timers.js`), only while status active, `turnTimeoutSec > 0` 
 - Current player disconnected: deadline = min(existing, now + 45 s); if they return before it expires, the rest of their
   turn time is restored. Nobody connected: timer paused (`deadlineAt null`); the first player back gets a fresh deadline.
 - On expiry the server applies `TIMEOUT` (4.9); a failed TIMEOUT is retried every 5 s, 3 times.
-- With `turnTimeoutSec 0` nothing is auto-played, even for a disconnected player.
+- With `turnTimeoutSec 0` nothing is auto-played, even for a disconnected player — except auctions (below).
+- Auctions are ALWAYS timed, independent of `turnTimeoutSec` and of who is connected: `deadlineAt = now + 10 s`
+  when the auction starts and after every bid (the timer key includes `auction.tileIndex` and `auction.bids.length`;
+  passes do NOT reset the clock) — but never later than 120 s after the auction started (`AUCTION_MAX_MS`), so two
+  players raising each other by $1 can't hold the table. Disconnected participants — the current player included — are not waited for and
+  get no 45 s grace: the 10 s clock simply runs out, and TIMEOUT (current player) ends the auction. Like the turn timer
+  it pauses only while nobody at all is connected (e.g. right after a restart), and the first player back gets a fresh
+  10 s (and a fresh 120 s limit) — so a restart mid-auction doesn't close it before anyone could reconnect.
+- While `trading`, the timer key uses the trade's `returnPhase` instead of `trading`, so proposing (and rejecting)
+  trades never refreshes the proposer's turn deadline; when it expires, TIMEOUT cancels the trade and times out the
+  underlying phase (4.9).
 
 Persistence (`server/persist.js`), under `DATA_DIR`:
 - `games/<id>.json` = `{ version: 1, state /* full private state incl. rng + decks */, secrets: { [playerId]: token } }`,

@@ -207,7 +207,7 @@ describe('money cards', () => {
     const { state, events } = roll(s, 'p1', 3, 4);
     assert.equal(player(state, 'p3').bankrupt, true);
     assert.equal(player(state, 'p3').cash, 0);
-    assertEvent(events, 'bankrupt', { playerId: 'p3', toPlayerId: 'p1' });
+    assertEvent(events, 'bankrupt', { playerId: 'p3', toPlayerId: 'p1', reason: 'debt' });
     assert.deepEqual(tile(state, 3), { index: 3, ownerId: 'p1', houses: 0, mortgaged: true });
     assert.equal(player(state, 'p1').cash, 1500 + 10 + 5);
     assert.equal(player(state, 'p2').cash, 1490);

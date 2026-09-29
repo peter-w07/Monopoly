@@ -26,13 +26,20 @@ describe('TIMEOUT', () => {
     assert.equal(state.turn.phase, 'buying_or_auction');
   });
 
-  test('buying_or_auction → DECLINE', () => {
+  test('buying_or_auction → DECLINE (which opens an auction when auctionOnDecline is on)', () => {
     const s = roll(newGame(), 'p1', 1, 2).state;
     const { state, events } = act(s, timeout());
     assertEvent(events, 'timeout', { playerId: 'p1', phase: 'buying_or_auction' });
     assertEvent(events, 'declined', { playerId: 'p1', tileIndex: 3 });
+    assertEvent(events, 'auction_started', { tileIndex: 3 });
     assert.equal(tile(state, 3).ownerId, null);
-    assert.equal(state.turn.phase, 'end_turn');
+    assert.equal(state.turn.phase, 'auction');
+
+    const off = roll(newGame({ settings: { auctionOnDecline: false } }), 'p1', 1, 2).state;
+    const declined = act(off, timeout());
+    assertEvent(declined.events, 'declined', { playerId: 'p1', tileIndex: 3 });
+    assert.equal(tile(declined.state, 3).ownerId, null);
+    assert.equal(declined.state.turn.phase, 'end_turn');
   });
 
   test('end_turn → END_TURN', () => {

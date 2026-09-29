@@ -156,7 +156,8 @@ async function serveStatic(req, res, pathname) {
   res.writeHead(200, {
     'Content-Type': CONTENT_TYPES[path.extname(filePath).toLowerCase()] ?? 'application/octet-stream',
     'Content-Length': stat.size,
-    'Cache-Control': 'no-cache',
+    // Vendored libraries (three.js, ~830 KB) only change on a deliberate upgrade; cache them for a day.
+    'Cache-Control': segments[0] === 'vendor' ? 'public, max-age=86400' : 'no-cache',
     'X-Content-Type-Options': 'nosniff',
   });
   if (req.method === 'HEAD') return res.end();

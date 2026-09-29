@@ -1,7 +1,8 @@
 // Pure rule queries. Nothing here mutates state.
 //
 // validateAction() holds one validator per action type. applyAction (actions.js) and
-// legalActions (below) both use it, so an action listed as legal always succeeds.
+// legalActions (below) both use it, so an action listed as legal always succeeds. Trades have
+// one more shared validator, validateTrade(), run on PROPOSE_TRADE and again on ACCEPT_TRADE.
 
 import { BOARD, TOKENS, getTile, groupIndices, isOwnable } from './board.js';
 
@@ -117,6 +118,7 @@ export function netWorth(state, playerId) {
 
 const OK = Object.freeze({ ok: true });
 const fail = (code, message) => ({ ok: false, code, message });
+const err = (code, message) => ({ code, message });
 
 function checkOwnedTile(state, playerId, tileIndex, propertyOnly) {
   const valid = Number.isInteger(tileIndex) && (propertyOnly ? getTile(tileIndex)?.type === 'property' : isOwnable(tileIndex));
@@ -189,16 +191,138 @@ export function canUnmortgage(state, playerId, tileIndex) {
 }
 
 // ---------------------------------------------------------------------------
+// Trading (CONTRACT §4.13)
+// ---------------------------------------------------------------------------
+
+const isCount = (v) => v === undefined || (Number.isInteger(v) && v >= 0);
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/** One side of an offer: an object whose cash / jailCards are absent or non-negative integers and whose tiles are distinct ownable indices. */
+function tradeSideShapeOk(side) {
+  if (!isPlainObject(side) || !isCount(side.cash) || !isCount(side.jailCards)) return false;
+  const { tiles } = side;
+  if (tiles === undefined) return true;
+  return Array.isArray(tiles) && tiles.every((i) => Number.isInteger(i) && isOwnable(i)) && new Set(tiles).size === tiles.length;
+}
+
+function tradeShapeOk(offer) {
+  return isPlainObject(offer) && typeof offer.toPlayerId === 'string'
+    && tradeSideShapeOk(offer.give) && tradeSideShapeOk(offer.get);
+}
+
+/** A well-formed trade side with every field filled in (absent fields → 0 / []). Always a fresh object. */
+export function normalizeTradeSide(side) {
+  return { cash: side?.cash ?? 0, tiles: [...(side?.tiles ?? [])], jailCards: side?.jailCards ?? 0 };
+}
+
+const isEmptySide = (side) => side.cash === 0 && side.tiles.length === 0 && side.jailCards === 0;
+
+/** A tile can change hands when no tile of its colour group has buildings (railroads and utilities always can). */
+function tradeableTile(state, tileIndex) {
+  return getTile(tileIndex).type !== 'property' || groupStates(state, tileIndex).every((t) => t.houses === 0);
+}
+
+/** Indices (ascending) of the player's tiles that could be traded right now. */
+export function tradeableTiles(state, playerId) {
+  return state.tiles.filter((t) => t.ownerId === playerId && tradeableTile(state, t.index)).map((t) => t.index);
+}
+
+/** What the receiver of a mortgaged tile pays the bank: 10% of its mortgage value, rounded up like unmortgageCost. */
+export function mortgageTransferFee(tileIndex) {
+  const exact = getTile(tileIndex).mortgage * BOARD.unmortgageInterest;
+  return Math.ceil(Math.round(exact * 1e6) / 1e6);
+}
+
+/** Fees each party would pay for the mortgaged tiles it receives: { [fromPlayerId]: n, [toPlayerId]: m }. */
+export function tradeFees(state, fromPlayerId, offer) {
+  const feeFor = (tiles) => tiles.reduce((sum, i) => sum + (getTileState(state, i)?.mortgaged ? mortgageTransferFee(i) : 0), 0);
+  return {
+    [fromPlayerId]: feeFor(normalizeTradeSide(offer.get).tiles),
+    [offer.toPlayerId]: feeFor(normalizeTradeSide(offer.give).tiles),
+  };
+}
+
+/**
+ * Whether `fromPlayerId` could trade `offer` = { toPlayerId, give, get } right now, ignoring whose turn
+ * and which phase it is. Shared by PROPOSE_TRADE and ACCEPT_TRADE (which re-checks it). → null | { code, message }
+ */
+export function validateTrade(state, fromPlayerId, offer) {
+  if (!tradeShapeOk(offer)) return err('BAD_PAYLOAD', 'Malformed trade.');
+  const from = getPlayer(state, fromPlayerId);
+  if (!from || from.bankrupt) return err('NO_PLAYER', 'You are not an active player in this game.');
+  if (offer.toPlayerId === fromPlayerId) return err('BAD_PAYLOAD', "You can't trade with yourself.");
+  const to = getPlayer(state, offer.toPlayerId);
+  if (!to || to.bankrupt) return err('NO_PLAYER', 'That player is not in the game.');
+  const give = normalizeTradeSide(offer.give);
+  const get = normalizeTradeSide(offer.get);
+  if (isEmptySide(give) && isEmptySide(get)) return err('EMPTY_TRADE', 'Put something on at least one side of the trade.');
+  const sides = [[from, give], [to, get]];
+  for (const [owner, side] of sides) {
+    const stranger = side.tiles.find((i) => getTileState(state, i).ownerId !== owner.id);
+    if (stranger !== undefined) return err('NOT_OWNER', `${owner.name} doesn't own ${getTile(stranger).name}.`);
+  }
+  for (const [, side] of sides) {
+    const built = side.tiles.find((i) => !tradeableTile(state, i));
+    if (built !== undefined) return err('HAS_BUILDINGS', `Sell the buildings in ${getTile(built).name}'s group before trading it.`);
+  }
+  for (const [owner, side] of sides) {
+    if (owner.cash < side.cash) return err('INSUFFICIENT_FUNDS', `${owner.name} doesn't have $${side.cash}.`);
+  }
+  for (const [owner, side] of sides) {
+    if (owner.getOutOfJailCards < side.jailCards) return err('NO_JAIL_CARD', `${owner.name} doesn't have ${side.jailCards} jail card(s).`);
+  }
+  return null;
+}
+
+/** Proposals the current player may make in one turn (TRADE_LIMIT after that). */
+export const MAX_TRADES_PER_TURN = 5;
+
+/**
+ * What the offer does to the proposer's liquidationValue: cash in − cash out − their 10% fees, plus
+ * the mortgage value of the unmortgaged tiles they receive, minus that of the ones they give
+ * (mortgaged tiles and jail cards count as $0: they raise nothing).
+ */
+function tradeLiquidityChange(state, fromPlayerId, offer) {
+  const give = normalizeTradeSide(offer.give);
+  const get = normalizeTradeSide(offer.get);
+  const worth = (tiles) => tiles.reduce((sum, i) => sum + (getTileState(state, i).mortgaged ? 0 : getTile(i).mortgage), 0);
+  return get.cash - give.cash - tradeFees(state, fromPlayerId, offer)[fromPlayerId] + worth(get.tiles) - worth(give.tiles);
+}
+
+/**
+ * A proposer in debt may sell (for cash, or swap at equal value) but not give anything away: the
+ * trade must not lower what they could raise to pay, or they could hand their assets to anyone
+ * but their creditor before going bankrupt (§4.13).
+ */
+function checkDebtTrade(state, fromPlayerId, offer) {
+  const change = tradeLiquidityChange(state, fromPlayerId, offer);
+  if (change >= 0) return null;
+  return err('UNFAIR_TRADE', `While you're in debt you can't give value away: this trade would leave you $${-change} less to pay with (properties count at their mortgage value).`);
+}
+
+/** ACCEPT_TRADE only: after the cash changes hands, each party must afford its mortgage fees. */
+function checkTradeFees(state, trade) {
+  const fees = tradeFees(state, trade.fromPlayerId, trade);
+  const after = (playerId, paid, received) => getPlayer(state, playerId).cash - paid + received;
+  const fromCash = after(trade.fromPlayerId, trade.give.cash, trade.get.cash);
+  const toCash = after(trade.toPlayerId, trade.get.cash, trade.give.cash);
+  if (fromCash < fees[trade.fromPlayerId] || toCash < fees[trade.toPlayerId]) {
+    return err('INSUFFICIENT_FUNDS', "A party can't pay the 10% fee on the mortgaged properties it would receive.");
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Action validation (CONTRACT §4.1). Order: known type → payload shape → game status →
 // player exists & not bankrupt → current player → phase → rule checks. First failure wins.
 // ---------------------------------------------------------------------------
 
-const err = (code, message) => ({ code, message });
 const fromCheck = (result) => (result.ok ? null : err(result.code, result.message));
 
 const MANAGE_PHASES = ['rolling', 'jail_decision', 'end_turn', 'buying_or_auction'];
 const RAISE_PHASES = [...MANAGE_PHASES, 'paying'];
-const TIMEOUT_PHASES = ['rolling', 'jail_decision', 'buying_or_auction', 'end_turn', 'paying'];
+const TRADE_PHASES = ['rolling', 'jail_decision', 'end_turn', 'paying']; // where a trade may be proposed
+const TIMEOUT_PHASES = ['rolling', 'jail_decision', 'buying_or_auction', 'end_turn', 'paying', 'auction', 'trading'];
 
 function requireActive(state) {
   return state.status === 'active' ? null : err('GAME_NOT_ACTIVE', 'The game is not in progress.');
@@ -217,11 +341,50 @@ function requireTurn(state, action, phases) {
     ?? (phases.includes(state.turn.phase) ? null : err('WRONG_PHASE', `You can't do that now (phase: ${state.turn.phase}).`));
 }
 
-function validateStub(state) {
-  return requireActive(state) ?? err('NOT_IMPLEMENTED', 'Auctions and trading are not implemented yet.');
+/**
+ * BID / PASS_AUCTION: game active → player active → an auction is running → the player takes part
+ * in it → hasn't passed → isn't the high bidder. Any participant may act, not only the current player.
+ */
+function requireBidder(state, playerId) {
+  const bad = requireActive(state)
+    ?? requirePlayer(state, playerId)
+    ?? (state.turn.phase === 'auction' && state.auction ? null : err('WRONG_PHASE', 'There is no auction running.'));
+  if (bad) return bad;
+  const { participants, passed, highBidderId } = state.auction;
+  if (!participants.includes(playerId)) return err('NOT_PARTICIPANT', 'You are not taking part in this auction.');
+  if (passed.includes(playerId)) return err('ALREADY_PASSED', 'You have dropped out of this auction.');
+  if (highBidderId === playerId) return err('ALREADY_HIGH_BIDDER', 'You already have the high bid.');
+  return null;
+}
+
+/**
+ * PROPOSE_TRADE before looking at the offer: game active → player active → their turn → no trade
+ * pending → phase → proposals left this turn.
+ */
+function tradeGate(state, playerId) {
+  return requireActive(state)
+    ?? requirePlayer(state, playerId)
+    ?? (currentPlayerId(state) === playerId ? null : err('NOT_YOUR_TURN', "It's not your turn."))
+    ?? (state.trade ? err('TRADE_PENDING', 'A trade is already waiting for an answer.') : null)
+    ?? (TRADE_PHASES.includes(state.turn.phase) ? null : err('WRONG_PHASE', `You can't trade now (phase: ${state.turn.phase}).`))
+    ?? ((state.turn.tradesProposed ?? 0) < MAX_TRADES_PER_TURN
+      ? null : err('TRADE_LIMIT', `You can propose at most ${MAX_TRADES_PER_TURN} trades per turn.`));
+}
+
+/**
+ * ACCEPT_TRADE / REJECT_TRADE: game active → player active → a trade is pending → and, when the
+ * action names one (`tradeId`), it is that trade, so an answer never lands on an offer that replaced
+ * the one the player read.
+ */
+function requireTrade(state, a) {
+  return requireActive(state)
+    ?? requirePlayer(state, a.playerId)
+    ?? (state.trade && (a.tradeId === undefined || a.tradeId === state.trade.id)
+      ? null : err('NO_TRADE', 'That trade offer is no longer open.'));
 }
 
 const hasTileIndex = (a) => Number.isInteger(a.tileIndex);
+const hasTradeId = (a) => a.tradeId === undefined || typeof a.tradeId === 'string'; // optional
 
 /**
  * Who may START_GAME: the host, or — while the host is offline — the first connected player in
@@ -242,6 +405,10 @@ const PAYLOAD_CHECKS = {
   SELL_HOUSE: hasTileIndex,
   MORTGAGE: hasTileIndex,
   UNMORTGAGE: hasTileIndex,
+  BID: (a) => Number.isInteger(a.amount),
+  PROPOSE_TRADE: tradeShapeOk,
+  ACCEPT_TRADE: hasTradeId,
+  REJECT_TRADE: hasTradeId,
 };
 
 const VALIDATORS = {
@@ -289,6 +456,25 @@ const VALIDATORS = {
 
   DECLINE(state, a) {
     return requireTurn(state, a, ['buying_or_auction']);
+  },
+
+  // DECLINE by another name; only meaningful (and only allowed) when declining starts an auction.
+  START_AUCTION(state, a) {
+    return requireTurn(state, a, ['buying_or_auction'])
+      ?? (state.settings.auctionOnDecline ? null : err('AUCTIONS_DISABLED', 'Auctions are turned off in this game.'));
+  },
+
+  BID(state, a) {
+    const bad = requireBidder(state, a.playerId);
+    if (bad) return bad;
+    const { highBid } = state.auction;
+    if (a.amount <= highBid || a.amount < 1) return err('BID_TOO_LOW', `Bid at least $${highBid + 1}.`);
+    if (a.amount > getPlayer(state, a.playerId).cash) return err('INSUFFICIENT_FUNDS', `You don't have $${a.amount}.`);
+    return null;
+  },
+
+  PASS_AUCTION(state, a) {
+    return requireBidder(state, a.playerId);
   },
 
   END_TURN(state, a) {
@@ -343,16 +529,35 @@ const VALIDATORS = {
     return requireTurn(state, a, MANAGE_PHASES) ?? fromCheck(canUnmortgage(state, a.playerId, a.tileIndex));
   },
 
+  PROPOSE_TRADE(state, a) {
+    return tradeGate(state, a.playerId)
+      ?? validateTrade(state, a.playerId, a)
+      ?? (state.turn.phase === 'paying' ? checkDebtTrade(state, a.playerId, a) : null);
+  },
+
+  ACCEPT_TRADE(state, a) {
+    const bad = requireTrade(state, a);
+    if (bad) return bad;
+    const { trade } = state;
+    if (a.playerId !== trade.toPlayerId) return err('NOT_TRADE_PARTY', 'Only the player the trade was offered to can accept it.');
+    return validateTrade(state, trade.fromPlayerId, trade)
+      ?? (trade.returnPhase === 'paying' ? checkDebtTrade(state, trade.fromPlayerId, trade) : null)
+      ?? checkTradeFees(state, trade);
+  },
+
+  // The target turns the offer down, or the proposer withdraws it.
+  REJECT_TRADE(state, a) {
+    const bad = requireTrade(state, a);
+    if (bad) return bad;
+    const { fromPlayerId, toPlayerId } = state.trade;
+    return a.playerId === fromPlayerId || a.playerId === toPlayerId
+      ? null : err('NOT_TRADE_PARTY', 'That trade is between other players.');
+  },
+
   // Server-only; the engine accepts it for the current player in any turn phase.
   TIMEOUT(state, a) {
     return requireTurn(state, a, TIMEOUT_PHASES);
   },
-
-  START_AUCTION: validateStub,
-  BID: validateStub,
-  PROPOSE_TRADE: validateStub,
-  ACCEPT_TRADE: validateStub,
-  REJECT_TRADE: validateStub,
 };
 
 /** All action types the engine knows. */
@@ -375,12 +580,13 @@ export function validateAction(state, action) {
 // ---------------------------------------------------------------------------
 
 const LISTED_TYPES = [
-  'JOIN', 'LEAVE', 'START_GAME', 'ROLL', 'BUY', 'DECLINE', 'END_TURN',
+  'JOIN', 'LEAVE', 'START_GAME', 'ROLL', 'BUY', 'DECLINE', 'START_AUCTION', 'END_TURN',
   'PAY_JAIL_FINE', 'USE_JAIL_CARD', 'PAY_DEBT', 'DECLARE_BANKRUPTCY',
+  'BID', 'PASS_AUCTION', 'PROPOSE_TRADE', 'ACCEPT_TRADE', 'REJECT_TRADE',
 ];
 
 export function legalActions(state, playerId) {
-  const result = { actions: [], build: [], sellHouse: [], mortgage: [], unmortgage: [] };
+  const result = { actions: [], build: [], sellHouse: [], mortgage: [], unmortgage: [], auction: null, tradeTargets: [] };
 
   if (!playerId) {
     // Spectator: can only take a seat.
@@ -389,12 +595,24 @@ export function legalActions(state, playerId) {
   }
 
   for (const type of LISTED_TYPES) {
-    const action = { type, playerId };
-    if (type === 'JOIN') {
-      action.name = 'Player';
-      action.token = TOKENS.find((t) => !state.players.some((p) => p.token === t.id))?.id ?? '';
+    if (type === 'BID') {
+      // Every amount from highBid + 1 up to the player's cash is a valid bid, or none is.
+      const minBid = (state.auction?.highBid ?? 0) + 1;
+      if (validateAction(state, { type, playerId, amount: minBid })) continue;
+      result.auction = { minBid, maxBid: getPlayer(state, playerId).cash };
+    } else if (type === 'PROPOSE_TRADE') {
+      // Listed when the player may open a trade at all; the offer itself is validated when sent.
+      if (tradeGate(state, playerId)) continue;
+      result.tradeTargets = activePlayers(state).filter((p) => p.id !== playerId).map((p) => p.id);
+    } else {
+      const action = { type, playerId };
+      if (type === 'JOIN') {
+        action.name = 'Player';
+        action.token = TOKENS.find((t) => !state.players.some((p) => p.token === t.id))?.id ?? '';
+      }
+      if (validateAction(state, action)) continue;
     }
-    if (!validateAction(state, action)) result.actions.push(type);
+    result.actions.push(type);
   }
 
   // Management actions need the current player in an active game, and every one of them needs

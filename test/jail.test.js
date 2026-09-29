@@ -7,11 +7,12 @@ import {
   setPosition, assertEvent,
 } from './helpers.js';
 
-/** Current player rolls [1, 2], declines any purchase and ends the turn. */
+/** Current player rolls [1, 2], declines any purchase (a TIMEOUT closes the auction unsold) and ends the turn. */
 function simpleTurn(state) {
   const pid = current(state);
   let s = roll(state, pid, 1, 2).state;
   if (s.turn.phase === 'buying_or_auction') s = act(s, { type: 'DECLINE', playerId: pid }).state;
+  if (s.turn.phase === 'auction') s = act(s, { type: 'TIMEOUT', playerId: pid }).state;
   return act(s, { type: 'END_TURN', playerId: pid }).state;
 }
 

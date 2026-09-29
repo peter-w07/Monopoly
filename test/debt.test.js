@@ -121,7 +121,7 @@ describe('bankruptcy', () => {
     const p2 = player(state, 'p2');
     // Events say how much each sell-off raised and how much cash went to the creditor.
     assert.deepEqual(ofType(events, 'sold_house').map((e) => [e.tileIndex, e.houses, e.amount]), [[6, 0, 50], [8, 0, 50], [9, 0, 25]]);
-    assertEvent(events, 'bankrupt', { playerId: 'p1', toPlayerId: 'p2', cash: 225 });
+    assertEvent(events, 'bankrupt', { playerId: 'p1', toPlayerId: 'p2', cash: 225, reason: 'debt' });
 
     // 5 building levels × floor(50 / 2) = 125, plus 100 cash.
     assert.equal(p2.cash, 1500 + 225);
@@ -252,7 +252,7 @@ describe('LEAVE while active (resign)', () => {
       const s = owingBoardwalk();
       const left = act(s, { type: 'LEAVE', playerId: 'p1' });
       const declared = act(s, bankrupt());
-      assertEvent(left.events, 'bankrupt', { playerId: 'p1', toPlayerId: 'p2', cash: 300 });
+      assertEvent(left.events, 'bankrupt', { playerId: 'p1', toPlayerId: 'p2', cash: 300, reason: 'resigned' });
       assert.deepEqual(player(left.state, 'p2'), player(declared.state, 'p2'));
       assert.deepEqual(left.state.tiles, declared.state.tiles);
       assert.deepEqual(player(left.state, 'p2').jailCards, ['chance']);
@@ -292,7 +292,7 @@ describe('LEAVE while active (resign)', () => {
       assert.equal(state.turn.phase, 'end_turn');
       assert.equal(player(state, 'p1').cash, 100);
       assert.equal(tile(state, 5).mortgaged, false);
-      assert.deepEqual(legalActions(state, 'p1').actions, ['LEAVE', 'END_TURN']);
+      assert.deepEqual(legalActions(state, 'p1').actions, ['LEAVE', 'END_TURN', 'PROPOSE_TRADE']);
       const next = act(state, { type: 'TIMEOUT', playerId: 'p1' });
       assertNoEvent(next.events, 'bankrupt');
       assert.equal(current(next.state), 'p3');
@@ -306,7 +306,7 @@ describe('LEAVE while active (resign)', () => {
       assert.equal(state.turn.pendingDebt, null);
       assert.equal(state.turn.phase, 'end_turn');
       assert.equal(state.turn.rollAgain, true);
-      assert.deepEqual(legalActions(state, 'p1').actions, ['LEAVE', 'ROLL']);
+      assert.deepEqual(legalActions(state, 'p1').actions, ['LEAVE', 'ROLL', 'PROPOSE_TRADE']);
       assert.equal(player(state, 'p1').cash, 2);
       assert.equal(player(state, 'p2').cash, 0);
     });

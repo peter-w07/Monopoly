@@ -1,12 +1,11 @@
 // Turn timers and AFK handling: one timer per room, driving state.turn.deadlineAt.
 //
-// room.timer = { key, handle, retries, turnDeadline }
-//   key          `${status}|${turn.number}|${currentPlayerId}|${phase}|${rollAgain}|${doublesCount}` the
-//                deadline belongs to (doublesCount: every doubles roll that lands with nothing pending
-//                leaves phase end_turn + rollAgain unchanged, but still earns a fresh deadline)
-//   handle       the pending setTimeout (expiry or retry)
-//   retries      failed TIMEOUT attempts for the current key
-//   turnDeadline the full-length deadline for this key (restored if an AFK player comes back)
+// room.timer = { key, handle, retries, turnDeadline, auctionEndsBy }
+//   key           what the deadline belongs to (see turnKey): a new key means a fresh deadline
+//   handle        the pending setTimeout (expiry or retry)
+//   retries       failed TIMEOUT attempts for the current key
+//   turnDeadline  the full-length deadline for this key (restored if an AFK player comes back)
+//   auctionEndsBy the running auction's overall time limit (AUCTION_MAX_MS after it started)
 //
 // Rules:
 // - When the key changes, the deadline restarts: turnTimeoutSec, or 45s if the current player is
@@ -14,11 +13,19 @@
 // - Current player disconnects: deadline = min(existing, now + 45s) — long enough for a phone that
 //   switched apps or networks to come back. All players gone: pause.
 //   Someone reconnects to a paused game: fresh deadline.
+// - Auctions always run on a 10s clock, restarted by every bid (not by passes), whatever
+//   turnTimeoutSec says and whoever is connected — only pausing while nobody at all is connected.
+//   However many bids come in, an auction closes AUCTION_MAX_MS after it started (a pause starts
+//   that limit over), so two players can't hold the table with endless $1 raises.
+// - Trading pauses nothing and refreshes nothing: the key uses the phase the trade interrupted, so
+//   the proposer's turn deadline keeps running through proposals and answers.
 // - On expiry the registered handler applies TIMEOUT. If that errors: retry every 5s, 3 times max.
 
 import { currentPlayerId } from '../engine/index.js';
 
 export const AFK_MS = 45_000;
+export const AUCTION_MS = 10_000;
+export const AUCTION_MAX_MS = 120_000;
 const RETRY_MS = 5_000;
 const MAX_RETRIES = 3;
 
@@ -33,17 +40,27 @@ export function setExpireHandler(fn) {
 }
 
 export function newTimerState() {
-  return { key: null, handle: null, retries: 0, turnDeadline: null };
+  return { key: null, handle: null, retries: 0, turnDeadline: null, auctionEndsBy: null };
 }
 
+/**
+ * `${status}|${turn.number}|${currentPlayerId}|${phase}|${rollAgain}|${doublesCount}`, where
+ * - doublesCount: every doubles roll that lands with nothing pending leaves phase end_turn +
+ *   rollAgain unchanged, but still earns a fresh deadline;
+ * - phase is the trade's returnPhase while trading, so a trade never restarts the turn clock;
+ * - an auction appends `|${tileIndex}|${bids.length}`: every bid restarts the auction clock.
+ */
 function turnKey(state) {
-  const { turn } = state;
-  return `${state.status}|${turn.number}|${currentPlayerId(state)}|${turn.phase}|${turn.rollAgain}|${turn.doublesCount}`;
+  const { turn, auction, trade } = state;
+  const phase = turn.phase === 'trading' && trade ? trade.returnPhase : turn.phase;
+  const key = `${state.status}|${turn.number}|${currentPlayerId(state)}|${phase}|${turn.rollAgain}|${turn.doublesCount}`;
+  return phase === 'auction' && auction ? `${key}|${auction.tileIndex}|${auction.bids.length}` : key;
 }
 
 const timeoutMs = (state) => (Number(state.settings?.turnTimeoutSec) || 0) * 1000;
 const anyConnected = (state) => state.players.some((p) => p.connected);
-const timersEnabled = (state) => state.status === 'active' && timeoutMs(state) > 0;
+const inAuction = (state) => state.status === 'active' && state.turn.phase === 'auction';
+const timersEnabled = (state) => inAuction(state) || (state.status === 'active' && timeoutMs(state) > 0);
 
 /** Stop the pending timeout (does not touch state). */
 export function clearTimer(room) {
@@ -56,6 +73,7 @@ export function clearTimer(room) {
 function stop(room) {
   clearTimer(room);
   room.timer.turnDeadline = null;
+  room.timer.auctionEndsBy = null; // an auction paused with nobody there gets a whole new time limit
   room.state.turn.deadlineAt = null;
 }
 
@@ -70,6 +88,12 @@ function armFresh(room) {
   const { state, timer } = room;
   if (!timersEnabled(state) || !anyConnected(state)) return stop(room);
   const now = Date.now();
+  if (inAuction(state)) {
+    // Bids only ever add to auction.bids, so none yet means the auction just started (or resumes).
+    if (state.auction.bids.length === 0 || timer.auctionEndsBy == null) timer.auctionEndsBy = now + AUCTION_MAX_MS;
+    timer.turnDeadline = Math.min(now + AUCTION_MS, timer.auctionEndsBy);
+    return setDeadline(room, timer.turnDeadline);
+  }
   timer.turnDeadline = now + timeoutMs(state);
   const current = state.players.find((p) => p.id === currentPlayerId(state));
   const afk = !current?.connected;
@@ -103,7 +127,8 @@ export function onConnectionChange(room, playerId, connected) {
     timer.retries = 0;
     return armFresh(room);
   }
-  if (playerId !== currentPlayerId(state)) return;
+  // The auction clock doesn't care who is connected; only the current player's turn clock does.
+  if (inAuction(state) || playerId !== currentPlayerId(state)) return;
 
   if (!connected) {
     setDeadline(room, Math.min(state.turn.deadlineAt, Date.now() + AFK_MS));

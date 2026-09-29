@@ -3,7 +3,7 @@
 // only source of truth, so every screen is re-rendered from the latest `state` + `legal`.
 
 import { BOARD } from './boarddata.js';
-import { render as renderBoard } from './renderer2d.js';
+import { render as renderBoard, busyUntil as boardBusyUntil } from './renderer-switch.js';
 import { connectGame } from './net.js';
 
 // ---------------------------------------------------------------------------
@@ -16,7 +16,7 @@ const TILES = BOARD.tiles;
 const TOKENS = BOARD.tokens;
 const TOKEN_BY_ID = new Map(TOKENS.map((t) => [t.id, t]));
 const GROUP_ORDER = [...Object.keys(BOARD.groups), 'railroad', 'utility'];
-const EMPTY_LEGAL = { actions: [], build: [], sellHouse: [], mortgage: [], unmortgage: [] };
+const EMPTY_LEGAL = { actions: [], build: [], sellHouse: [], mortgage: [], unmortgage: [], auction: null, tradeTargets: [] };
 const HOME_REFRESH_MS = 5000;
 const BUSY_TIMEOUT_MS = 4000;
 // After a move, dialogs wait this long so the board can show the dice and the token's walk first
@@ -29,13 +29,30 @@ const NOT_FOUND = Symbol('not found');
 // Must match the single-column breakpoint in style.css: there, dialogs sit in the side panel
 // above the action bar instead of floating over the board.
 const NARROW = window.matchMedia('(max-width: 899px)');
+const COARSE = window.matchMedia('(pointer: coarse)');
 
 const KEY_NAME = 'monopoly.name';
 const KEY_SESSIONS = 'monopoly.sessions';
 const seatKey = (gameId) => `monopoly.seat.${gameId}`;
 
 // Actions that don't depend on what the player saw last: sent without the state seq.
+// (BID and PASS_AUCTION do carry it: the server accepts any seq from the running auction, since
+// bids race each other, but refuses one from before it, so a late bid can't land in a later auction.)
 const SEQ_FREE = new Set(['JOIN', 'LEAVE', 'START_GAME']);
+const AUCTION_ACTIONS = new Set(['BID', 'PASS_AUCTION']);
+const TRADE_ACTIONS = new Set(['PROPOSE_TRADE', 'ACCEPT_TRADE', 'REJECT_TRADE']);
+// Quick-bid steps over the current high bid, each in a fixed slot (an unaffordable one is disabled).
+const QUICK_BIDS = [1, 10, 50, 100];
+// Quick bids are relative to the high bid, so their amounts change when a bid comes in. For this long
+// after that they don't take clicks: a click aimed at the old amount must not bid the new one.
+const QUICK_BID_ARM_MS = 700;
+// A newly shown trade offer can't be accepted for this long, so an offer swapped in at the last
+// moment (withdraw + propose again) isn't accepted by a click meant for the one before.
+const TRADE_ARM_MS = 1000;
+// Mirrors rules.MAX_TRADES_PER_TURN.
+const MAX_TRADES_PER_TURN = 5;
+// The server's auction clock (CONTRACT §9); only used to draw the "going, going…" bar.
+const AUCTION_CLOCK_MS = 10_000;
 
 const ERROR_TEXT = {
   NOT_YOUR_TURN: "It's not your turn.",
@@ -46,6 +63,9 @@ const ERROR_TEXT = {
   MUST_ROLL_AGAIN: 'You rolled doubles — roll again first.',
   NOT_ENOUGH_PLAYERS: 'You need at least 2 players to start.',
   NOT_IN_LOBBY: 'The game has already started.',
+  TRADE_PENDING: 'A trade offer is already waiting for an answer.',
+  NO_TRADE: 'That trade offer is no longer open.',
+  EMPTY_TRADE: 'Put something on at least one side of the trade.',
 };
 
 // ---------------------------------------------------------------------------
@@ -77,6 +97,15 @@ const app = {
   selectedToken: null,
   resigned: false,        // I resigned (LEAVE while active): the engine records that as bankrupt
   homeTimer: null,
+  lastAction: null,       // { type, at } of the latest action I sent (to word its error)
+  auctionKey: null,       // the auction on screen (turn + tile): a new one clears the bid box
+  auctionBids: 0,         // bids seen in it, so only a new bid replays the high-bid pop
+  auctionHigh: 0,         // the high bid last drawn: when it changes, the quick bids re-arm
+  quickBidsAt: 0,         // quick bids take clicks from this time on (QUICK_BID_ARM_MS)
+  armTimer: null,         // re-renders once quick bids / a trade offer's Accept are armed
+  tradeSeen: null,        // { id, at }: the trade offer on screen and when it first appeared (TRADE_ARM_MS)
+  tradeDraft: null,       // trade builder: { to, give: side, get: side }, side = { tiles, cash, jail } (cash/jail as typed)
+  tradeWith: null,        // whom I last sent an offer to: the builder's default target next time
 };
 
 // ---------------------------------------------------------------------------
@@ -103,11 +132,13 @@ function setHtml(el, html) {
   el.innerHTML = html;
 }
 
-// A control's identity across re-renders: its action (+ tile), UI command, or player row.
+// A control's identity across re-renders: its action (+ tile, or the trade offer it answers), UI
+// command, or player row. (A new offer's Accept is a different control from the last one's.)
 function focusKey(el) {
   const d = el.dataset ?? {};
-  if (d.act) return `act:${d.act}:${d.tile ?? ''}`;
+  if (d.act) return `act:${d.act}:${d.tile ?? d.key ?? d.tradeId ?? ''}`;
   if (d.ui) return `ui:${d.ui}:${d.key ?? d.game ?? ''}`;
+  if (d.trade) return `trade:${d.trade}:${d.key ?? ''}`;
   const row = el.tagName === 'SUMMARY' ? el.closest('details[data-player]') : null;
   return row ? `player:${row.dataset.player}` : null;
 }
@@ -130,7 +161,9 @@ function setHtmlKeepFocus(el, html) {
   else if (memo?.el === el && Date.now() - memo.at < 5000 && document.activeElement === document.body) want = memo;
   setHtml(el, html);
   if (!want?.key || el.contains(document.activeElement)) return;
-  const controls = [...el.querySelectorAll('[data-act], [data-ui], summary')];
+  // Focus lost a while ago never comes back onto a decision like Accept trade (data-nofocus).
+  const controls = [...el.querySelectorAll('[data-act], [data-ui], [data-trade], summary')]
+    .filter((c) => !(want === memo && c.dataset.nofocus != null));
   const target = controls.find((c) => focusable(c) && focusKey(c) === want.key)
     ?? (want.tile != null ? controls.find((c) => focusable(c) && c.dataset.tile === want.tile) : null);
   if (target) {
@@ -260,6 +293,27 @@ function unmortgageCost(index) {
   return Math.ceil(Math.round(exact * 1e6) / 1e6);
 }
 
+// Mirrors rules.mortgageTransferFee: the receiver of a mortgaged tile pays the bank 10% of its mortgage value.
+function mortgageTransferFee(index) {
+  const exact = TILES[index].mortgage * BOARD.unmortgageInterest;
+  return Math.ceil(Math.round(exact * 1e6) / 1e6);
+}
+
+// Mirrors rules.tradeableTiles: a tile can change hands when no tile of its colour group has buildings.
+function isTradeable(s, index) {
+  const tile = TILES[index];
+  return tile.type !== 'property'
+    || TILES.every((t) => t.group !== tile.group || !(tileState(s, t.index)?.houses > 0));
+}
+
+/** The 10% fees whoever receives `tiles` pays for the mortgaged ones among them (mirrors rules.tradeFees). */
+function tradeFee(s, tiles) {
+  return tiles.reduce((sum, i) => sum + (tileState(s, i)?.mortgaged ? mortgageTransferFee(i) : 0), 0);
+}
+
+/** Tile indices owned by `playerId`, ascending. */
+const ownedTiles = (s, playerId) => s.tiles.filter((t) => t.ownerId === playerId).map((t) => t.index);
+
 /** Current rent of an owned tile as display text (mirrors rules.rentFor). */
 function rentText(s, index) {
   const tile = TILES[index];
@@ -320,8 +374,11 @@ function closeGame() {
   Object.assign(app, {
     conn: null, gameId: null, seat: null, takeover: null, state: null,
     legal: EMPTY_LEGAL, net: { status: 'closed' }, selectedToken: null, resigned: false,
-    autoJoin: null, focusMemo: null, lastRollAt: 0,
+    autoJoin: null, focusMemo: null, lastRollAt: 0, lastAction: null, auctionKey: null, auctionBids: 0,
+    auctionHigh: 0, quickBidsAt: 0, tradeSeen: null, tradeDraft: null, tradeWith: null,
   });
+  clearTimeout(app.armTimer);
+  $('#bid-input').value = '';
   setBusy(false);
   app.dismissed.clear();
   app.expanded.clear();
@@ -448,8 +505,11 @@ function handleState(msg) {
     const myId = me()?.id;
     if (myId && events.some((e) => e.type === 'dice_rolled' && e.playerId === myId)) app.lastRollAt = Date.now();
     drawBoard(events);
+    // The 3D board animates longer than DIALOG_HOLD_MS; hold dialogs until the token lands (0 in 2D).
+    app.dialogAt = Math.max(app.dialogAt, boardBusyUntil());
     renderGame();
-    if (!firstState) announceLater(events);
+    // A trade's answer (rejected / cancelled) doesn't name its parties: they are in the previous state.
+    if (!firstState) announceLater(events, prev?.trade ?? null);
   }
   updateTitle();
 }
@@ -481,14 +541,14 @@ function autoJoin() {
 }
 
 // Toasts about a move (rent, cards, passing GO…) wait for the board to show it, like dialogs do.
-function announceLater(events) {
+function announceLater(events, prevTrade) {
   const wait = app.dialogAt - Date.now();
   if (wait <= 0) {
-    announce(events);
+    announce(events, prevTrade);
     return;
   }
   const gameId = app.gameId;
-  setTimeout(() => { if (app.gameId === gameId && app.state) announce(events); }, wait);
+  setTimeout(() => { if (app.gameId === gameId && app.state) announce(events, prevTrade); }, wait);
 }
 
 // Keep stored credentials in line with the table: refresh the remembered name, and forget the
@@ -541,14 +601,45 @@ function handleError(msg) {
     rerender();
     return;
   }
+  const last = app.lastAction && Date.now() - app.lastAction.at < BUSY_TIMEOUT_MS * 2 ? app.lastAction.type : null;
+  const mild = AUCTION_ACTIONS.has(last) ? auctionErrorText(msg.code) : null;
+  if (mild) {
+    // Bids race each other: being outbid a moment earlier is part of an auction, not an error.
+    toast(mild, 'info', 3000);
+    rerender();
+    return;
+  }
   if (msg.code === 'STALE_STATE') {
     // The click was meant for a state that has already changed (e.g. a timeout played the move).
     toast('Too late — the game moved on.', 'info', 2500);
     rerender();
     return;
   }
-  toast(ERROR_TEXT[msg.code] ?? msg.message ?? msg.code ?? 'Something went wrong.', 'error');
+  if (TRADE_ACTIONS.has(last) && msg.code === 'NO_TRADE') {
+    toast('That trade offer is no longer open.', 'info', 3000);
+    rerender();
+    return;
+  }
+  // The engine's own wording is the most precise for trades ("Bob doesn't own Boardwalk.").
+  const text = TRADE_ACTIONS.has(last) && msg.message ? msg.message : ERROR_TEXT[msg.code] ?? msg.message;
+  toast(text ?? msg.code ?? 'Something went wrong.', 'error');
   rerender();
+}
+
+/** A failed BID / PASS_AUCTION that only means someone was quicker; null for real errors. */
+function auctionErrorText(code) {
+  const a = app.state?.status === 'active' && app.state.turn.phase === 'auction' ? app.state.auction : null;
+  if (!a) return code === 'WRONG_PHASE' || code === 'STALE_STATE' ? 'Too late — the auction is over.' : null;
+  switch (code) {
+    case 'BID_TOO_LOW': {
+      const by = a.highBidderId ? ` by ${playerName(app.state, a.highBidderId)}` : '';
+      return `Someone bid first — the high bid is now ${money(a.highBid)}${by}.`;
+    }
+    case 'ALREADY_HIGH_BIDDER': return "You're already the high bidder.";
+    case 'ALREADY_PASSED': return 'You have already dropped out of this auction.';
+    case 'STALE_STATE': return 'Too late — try again.';
+    default: return null;
+  }
 }
 
 function handleStatus(status) {
@@ -568,7 +659,7 @@ function drawBoard(events) {
   try {
     renderBoard(app.state, events, me()?.id ?? null);
   } catch (err) {
-    console.error('renderer2d.render failed:', err);
+    console.error('board render failed:', err);
   }
 }
 
@@ -577,7 +668,13 @@ function updateTitle() {
   let title = 'Monopoly';
   if (app.net.status === 'replaced') title = 'Opened in another tab · Monopoly';
   else if (s?.status === 'lobby') title = `Lobby ${codeOf(s.id)} · Monopoly`;
-  else if (s?.status === 'active') title = isMyTurn() ? '● Your turn · Monopoly' : `${codeOf(s.id)} · Monopoly`;
+  else if (s?.status === 'active' && (can('BID') || can('PASS_AUCTION'))) title = '● Auction · Monopoly';
+  else if (s?.status === 'active' && s.trade && s.trade.toPlayerId === me()?.id) title = '● Trade offer · Monopoly';
+  // The dot means "you have something to do": not while an auction or my own offer waits on others.
+  else if (s?.status === 'active') {
+    const waiting = s.turn.phase === 'auction' || s.turn.phase === 'trading';
+    title = isMyTurn() && !waiting ? '● Your turn · Monopoly' : `${codeOf(s.id)} · Monopoly`;
+  }
   else if (s?.status === 'finished') title = 'Game over · Monopoly';
   document.title = title;
 }
@@ -593,14 +690,16 @@ function setBusy(on) {
 }
 
 function act(type, payload = {}) {
-  if (!app.conn || app.busy) return;
+  if (!app.conn || app.busy) return false;
   const seq = SEQ_FREE.has(type) ? undefined : app.state?.seq;
   if (!app.conn.send({ type, ...payload }, seq)) {
     toast('Not connected right now — please wait a moment.', 'error');
-    return;
+    return false;
   }
+  app.lastAction = { type, at: Date.now() };
   setBusy(true);
   rerender();
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -626,21 +725,28 @@ function renderConn() {
   tick();
 }
 
-// Runs 4× a second: turn countdown (clock-skew corrected) and the reconnect countdown.
+// Runs 4× a second: turn countdown (clock-skew corrected), the auction clock and the reconnect countdown.
 function tick() {
   const deadline = app.state?.status === 'active' ? app.state.turn.deadlineAt : null;
-  const left = deadline ? Math.max(0, Math.ceil((deadline - (Date.now() + app.clockOffset)) / 1000)) : 0;
+  const leftMs = deadline ? Math.max(0, deadline - (Date.now() + app.clockOffset)) : 0;
+  const left = Math.ceil(leftMs / 1000);
   const clock = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
-  const cd = document.querySelector('[data-countdown]');
-  if (cd) {
+  for (const cd of document.querySelectorAll('[data-countdown]')) {
     if (!deadline) {
       cd.hidden = true;
-    } else {
-      const text = `⏱ ${clock}`;
-      if (cd.textContent !== text) cd.textContent = text;
-      cd.hidden = false;
-      cd.classList.toggle('urgent', left <= 10);
+      continue;
     }
+    const text = `⏱ ${clock}`;
+    if (cd.textContent !== text) cd.textContent = text;
+    cd.hidden = false;
+    cd.classList.toggle('urgent', left <= Number(cd.dataset.urgent || 10));
+  }
+  // "Going once, going twice…": the bar drains over the auction's last 10 seconds.
+  const bar = document.querySelector('[data-auction-bar]');
+  if (bar) {
+    const width = deadline ? `${(Math.min(1, leftMs / AUCTION_CLOCK_MS) * 100).toFixed(1)}%` : '100%';
+    if (bar.style.width !== width) bar.style.width = width;
+    bar.parentElement.classList.toggle('urgent', !!deadline && leftMs <= 3000);
   }
   const offline = document.querySelector('[data-offline-in]');
   if (offline && deadline && offline.textContent !== clock) offline.textContent = clock;
@@ -739,6 +845,7 @@ async function createGame(event) {
     maxPlayers: Number($('#set-max').value),
     freeParkingPot: $('#set-pot').checked,
     evenBuild: $('#set-even').checked,
+    auctionOnDecline: $('#set-auction').checked,
   };
   button.disabled = true;
   try {
@@ -841,6 +948,7 @@ function renderLobby() {
     ['Max players', st.maxPlayers],
     ['Free Parking pot', st.freeParkingPot ? 'On' : 'Off'],
     ['Build evenly', st.evenBuild ? 'On' : 'Off'],
+    ['Auctions', st.auctionOnDecline ? 'On' : 'Off'],
   ].map(([k, v]) => `<div><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join(''));
 }
 
@@ -887,7 +995,10 @@ function joinLobby(event) {
 // ---------------------------------------------------------------------------
 
 function renderGame() {
+  syncTradeDraft();
+  syncTradeSeen();
   renderBanner();
+  renderAuction();
   renderActions();
   renderRecentLog();
   renderPlayers();
@@ -913,6 +1024,8 @@ function renderBanner() {
   if (s.status === 'active') sub.push(`Turn ${s.turn.number}`);
   if (s.settings.freeParkingPot) sub.push(`Free Parking pot ${money(s.pot)}`);
   if (!m) sub.push('Spectating');
+  // During an auction the sheet right below shows its clock; the banner doesn't repeat it.
+  const clock = s.status === 'active' && s.turn.phase === 'auction' ? '' : '<span class="countdown" data-countdown hidden></span>';
 
   setHtml($('#turn-banner'), `
     <div class="turn-banner${mine ? ' mine' : ''}" style="--pc:${cur && s.status === 'active' ? playerColor(s, cur.id) : 'var(--muted)'}">
@@ -921,13 +1034,17 @@ function renderBanner() {
         <div class="turn-title">${title}</div>
         <div class="turn-sub">${esc(sub.join(' · '))}</div>
       </div>
-      <span class="countdown" data-countdown hidden></span>
+      ${clock}
     </div>`);
 }
 
 function myTurnText(s) {
   const t = s.turn;
   switch (t.phase) {
+    case 'auction': return `🔨 Auction for ${tileName(s.auction?.tileIndex)}`;
+    case 'trading': return s.trade?.fromPlayerId === me()?.id
+      ? `🤝 Waiting for ${playerName(s, s.trade.toPlayerId)} to answer your offer…`
+      : `🤝 ${playerName(s, s.trade?.fromPlayerId)} offered ${playerName(s, s.trade?.toPlayerId)} a trade`;
     case 'rolling': return 'Your turn — roll the dice';
     case 'jail_decision': {
       // Only the options that are open right now (the fine needs the cash, the card needs a card).
@@ -941,7 +1058,9 @@ function myTurnText(s) {
       return `You're in jail — ${list}`;
     }
     case 'buying_or_auction': return `Buy ${tileName(t.pendingPurchase)} for ${money(TILES[t.pendingPurchase]?.price)}?`;
-    case 'paying': return `You owe ${money(t.pendingDebt?.amount)} — raise cash or declare bankruptcy`;
+    case 'paying': return can('PAY_DEBT')
+      ? `You owe ${money(t.pendingDebt?.amount)}${debtCreditorText(s, t.pendingDebt)} — pay it to continue`
+      : `You owe ${money(t.pendingDebt?.amount)} — raise cash or declare bankruptcy`;
     case 'end_turn': return t.rollAgain ? 'Doubles! Roll again' : 'Build or mortgage if you like, then end your turn';
     default: return 'Your turn';
   }
@@ -951,6 +1070,12 @@ function myTurnText(s) {
 function otherTurnHtml(s, cur) {
   const t = s.turn;
   const name = cur?.name ?? 'the next player';
+  // Auctions and trade offers involve more than the current player, whether or not they're online.
+  if (t.phase === 'auction' && s.auction) return esc(`🔨 ${tileName(s.auction.tileIndex)} is up for auction`);
+  if (t.phase === 'trading' && s.trade) {
+    const to = s.trade.toPlayerId === me()?.id ? 'you' : playerName(s, s.trade.toPlayerId);
+    return esc(`🤝 ${playerName(s, s.trade.fromPlayerId)} offered ${to} a trade`);
+  }
   if (cur && !cur.connected) {
     // tick() fills in the countdown to the server's auto-play.
     return t.deadlineAt
@@ -983,19 +1108,26 @@ function renderActions() {
     return;
   }
   if (!m) {
-    setHtmlKeepFocus(bar, `<p class="note">👀 You're watching this game.${app.takeover ? ` ${takeoverLink()}` : ''}</p>`);
+    setHtmlKeepFocus(bar, `<p class="note">👀 You're watching this game.${app.takeover ? ` ${takeoverLink()}` : ''}</p>${tradeNoteHtml(s)}`);
     return;
   }
   if (m.bankrupt) {
-    setHtml(bar, `<p class="note">${app.resigned ? 'You resigned' : 'You went bankrupt'} — watching the rest of the game.</p>`);
+    setHtml(bar, `<p class="note">${app.resigned ? 'You resigned' : 'You went bankrupt'} — watching the rest of the game.</p>${tradeNoteHtml(s)}`);
     return;
   }
 
   const t = s.turn;
   const ok = ready();
   const buttons = [];
-  const button = (type, label, cls = '', enabled = true) =>
-    buttons.push(`<button type="button" class="btn ${cls}" data-act="${type}"${disabledAttr(enabled && ok)}>${label}</button>`);
+  // `nofocus`: a new dialog never moves keyboard focus onto it (Space must not accept a trade).
+  // `attrs`: extra attributes, e.g. the id of the trade offer a button answers.
+  const button = (type, label, cls = '', enabled = true, nofocus = false, attrs = '') =>
+    buttons.push(`<button type="button" class="btn ${cls}" data-act="${type}"${nofocus ? ' data-nofocus' : ''}${attrs}${disabledAttr(enabled && ok)}>${label}</button>`);
+
+  if (t.phase === 'trading' && s.trade) {
+    setHtmlKeepFocus(bar, tradeActionsHtml(s, s.trade, m, button, buttons));
+    return;
+  }
 
   if (can('ROLL')) {
     const label = t.phase === 'jail_decision' ? 'Roll for doubles' : t.phase === 'end_turn' ? 'Roll again' : 'Roll dice';
@@ -1011,16 +1143,28 @@ function renderActions() {
   if (can('USE_JAIL_CARD')) button('USE_JAIL_CARD', '🎫 Use jail card');
   if (can('END_TURN')) button('END_TURN', 'End turn', 'primary');
   if (can('DECLINE')) button('DECLINE', 'Decline');
-  if (can('DECLARE_BANKRUPTCY')) button('DECLARE_BANKRUPTCY', 'Declare bankruptcy', 'danger');
+  // The builder is a panel of its own (a dialog, or the panel slot on phones); this only opens it.
+  if (can('PROPOSE_TRADE') && !app.tradeDraft) {
+    buttons.push(`<button type="button" class="btn" data-ui="trade-open"${disabledAttr(ok)}>🤝 Trade</button>`);
+  }
+  // Once the debt can be paid, bankruptcy is only a misclick away from quitting: not offered (Resign still is).
+  if (can('DECLARE_BANKRUPTCY') && !can('PAY_DEBT')) button('DECLARE_BANKRUPTCY', 'Declare bankruptcy', 'danger');
 
   let hint = '';
   const canRaise = app.legal.mortgage.length > 0 || app.legal.sellHouse.length > 0;
+  const canTrade = can('PROPOSE_TRADE');
   if (isMyTurn() && t.phase === 'buying_or_auction' && !can('BUY')) {
-    hint = canRaise ? 'Not enough cash to buy — mortgage or sell to raise it, or decline.' : 'Not enough cash to buy — decline.';
+    const other = s.settings.auctionOnDecline ? 'decline to auction it' : 'decline';
+    hint = canRaise ? `Not enough cash to buy — mortgage or sell to raise it, or ${other}.` : `Not enough cash to buy — ${other}.`;
   } else if (isMyTurn() && t.phase === 'paying' && !can('PAY_DEBT')) {
     hint = canRaise
-      ? `Raise ${money(t.pendingDebt.amount - m.cash)} more by selling or mortgaging.`
-      : 'Nothing left to sell or mortgage.';
+      ? `Raise ${money(t.pendingDebt.amount - m.cash)} more by selling or mortgaging${canTrade ? ', or trade' : ''}.`
+      : `Nothing left to sell or mortgage${canTrade ? ' — you can still trade' : ''}.`;
+  }
+  // The Trade button is gone once this turn's offers are used up (TRADE_LIMIT): say so.
+  if (!hint && isMyTurn() && !canTrade && ['rolling', 'jail_decision', 'end_turn', 'paying'].includes(t.phase)
+    && (t.tradesProposed ?? 0) >= MAX_TRADES_PER_TURN) {
+    hint = `No more trade offers this turn (${MAX_TRADES_PER_TURN} is the limit).`;
   }
   // Space can't end the turn while the dice and token are still moving; the tip returns after.
   const hold = can('END_TURN') ? endTurnKeyHold() : 0;
@@ -1031,6 +1175,516 @@ function renderActions() {
   setHtmlKeepFocus(bar, buttons.length
     ? `<div class="action-buttons">${buttons.join('')}</div>${netNoteHtml()}${hint ? `<p class="hint">${hint}</p>` : keyHint}`
     : '');
+}
+
+/** The action bar while a trade offer is pending: the target answers, the proposer may withdraw, others just see it. */
+function tradeActionsHtml(s, trade, m, button, buttons) {
+  const to = playerName(s, trade.toPlayerId);
+  const id = tradeIdAttr(trade);
+  if (m.id === trade.toPlayerId) {
+    if (can('ACCEPT_TRADE')) button('ACCEPT_TRADE', 'Accept trade', 'primary', tradeArmed(), true, id);
+    if (can('REJECT_TRADE')) button('REJECT_TRADE', 'Reject', '', true, true, id);
+    const why = can('ACCEPT_TRADE') ? '' : `<p class="hint">${esc(acceptBlocker(s, trade))}</p>`;
+    return `<div class="action-buttons">${buttons.join('')}</div>${netNoteHtml()}${why}`;
+  }
+  if (m.id === trade.fromPlayerId) {
+    if (can('REJECT_TRADE')) button('REJECT_TRADE', 'Withdraw offer', '', true, true, id);
+    const clock = s.settings.turnTimeoutSec > 0 ? `<p class="hint">Your turn clock keeps running while ${esc(to)} decides.</p>` : '';
+    return `<div class="action-buttons">${buttons.join('')}</div>${netNoteHtml()}${clock}`;
+  }
+  return tradeNoteHtml(s);
+}
+
+/** Buttons that answer a trade offer name it, so a click never lands on an offer that replaced it. */
+const tradeIdAttr = (trade) => ` data-trade-id="${esc(trade.id)}"`;
+
+/** Remember when the pending offer first appeared on screen; its Accept waits TRADE_ARM_MS from then. */
+function syncTradeSeen() {
+  const s = app.state;
+  const trade = s.status === 'active' && s.turn.phase === 'trading' ? s.trade : null;
+  if (!trade) {
+    app.tradeSeen = null;
+    return;
+  }
+  if (app.tradeSeen?.id === trade.id) return;
+  app.tradeSeen = { id: trade.id, at: Date.now() };
+  if (trade.toPlayerId === me()?.id) rerenderAfter(TRADE_ARM_MS);
+}
+
+const tradeArmed = () => !!app.tradeSeen && Date.now() - app.tradeSeen.at >= TRADE_ARM_MS;
+
+/** One re-render `ms` from now, once an arming delay is over (a later request replaces an earlier one). */
+function rerenderAfter(ms) {
+  clearTimeout(app.armTimer);
+  app.armTimer = setTimeout(rerender, ms + 20);
+}
+
+/** For everyone but the two parties: what is on the table right now (empty when no offer is pending). */
+function tradeNoteHtml(s) {
+  const trade = s.status === 'active' && s.turn.phase === 'trading' ? s.trade : null;
+  if (!trade) return '';
+  const who = `${playerName(s, trade.fromPlayerId)} offered ${playerName(s, trade.toPlayerId)} a trade`;
+  return `<p class="note trade-note">🤝 ${esc(who)}: ${esc(tradeLine(s, trade))}.</p>`;
+}
+
+// ---------------------------------------------------------------------------
+// Auction sheet — shown to everyone at the table while the phase is `auction` (read-only for
+// spectators and players out of the auction). It sits in the side panel on every layout, right
+// under the turn banner. The custom bid box (#auction-form) is static markup: re-renders only
+// update its limits, so a half-typed amount survives every incoming bid.
+// ---------------------------------------------------------------------------
+
+function renderAuction() {
+  const s = app.state;
+  const a = s.status === 'active' && s.turn.phase === 'auction' ? s.auction : null;
+  $('#auction-sheet').hidden = !a;
+  if (!a) {
+    app.auctionKey = null;
+    return;
+  }
+  const key = `${s.turn.number}:${a.tileIndex}`;
+  const fresh = app.auctionKey !== key;
+  if (fresh) {
+    app.auctionKey = key;
+    app.auctionBids = a.bids.length;
+    $('#bid-input').value = '';
+  }
+  const bumped = a.bids.length !== app.auctionBids; // a new bid since the last render: the amount pops
+  app.auctionBids = a.bids.length;
+  // New amounts on the quick bids (a new auction, a bid, a resigned bidder's bid gone): arm them again.
+  if (fresh || a.highBid !== app.auctionHigh) armQuickBids();
+  app.auctionHigh = a.highBid;
+
+  const m = me();
+  const limits = can('BID') ? app.legal.auction : null;
+  const ok = ready();
+  const armed = Date.now() >= app.quickBidsAt;
+  setHtml($('#auction-head'), auctionHeadHtml(a));
+  setHtml($('#auction-high'), auctionHighHtml(s, a, m, bumped || fresh));
+  setHtml($('#auction-status'), auctionStatusHtml(s, a, m, limits));
+  setHtmlKeepFocus($('#auction-controls'), limits
+    ? quickBids(a.highBid, limits).map(({ step, amount, affordable }) => `
+      <button type="button" class="btn quick-bid" data-act="BID" data-amount="${amount}" data-key="${step}"
+        aria-label="Bid ${money(amount)}${affordable ? '' : ' (more than you have)'}"${disabledAttr(ok && armed && affordable)}>
+        <span class="qb-step">+${money(step)}</span><span class="qb-total">${money(amount)}</span>
+      </button>`).join('')
+    : '');
+  const form = $('#auction-form');
+  form.hidden = !limits;
+  if (limits) {
+    const input = $('#bid-input');
+    input.min = String(limits.minBid);
+    input.max = String(limits.maxBid);
+    input.placeholder = `${limits.minBid}–${limits.maxBid}`;
+    $('#bid-submit').disabled = !ok;
+    $('#bid-max').disabled = !ok;
+    $('#bid-max').title = `Fill in all your cash (${money(limits.maxBid)}), then press Bid`;
+  }
+  setHtmlKeepFocus($('#auction-pass'), can('PASS_AUCTION')
+    ? `<button type="button" class="btn block" data-act="PASS_AUCTION"${disabledAttr(ok)}>Pass — drop out</button>`
+    : '');
+  if (fresh) revealAuctionControls();
+  setHtml($('#auction-people'), a.participants.map((id) => {
+    const p = playerById(s, id);
+    const where = p?.bankrupt ? 'out' : a.passed.includes(id) ? 'passed' : id === a.highBidderId ? 'high' : 'in';
+    const label = { out: 'out', passed: 'passed', high: 'high bid', in: 'in' }[where];
+    return `<li class="ap ap-${where}" style="--pc:${playerColor(s, id)}">
+      <span class="pdot"></span><span class="ap-name">${esc(p?.name ?? '?')}${id === m?.id ? ' (you)' : ''}</span><span class="ap-state">${label}</span>
+    </li>`;
+  }).join(''));
+}
+
+/**
+ * Quick bids: highBid + each step, always in the same slots. A step I can't afford stays in its slot,
+ * disabled, so a slot never changes into a different kind of bid under the pointer; bidding all my
+ * cash goes through the bid box (its Max button).
+ */
+function quickBids(highBid, { maxBid }) {
+  return QUICK_BIDS.map((step) => ({ step, amount: highBid + step, affordable: highBid + step <= maxBid }));
+}
+
+function armQuickBids() {
+  app.quickBidsAt = Date.now() + QUICK_BID_ARM_MS;
+  rerenderAfter(QUICK_BID_ARM_MS);
+}
+
+/**
+ * Phones: the auction sheet sits under the board, and a 10 s clock leaves no time to scroll. When an
+ * auction starts and I can bid or pass, bring its controls into view (unless they already are).
+ */
+function revealAuctionControls() {
+  if (!NARROW.matches || !(can('BID') || can('PASS_AUCTION'))) return;
+  const sheet = $('#auction-sheet');
+  const controls = $('#auction-pass').firstElementChild ?? $('#auction-controls');
+  const top = parseFloat(getComputedStyle(sheet).scrollMarginTop) || 0;
+  const box = controls.getBoundingClientRect();
+  if (box.top >= top && box.bottom <= window.innerHeight) return;
+  // The whole sheet if it fits under the top bar, else just enough to show the controls at the bottom.
+  const fits = sheet.getBoundingClientRect().height + top <= window.innerHeight;
+  // A hidden tab doesn't animate (a smooth scroll would never happen): jump, so it's there on return.
+  const behavior = document.hidden || window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+  if (fits) sheet.scrollIntoView({ block: 'start', behavior });
+  else controls.scrollIntoView({ block: 'end', behavior });
+}
+
+function auctionHeadHtml(a) {
+  const tile = TILES[a.tileIndex];
+  return `<div class="auction-top">
+      <span class="auction-kicker">🔨 Auction</span>
+      <span class="countdown auction-clock" data-countdown data-urgent="3" hidden></span>
+    </div>
+    <div class="auction-timebar" aria-hidden="true"><i data-auction-bar></i></div>
+    ${deedHtml(tile, `List price ${money(tile.price)}`, 'auction-title')}`;
+}
+
+/** The high bid and who holds it. `bump`: a new bid just came in, so the amount pops (CSS). */
+function auctionHighHtml(s, a, m, bump) {
+  const bidder = playerById(s, a.highBidderId);
+  const mine = !!m && bidder?.id === m.id;
+  const who = bidder
+    ? `<span class="auction-bidder" style="--pc:${playerColor(s, bidder.id)}"><span class="pdot"></span>${mine ? 'You' : esc(bidder.name)}</span>`
+    : '';
+  const cls = ['auction-amount', bump && 'bump', !bidder && 'none'].filter(Boolean).join(' ');
+  return `<div class="auction-high${mine ? ' winning' : ''}">
+    <span class="auction-label">High bid</span>
+    <strong class="${cls}">${bidder ? money(a.highBid) : 'No bids yet'}</strong>${who}
+  </div>`;
+}
+
+/** One line on where I stand in this auction. */
+function auctionStatusHtml(s, a, m, limits) {
+  const line = (text, cls = '') => `<p class="auction-status ${cls}">${text}</p>`;
+  if (!m) return line('👀 You are watching.');
+  if (m.bankrupt || !a.participants.includes(m.id)) return line('You are not in this auction.');
+  if (a.passed.includes(m.id)) return line('You passed.');
+  const cash = `You have <strong>${money(m.cash)}</strong>`;
+  if (a.highBidderId === m.id) return line(`${cash} · you're winning — others can still outbid you.`, 'good');
+  if (!limits) return line(`${cash} — not enough to outbid ${money(a.highBid)}.`, 'warn');
+  const outbid = a.bids.some((b) => b.playerId === m.id);
+  return line(`${cash}${outbid ? ' · <span class="neg">outbid</span> — raise or pass' : ' · bid or pass'}`);
+}
+
+/** The custom amount from the bid box (Enter or the Bid button). */
+function submitBid(event) {
+  event.preventDefault();
+  const limits = can('BID') ? app.legal.auction : null;
+  const input = $('#bid-input');
+  if (!limits || !ready()) return;
+  const text = input.value.trim();
+  const amount = Number(text);
+  if (!text || !Number.isInteger(amount)) {
+    toast(`Type a whole-dollar bid of at least ${money(limits.minBid)}.`, 'error');
+    return;
+  }
+  if (amount < limits.minBid) {
+    toast(`The high bid is ${money(app.state.auction.highBid)} — bid at least ${money(limits.minBid)}.`, 'info', 3000);
+    return;
+  }
+  if (amount > limits.maxBid) {
+    toast(`You only have ${money(limits.maxBid)}.`, 'error');
+    return;
+  }
+  if (!act('BID', { amount })) return;
+  input.value = '';
+  if (COARSE.matches) input.blur(); // let the phone keyboard go, so the result is visible
+}
+
+// ---------------------------------------------------------------------------
+// Trading. The current player opens the builder (a dialog; the panel slot on narrow layouts),
+// picks a player from legal.tradeTargets and what goes each way; the target gets the offer as
+// a dialog with Accept / Reject, the proposer can withdraw it, everyone else sees a note.
+// The builder's form is rewritten only when the table changes (tiles, cash, targets), never while
+// typing: values live in app.tradeDraft and are put back after a rewrite (hydrateTradeBuilder).
+// ---------------------------------------------------------------------------
+
+const emptyTradeSide = () => ({ tiles: [], cash: '', jail: '' });
+
+function openTradeBuilder() {
+  if (!can('PROPOSE_TRADE') || !app.legal.tradeTargets.length) return;
+  const targets = app.legal.tradeTargets;
+  const to = targets.includes(app.tradeWith) ? app.tradeWith : targets[0];
+  app.tradeDraft = { to, give: emptyTradeSide(), get: emptyTradeSide() };
+  app.dismissed.delete('trade-build');
+  renderGame();
+  // Phones: the builder opens above the action bar, which may be further down the page.
+  if (NARROW.matches) $('#panel-dialog').scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+
+function closeTradeBuilder() {
+  app.tradeDraft = null;
+  rerender();
+}
+
+/**
+ * Keep the draft in line with the table. It closes once the offer is out, or as soon as I can't
+ * propose any more (I rolled onto a purchase decision, my turn ended); a draft that popped back up
+ * later would be more surprising than one to rebuild.
+ */
+function syncTradeDraft() {
+  const d = app.tradeDraft;
+  if (!d) return;
+  const s = app.state;
+  if (!me() || s.status !== 'active' || !can('PROPOSE_TRADE')) {
+    app.tradeDraft = null;
+    return;
+  }
+  const m = me();
+  const targets = app.legal.tradeTargets;
+  if (!targets.includes(d.to)) {
+    d.to = targets[0] ?? null;
+    d.get = emptyTradeSide();
+  }
+  // Tiles that changed hands, or whose group got buildings meanwhile, drop out of the offer.
+  d.give.tiles = d.give.tiles.filter((i) => tileState(s, i)?.ownerId === m.id && isTradeable(s, i));
+  d.get.tiles = d.get.tiles.filter((i) => tileState(s, i)?.ownerId === d.to && isTradeable(s, i));
+}
+
+function tradeBuilderHtml(s, d) {
+  const m = me();
+  const target = playerById(s, d.to);
+  const ok = ready();
+  const chips = app.legal.tradeTargets.map((id) => playerById(s, id)).filter(Boolean).map((p) => `
+    <button type="button" class="trade-target${p.id === d.to ? ' selected' : ''}" data-ui="trade-target" data-key="${esc(p.id)}"
+      role="radio" aria-checked="${p.id === d.to}" aria-label="${esc(`${p.name}, ${money(p.cash)}`)}"
+      style="--pc:${playerColor(s, p.id)}"${disabledAttr(ok)}>
+      <span class="pdot"></span><span class="tt-token">${tokenEmoji(p.token)}</span><span class="tt-name">${esc(p.name)}</span><span class="tt-cash">${money(p.cash)}</span>
+    </button>`).join('');
+  return `<h3 id="dialog-title" class="dialog-title">🤝 Propose a trade</h3>
+    <div class="trade-targets" role="radiogroup" aria-label="Trade with">${chips}</div>
+    ${target ? `<div class="trade-cols">
+        ${tradeSideFormHtml(s, 'give', 'You give', m)}
+        ${tradeSideFormHtml(s, 'get', `You get from ${target.name}`, target)}
+      </div>
+      <div class="trade-summary" data-trade-summary aria-live="polite"></div>` : ''}
+    <div class="dialog-btns">
+      <button type="button" class="btn primary" data-ui="trade-send" data-trade-send disabled>Send offer</button>
+      <button type="button" class="btn" data-ui="trade-cancel">Cancel</button>
+    </div>`;
+}
+
+/** One side of the builder: `owner`'s tiles (locked when their group has buildings), cash and jail cards. */
+function tradeSideFormHtml(s, side, heading, owner) {
+  const rows = ownedTiles(s, owner.id).map((i) => {
+    const ts = tileState(s, i);
+    const free = isTradeable(s, i);
+    let note = '';
+    if (!free) note = '<span class="trade-lock">🏠 sell buildings first</span>';
+    else if (ts.mortgaged) note = `<span class="tag mort" title="Mortgaged: the receiver pays the bank ${money(mortgageTransferFee(i))}">M · fee ${money(mortgageTransferFee(i))}</span>`;
+    return `<label class="trade-tile${free ? '' : ' locked'}" style="--gc:${groupMeta(groupKeyOf(i)).color}">
+      <input type="checkbox" data-trade="${side}-tile" data-key="${i}"${free ? '' : ' disabled'}>
+      <span class="trade-tile-name">${esc(TILES[i].name)}</span>${note}
+    </label>`;
+  }).join('');
+  const whose = side === 'give' ? 'You have' : `${esc(owner.name)} has`;
+  const count = (field, label, max, maxText) => `<label class="trade-count">
+      <span class="trade-count-label">${label}</span>
+      <span class="count-field${field === 'cash' ? ' money' : ''}"><input type="number" inputmode="numeric" min="0" max="${max}" step="1"
+        placeholder="0" autocomplete="off" data-trade="${side}-${field}"></span>
+      <span class="trade-count-max">of ${maxText}</span>
+    </label>`;
+  const cards = owner.getOutOfJailCards;
+  return `<fieldset class="trade-col trade-side-${side}">
+    <legend class="trade-col-head">${esc(heading)}</legend>
+    <div class="trade-tiles">${rows || `<p class="muted small">${whose} no properties.</p>`}</div>
+    ${count('cash', 'Cash', owner.cash, money(owner.cash))}
+    ${cards > 0 ? count('jail', '🎫 Jail cards', cards, cards) : ''}
+  </fieldset>`;
+}
+
+/** After a (re)render of the builder: put the draft's values back and refresh the summary. */
+function hydrateTradeBuilder(box) {
+  const d = app.tradeDraft;
+  if (!d) return;
+  for (const el of box.querySelectorAll('[data-trade]')) {
+    const [side, field] = el.dataset.trade.split('-');
+    if (field === 'tile') el.checked = d[side].tiles.includes(Number(el.dataset.key));
+    else if (el.value !== d[side][field]) el.value = d[side][field];
+  }
+  updateTradeSummary(box);
+}
+
+/** A builder input changed: update the draft and the summary, without rewriting the form. */
+function onTradeInput(el) {
+  const d = app.tradeDraft;
+  if (!d) return;
+  const [side, field] = el.dataset.trade.split('-');
+  if (field === 'tile') {
+    const index = Number(el.dataset.key);
+    const tiles = d[side].tiles.filter((i) => i !== index);
+    if (el.checked) tiles.push(index);
+    d[side].tiles = tiles.sort((a, b) => a - b);
+  } else {
+    d[side][field] = el.value;
+  }
+  updateTradeSummary(el.closest('#dialog-layer, #panel-dialog') ?? document);
+}
+
+const parseCount = (text) => {
+  const t = String(text ?? '').trim();
+  const n = t === '' ? 0 : Number(t);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+};
+
+/**
+ * The draft as a PROPOSE_TRADE payload plus what's wrong with it — the engine's validateTrade
+ * checks, and the fee check ACCEPT_TRADE would fail on (cash can't change while an offer is open).
+ */
+function readTradeDraft(s, d) {
+  const m = me();
+  const target = playerById(s, d.to);
+  const errors = [];
+  const side = (raw, owner, you) => {
+    const cash = parseCount(raw.cash);
+    const jailCards = parseCount(raw.jail);
+    if (cash === null) errors.push('Cash must be a whole number of dollars.');
+    else if (cash > owner.cash) errors.push(`${you ? 'You only have' : `${owner.name} only has`} ${money(owner.cash)}.`);
+    if (jailCards === null) errors.push('Jail cards must be a whole number.');
+    else if (jailCards > owner.getOutOfJailCards) {
+      errors.push(`${you ? 'You have' : `${owner.name} has`} only ${owner.getOutOfJailCards} jail card${owner.getOutOfJailCards === 1 ? '' : 's'}.`);
+    }
+    return { cash: cash ?? 0, tiles: [...raw.tiles], jailCards: jailCards ?? 0 };
+  };
+  const give = side(d.give, m, true);
+  const get = side(d.get, target, false);
+  const empty = [give, get].every((x) => !x.cash && !x.jailCards && !x.tiles.length);
+  const fees = { mine: tradeFee(s, get.tiles), theirs: tradeFee(s, give.tiles) };
+  const myCash = m.cash - give.cash + get.cash;
+  const theirCash = target.cash - get.cash + give.cash;
+  if (!errors.length && myCash < fees.mine) errors.push(`You couldn't pay the ${money(fees.mine)} mortgage fee.`);
+  if (!errors.length && theirCash < fees.theirs) errors.push(`${target.name} couldn't pay the ${money(fees.theirs)} mortgage fee.`);
+  // In debt, a trade may not leave me less to pay with (mirrors rules.checkDebtTrade: UNFAIR_TRADE).
+  const inDebt = s.turn.phase === 'paying';
+  if (!errors.length && inDebt) {
+    const worth = (tiles) => tiles.reduce((sum, i) => sum + (tileState(s, i)?.mortgaged ? 0 : TILES[i].mortgage), 0);
+    const change = get.cash - give.cash - fees.mine + worth(get.tiles) - worth(give.tiles);
+    if (change < 0) errors.push(`You're in debt, so you can't give value away: ask for ${money(-change)} more (properties count at their mortgage value).`);
+  }
+  return { payload: { toPlayerId: d.to, give, get }, errors, empty, fees, target, inDebt, myCashAfter: myCash - fees.mine };
+}
+
+function updateTradeSummary(box) {
+  const d = app.tradeDraft;
+  const summary = box.querySelector('[data-trade-summary]');
+  const send = box.querySelector('[data-trade-send]');
+  if (!d || !summary || !playerById(app.state, d.to)) {
+    if (send) send.disabled = true;
+    return;
+  }
+  const r = readTradeDraft(app.state, d);
+  const { give, get } = r.payload;
+  const rows = [['You give', sideText(app.state, give)], ['You get', sideText(app.state, get)]];
+  if (r.fees.mine || r.fees.theirs) rows.push(['10% fees', `you ${money(r.fees.mine)} · ${r.target.name} ${money(r.fees.theirs)}`]);
+  rows.push(['Your cash after', money(r.myCashAfter)]);
+  let note = '';
+  if (r.errors.length) note = `<p class="form-error">${esc(r.errors[0])}</p>`;
+  else if (r.empty) note = '<p class="hint">Tick properties or add cash on either side (or both).</p>';
+  else if (r.inDebt) note = '<p class="hint">You’re in debt: you may sell, but not give away — what you get must be worth at least the mortgage value of what you give.</p>';
+  else if (r.fees.mine || r.fees.theirs) note = '<p class="hint">Whoever receives a mortgaged property pays the bank 10% of its mortgage value.</p>';
+  setHtml(summary, `<dl class="trade-sum">${rows.map(([k, v]) => `<div><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join('')}</dl>${note}`);
+  if (send) send.disabled = !ready() || r.empty || r.errors.length > 0;
+}
+
+function sendTrade() {
+  const d = app.tradeDraft;
+  if (!d || !playerById(app.state, d.to)) return;
+  const r = readTradeDraft(app.state, d);
+  if (r.empty || r.errors.length) {
+    toast(r.errors[0] ?? 'Pick something to trade first.', 'error');
+    return;
+  }
+  app.tradeWith = d.to;
+  act('PROPOSE_TRADE', r.payload);
+}
+
+/** "Boardwalk (mortgaged), $100, 1 jail card" — or "nothing". */
+function sideText(s, side) {
+  const parts = side.tiles.map((i) => `${tileName(i)}${tileState(s, i)?.mortgaged ? ' (mortgaged)' : ''}`);
+  if (side.cash > 0) parts.push(money(side.cash));
+  if (side.jailCards > 0) parts.push(`${side.jailCards} jail card${side.jailCards > 1 ? 's' : ''}`);
+  return parts.length ? parts.join(', ') : 'nothing';
+}
+
+/** "Alice gives Boardwalk; Bob gives $300" — a pending trade in one line. */
+function tradeLine(s, trade) {
+  return `${playerName(s, trade.fromPlayerId)} gives ${sideText(s, trade.give)}; ${playerName(s, trade.toPlayerId)} gives ${sideText(s, trade.get)}`;
+}
+
+/** Why the target can't accept the pending offer (legal leaves ACCEPT_TRADE out). */
+function acceptBlocker(s, trade) {
+  const m = me();
+  const from = playerById(s, trade.fromPlayerId);
+  if (m.cash < trade.get.cash) return `You can't accept: it asks for ${money(trade.get.cash)} and you have ${money(m.cash)}.`;
+  const myFee = tradeFee(s, trade.give.tiles);
+  if (m.cash - trade.get.cash + trade.give.cash < myFee) return `You can't accept: you couldn't pay the ${money(myFee)} mortgage fee.`;
+  const theirFee = tradeFee(s, trade.get.tiles);
+  if (from && from.cash - trade.give.cash + trade.get.cash < theirFee) {
+    return `This can't go through: ${from.name} couldn't pay the ${money(theirFee)} mortgage fee.`;
+  }
+  return "This offer can't be accepted as it stands — reject it.";
+}
+
+/** A pending offer, as the target (incoming) or the proposer (outgoing) sees it. */
+function tradeOfferHtml(s, trade, compact) {
+  const m = me();
+  const incoming = trade.toPlayerId === m.id;
+  const other = playerById(s, incoming ? trade.fromPlayerId : trade.toPlayerId);
+  const youGet = incoming ? trade.give : trade.get;
+  const youGive = incoming ? trade.get : trade.give;
+  const myFee = tradeFee(s, youGet.tiles);
+  const theirFee = tradeFee(s, youGive.tiles);
+  const ok = ready();
+  const id = tradeIdAttr(trade);
+  const title = incoming ? `🤝 ${other?.name ?? 'Someone'} offers you a trade` : `🤝 Your offer to ${other?.name ?? 'them'}`;
+  let buttons = '';
+  if (!compact && incoming) {
+    buttons = `<div class="dialog-btns">
+      <button type="button" class="btn primary" data-act="ACCEPT_TRADE" data-nofocus${id}${disabledAttr(ok && can('ACCEPT_TRADE') && tradeArmed())}>Accept</button>
+      <button type="button" class="btn" data-act="REJECT_TRADE" data-nofocus${id}${disabledAttr(ok && can('REJECT_TRADE'))}>Reject</button>
+    </div>`;
+  } else if (!compact) {
+    buttons = `<div class="dialog-btns">
+      <button type="button" class="btn" data-act="REJECT_TRADE" data-nofocus${id}${disabledAttr(ok && can('REJECT_TRADE'))}>Withdraw offer</button>
+    </div>`;
+  }
+  const fees = myFee || theirFee
+    ? `<p class="trade-fee">10% mortgage fees to the bank: you ${money(myFee)} · ${esc(other?.name ?? 'they')} ${money(theirFee)}</p>`
+    : '';
+  const after = m.cash - youGive.cash + youGet.cash - myFee;
+  const blocker = incoming && !can('ACCEPT_TRADE') ? `<p class="hint">${esc(acceptBlocker(s, trade))}</p>` : '';
+  const sets = [
+    ...setsCompleted(s, m.id, youGet, youGive).map((g) => `Completes your ${g} set`),
+    ...(other ? setsCompleted(s, other.id, youGive, youGet).map((g) => `Completes ${other.name}'s ${g} set`) : []),
+  ];
+  const setsLine = sets.length ? `<p class="trade-sets">✨ ${esc(sets.join(' · '))}</p>` : '';
+  return `${compact ? '' : `<h3 id="dialog-title" class="dialog-title">${esc(title)}</h3>`}
+    <div class="trade-cols offer">
+      ${tradeListHtml(s, 'You get', youGet)}
+      ${tradeListHtml(s, 'You give', youGive)}
+    </div>
+    ${setsLine}${fees}
+    <div class="dialog-cash">Your cash <strong>${money(m.cash)}</strong> → <strong>${money(after)}</strong></div>
+    ${buttons}${compact ? '' : blocker}`;
+}
+
+/** Names of the colour groups `playerId` would own in full after receiving `receive` and giving `give` (not before). */
+function setsCompleted(s, playerId, receive, give) {
+  const mineAfter = (i) => receive.tiles.includes(i) || (tileState(s, i)?.ownerId === playerId && !give.tiles.includes(i));
+  const groups = new Set(receive.tiles.map((i) => TILES[i].group).filter(Boolean));
+  return [...groups]
+    .filter((g) => !ownsFullGroup(s, playerId, g) && TILES.every((t) => t.group !== g || mineAfter(t.index)))
+    .map((g) => BOARD.groups[g]?.name ?? g);
+}
+
+function tradeListHtml(s, heading, side) {
+  const items = side.tiles.map((i) => `<li class="trade-item" style="--gc:${groupMeta(groupKeyOf(i)).color}">
+      <span class="trade-item-name">${esc(TILES[i].name)}</span>${tileState(s, i)?.mortgaged ? '<span class="tag mort">Mortgaged</span>' : ''}
+    </li>`);
+  if (side.cash > 0) items.push(`<li class="trade-item plain">💵 ${money(side.cash)}</li>`);
+  if (side.jailCards > 0) items.push(`<li class="trade-item plain">🎫 ${side.jailCards} Get Out of Jail Free card${side.jailCards > 1 ? 's' : ''}</li>`);
+  return `<div class="trade-col">
+    <div class="trade-col-head">${heading}</div>
+    <ul class="trade-items">${items.join('') || '<li class="trade-item plain muted">Nothing</li>'}</ul>
+  </div>`;
 }
 
 // Phones and narrow windows: the latest log lines in the panel (the board's own log is tiny there;
@@ -1125,11 +1779,17 @@ function groupHtml(s, key, list, buttons) {
   const { info, name, color } = groupMeta(key);
   const total = TILES.filter((t) => (info ? t.group === key : t.type === key)).length;
   const fullSet = !!info && list.length === total;
+  // The Build buttons of a full set with a mortgaged lot are disabled (MORTGAGED_IN_GROUP): say why.
+  const mortgaged = buttons && fullSet ? list.filter((ts) => ts.mortgaged).map((ts) => tileName(ts.index)) : [];
+  const note = mortgaged.length
+    ? `<p class="hint pgroup-note">Unmortgage ${esc(mortgaged.join(' and '))} to build here.</p>`
+    : '';
   return `<div class="pgroup" style="--gc:${color}">
     <div class="pgroup-head">
       <span>${esc(name)}</span><span class="muted">${list.length}/${total}</span>
       ${fullSet ? '<span class="tag set">Full set</span>' : ''}
     </div>
+    ${note}
     ${list.sort((a, b) => a.index - b.index).map((ts) => propertyRow(s, ts, fullSet, buttons)).join('')}
   </div>`;
 }
@@ -1193,9 +1853,10 @@ function renderDialog() {
   clearDialogBox(narrow ? $('#dialog-layer') : $('#panel-dialog'));
   const dialog = currentDialog(narrow);
   const visible = !!dialog && (narrow || !app.dismissed.has(dialog.key));
-  const hold = app.dialogAt - Date.now();
+  const hold = dialog?.immediate ? 0 : app.dialogAt - Date.now();
   clearTimeout(app.dialogTimer);
-  // A dialog that is already up just refreshes; a new one waits for the board's move animation.
+  // A dialog that is already up just refreshes; a new one waits for the board's move animation
+  // (except one the player opened themselves, like the trade builder).
   if (!visible || (hold > 0 && box.dataset.key !== dialog.key)) {
     clearDialogBox(box);
     if (visible) app.dialogTimer = setTimeout(renderDialog, hold);
@@ -1214,24 +1875,28 @@ function renderDialog() {
         <button type="button" class="dialog-x" data-ui="dismiss" data-key="${esc(dialog.key)}" aria-label="Hide" title="Hide — the buttons stay in the side panel">×</button>
         ${html}
       </div>`);
+  dialog.after?.(box); // e.g. put the trade builder's typed values back
   box.querySelectorAll(scrollers).forEach((e, k) => { if (scrolled[k]) e.scrollTop = scrolled[k]; });
   // Only a newly opened dialog pops in; updates to the one on screen (cash, buttons) don't.
   if (alreadyShown) box.firstElementChild?.classList.add('shown');
-  else focusNewDialog(box, narrow);
+  else focusNewDialog(box, narrow, dialog.focus);
 }
 
 // Keyboard users continue in a new dialog: if focus was lost to a re-render (after Roll) or is in
-// the action bar, move it to the dialog's main button (never a dangerous one). On narrow layouts
-// those buttons live in the action bar.
-function focusNewDialog(box, narrow) {
+// the action bar, move it to the dialog's main button (never a dangerous one, nor one marked
+// data-nofocus such as Accept trade: Space must never take a decision like that by accident). On
+// narrow layouts those buttons live in the action bar. `own` = a control of the dialog itself to
+// focus instead (the trade builder's form, which has no action-bar buttons).
+function focusNewDialog(box, narrow, own = null) {
   const active = document.activeElement;
   const bar = $('#action-bar');
   const fromBody = !active || active === document.body;
   if (!fromBody && !(!narrow && bar.contains(active))) return;
-  const safe = '[data-act]:not(:disabled):not(.danger)';
-  const target = narrow
-    ? bar.querySelector(`.action-buttons ${safe}`)
-    : box.querySelector(`.dialog-btns ${safe}`) ?? box.querySelector('.dialog');
+  const safe = '[data-act]:not(:disabled):not(.danger):not([data-nofocus])';
+  let target;
+  if (own) target = box.querySelector(own);
+  else if (narrow) target = bar.querySelector(`.action-buttons ${safe}`);
+  else target = box.querySelector(`.dialog-btns ${safe}`) ?? box.querySelector('.dialog');
   target?.focus({ preventScroll: true });
 }
 
@@ -1249,8 +1914,31 @@ function currentDialog(compact) {
   const s = app.state;
   if (s.status === 'finished') return { key: 'game-over', cls: 'dialog-over', label: 'Final standings', html: gameOverHtml(s, compact) };
   const m = me();
-  if (!m || m.bankrupt || !isMyTurn()) return null;
+  if (!m || m.bankrupt) return null;
   const t = s.turn;
+  // A pending trade concerns its two parties, whoever's turn it is.
+  if (t.phase === 'trading' && s.trade) {
+    if (s.trade.toPlayerId !== m.id && s.trade.fromPlayerId !== m.id) return null;
+    const incoming = s.trade.toPlayerId === m.id;
+    return {
+      key: `trade-${incoming ? 'in' : 'out'}:${s.trade.id}`,
+      cls: 'dialog-offer',
+      label: incoming ? 'Trade offer' : 'Your trade offer',
+      html: tradeOfferHtml(s, s.trade, compact),
+    };
+  }
+  if (!isMyTurn()) return null;
+  if (app.tradeDraft && can('PROPOSE_TRADE')) {
+    return {
+      key: 'trade-build',
+      cls: 'dialog-trade',
+      label: 'Propose a trade',
+      html: tradeBuilderHtml(s, app.tradeDraft),
+      immediate: true,
+      after: hydrateTradeBuilder,
+      focus: '.trade-target.selected',
+    };
+  }
   if (t.phase === 'buying_or_auction' && t.pendingPurchase != null) {
     return { key: `buy:${t.number}:${t.pendingPurchase}`, label: 'Buy decision', html: buyHtml(m, t.pendingPurchase, compact) };
   }
@@ -1274,6 +1962,7 @@ function buyHtml(m, index, compact) {
   let after = '';
   if (short > 0) after = raiseCashHtml(short, 'Nothing left to sell or mortgage — you can only decline.');
   else if (!can('BUY')) after = `<p class="hint">You can't buy this right now.</p>`;
+  if (app.state.settings.auctionOnDecline) after += '<p class="hint">If you decline, it goes to auction — everyone can bid, you too.</p>';
   // The deed's band is the dialog's heading, which keeps the card short enough to sit under the dice.
   return `${deedHtml(tile, `Buy for ${money(tile.price)}?`)}
     <div class="dialog-cash">You have <strong>${money(m.cash)}</strong>${short > 0 ? ` — <span class="neg">${money(short)} short</span>` : ''}</div>
@@ -1285,7 +1974,7 @@ function buyHtml(m, index, compact) {
 }
 
 /** Compact title deed: color band (with `heading` as the dialog title), rent on up to three lines, costs. */
-function deedHtml(tile, heading) {
+function deedHtml(tile, heading, id = 'dialog-title') {
   let band = '#3d4448';
   let rows = [];
   if (tile.type === 'property') {
@@ -1304,7 +1993,7 @@ function deedHtml(tile, heading) {
   const costs = [tile.houseCost ? `Houses ${money(tile.houseCost)} each` : '', `Mortgage ${money(tile.mortgage)}`]
     .filter(Boolean).join(' · ');
   return `<div class="deed" style="--gc:${band};--gc-text:${textOn(band)}">
-    <div class="deed-band" id="dialog-title"><span class="deed-kicker">${esc(heading)}</span><strong>${esc(tile.name)}</strong></div>
+    <div class="deed-band" id="${id}"><span class="deed-kicker">${esc(heading)}</span><strong>${esc(tile.name)}</strong></div>
     <table class="deed-rent">${rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')}</table>
     <div class="deed-foot">${costs}</div>
   </div>`;
@@ -1334,6 +2023,12 @@ function raiseCashHtml(short, emptyText) {
   </div>`;
 }
 
+/** " to Alice" / " to the bank" / " to the other players" for a pending debt. */
+function debtCreditorText(s, debt) {
+  if (!debt) return '';
+  return ` to ${debt.payees?.length ? 'the other players' : debt.toPlayerId ? playerName(s, debt.toPlayerId) : 'the bank'}`;
+}
+
 function debtHtml(s, m, debt, compact) {
   const ok = ready();
   const creditor = debt.payees?.length ? 'the other players' : debt.toPlayerId ? playerName(s, debt.toPlayerId) : 'the bank';
@@ -1344,7 +2039,7 @@ function debtHtml(s, m, debt, compact) {
     <div class="dialog-cash">You have <strong>${money(m.cash)}</strong>${short > 0 ? ` — <span class="neg">${money(short)} short</span>` : ''}</div>
     ${compact ? '' : `<div class="dialog-btns">
       <button type="button" class="btn primary" data-act="PAY_DEBT"${disabledAttr(ok && can('PAY_DEBT'))}>Pay ${money(debt.amount)}</button>
-      <button type="button" class="btn danger" data-act="DECLARE_BANKRUPTCY"${disabledAttr(ok && can('DECLARE_BANKRUPTCY'))}>Declare bankruptcy</button>
+      ${can('PAY_DEBT') ? '' : `<button type="button" class="btn danger" data-act="DECLARE_BANKRUPTCY"${disabledAttr(ok && can('DECLARE_BANKRUPTCY'))}>Declare bankruptcy</button>`}
     </div>`}
     ${short > 0 ? raiseCashHtml(short, 'Nothing left to sell or mortgage — you can only declare bankruptcy.') : ''}`;
 }
@@ -1425,12 +2120,15 @@ function toast(text, kind = 'info', ms = 4500) {
  * what I just did myself or what is already on screen (my purchase, my debt, the banner saying
  * it's my turn): those would only pile up over the buttons.
  */
-function announce(events) {
+function announce(events, prevTrade = null) {
   const s = app.state;
   const myId = me()?.id;
   const name = (id) => playerName(s, id);
+  // Whoever went bankrupt (or resigned) in this batch: a cancelled trade or debt names them.
+  const gone = events.find((e) => e.type === 'bankrupt')?.playerId ?? null;
   for (const ev of events) {
     const mine = !!myId && ev.playerId === myId;
+    if (announceDeal(ev, s, myId, name, prevTrade, gone)) continue;
     switch (ev.type) {
       case 'turn_started':
         if (mine && !document.hasFocus()) toast("🎲 It's your turn!", 'info', 2500);
@@ -1475,17 +2173,80 @@ function announce(events) {
         if (mine && ev.method === 'doubles') toast("Doubles — you're out of jail!", 'good');
         else if (mine && ev.method === 'forced_fine') toast(`Third miss — you paid the ${money(BOARD.jailFine)} fine and move on`, 'bad');
         break;
-      case 'timeout':
-        if (mine) toast("Time's up — the game played your turn for you", 'bad');
+      case 'timeout': // an auction's clock running out is just how auctions end (auction_won / _unsold say it)
+        if (mine && ev.phase !== 'auction') toast("Time's up — the game played your turn for you", 'bad');
         break;
-      case 'bankrupt':
-        if (mine) toast(app.resigned ? 'You resigned from the game' : 'You went bankrupt', 'bad', 6000);
-        else if (myId && ev.toPlayerId === myId) toast(`${name(ev.playerId)} went bankrupt — their assets are yours`, 'good', 6000);
-        else toast(`${name(ev.playerId)} went bankrupt`, 'info');
+      case 'bankrupt': {
+        const resigned = ev.reason === 'resigned';
+        if (mine) toast(resigned || app.resigned ? 'You resigned from the game' : 'You went bankrupt', 'bad', 6000);
+        else if (myId && ev.toPlayerId === myId) toast(`${name(ev.playerId)} ${resigned ? 'resigned' : 'went bankrupt'} — their assets are yours`, 'good', 6000);
+        else toast(`${name(ev.playerId)} ${resigned ? 'resigned' : 'went bankrupt'}`, 'info');
+        break;
+      }
+      case 'debt_reduced': // someone I owed went bankrupt: their share of my debt is cancelled
+        if (mine && gone) {
+          toast(ev.amount > 0
+            ? `${name(gone)} is out — you no longer owe them; ${money(ev.amount)} is still due`
+            : `${name(gone)} is out — you no longer owe them anything`, 'good', 6000);
+        }
         break;
       default:
         break;
     }
+  }
+}
+
+/**
+ * Toasts for auctions and trades; true if `ev` was one of theirs. Bids and passes get none (the
+ * auction sheet shows them), nor does my own click (declining, accepting…).
+ */
+function announceDeal(ev, s, myId, name, prevTrade, gone) {
+  switch (ev.type) {
+    case 'auction_started':
+      // The decliner just clicked; everyone else may be looking elsewhere (on phones the sheet is
+      // below the board).
+      if (!myId || currentPlayerId(s) !== myId) {
+        const bidder = !!myId && ev.participants?.includes(myId) && !playerById(s, myId)?.bankrupt;
+        // Phones scroll the sheet into view instead (revealAuctionControls); a toast would cover its clock.
+        if (bidder && NARROW.matches) return true;
+        toast(`🔨 ${tileName(ev.tileIndex)} is up for auction${bidder ? ' — bid or pass in the panel' : ''}`, 'info', 4000);
+      }
+      return true;
+    case 'auction_won':
+      if (ev.playerId === myId) toast(`🔨 You won ${tileName(ev.tileIndex)} for ${money(ev.amount)}!`, 'good', 5000);
+      else toast(`🔨 ${name(ev.playerId)} won ${tileName(ev.tileIndex)} for ${money(ev.amount)}`, 'info');
+      return true;
+    case 'auction_unsold':
+      toast(`🔨 No sale — ${tileName(ev.tileIndex)} stays with the bank`, 'info');
+      return true;
+    case 'trade_proposed':
+      if (ev.toPlayerId === myId) toast(`🤝 ${name(ev.fromPlayerId)} offered you a trade`, 'card', 5000);
+      return true;
+    case 'trade_accepted': {
+      const fee = myId ? ev.fees?.[myId] ?? 0 : 0;
+      const feeText = fee > 0 ? ` (you paid a ${money(fee)} mortgage fee)` : '';
+      if (ev.fromPlayerId === myId) toast(`🤝 ${name(ev.toPlayerId)} accepted your trade${feeText}`, 'good', 5000);
+      else if (ev.toPlayerId === myId) toast(`🤝 Trade done${feeText}`, 'good');
+      else toast(`🤝 ${name(ev.fromPlayerId)} and ${name(ev.toPlayerId)} made a trade`, 'info');
+      return true;
+    }
+    case 'trade_rejected': {
+      const t = prevTrade?.id === ev.tradeId ? prevTrade : null;
+      if (!t || ev.byPlayerId === myId) return true; // my own click
+      if (t.fromPlayerId === myId) toast(`🤝 ${name(ev.byPlayerId)} turned down your trade`, 'bad');
+      else if (t.toPlayerId === myId) toast(`🤝 ${name(ev.byPlayerId)} withdrew the trade offer`, 'info');
+      return true;
+    }
+    case 'trade_cancelled': {
+      const t = prevTrade?.id === ev.tradeId ? prevTrade : null;
+      if (t && (t.fromPlayerId === myId || t.toPlayerId === myId)) {
+        const why = ev.reason === 'timeout' ? 'time ran out' : `${gone ? name(gone) : 'a player'} resigned`;
+        toast(`🤝 The trade offer was called off (${why})`, 'info');
+      }
+      return true;
+    }
+    default:
+      return false;
   }
 }
 
@@ -1533,6 +2294,8 @@ function onActionClick(el) {
   if (text && !window.confirm(text)) return;
   if (type === 'LEAVE' && !lobbyOnly && app.state?.status === 'active') app.resigned = true;
   const payload = el.dataset.tile != null ? { tileIndex: Number(el.dataset.tile) } : {};
+  if (el.dataset.amount != null) payload.amount = Number(el.dataset.amount); // quick bids
+  if (el.dataset.tradeId != null) payload.tradeId = el.dataset.tradeId; // answers exactly the offer on screen
   if (lobbyOnly) payload.lobbyOnly = true;
   act(type, payload);
 }
@@ -1570,8 +2333,34 @@ function onUiClick(el, event) {
       app.conn?.reconnect();
       break;
     case 'dismiss':
+      if (el.dataset.key === 'trade-build') {
+        closeTradeBuilder(); // the builder has nothing in the side panel to fall back on
+        break;
+      }
       app.dismissed.add(el.dataset.key);
       renderDialog();
+      break;
+    case 'trade-open':
+      openTradeBuilder();
+      break;
+    case 'bid-max': { // fills the bid box only: bidding everything still takes the Bid button
+      const limits = can('BID') ? app.legal.auction : null;
+      if (limits) $('#bid-input').value = String(limits.maxBid);
+      break;
+    }
+    case 'trade-target':
+      if (app.tradeDraft && app.tradeDraft.to !== el.dataset.key) {
+        // Another player: what I'd get from the previous one no longer applies.
+        app.tradeDraft.to = el.dataset.key;
+        app.tradeDraft.get = emptyTradeSide();
+        rerender();
+      }
+      break;
+    case 'trade-cancel':
+      closeTradeBuilder();
+      break;
+    case 'trade-send':
+      sendTrade();
       break;
     default:
       break;
@@ -1615,6 +2404,13 @@ function boot() {
   $('#create-form').addEventListener('submit', createGame);
   $('#code-form').addEventListener('submit', joinByCode);
   $('#lobby-join').addEventListener('submit', joinLobby);
+  $('#auction-form').addEventListener('submit', submitBid);
+  // Trade builder fields: update the draft and its summary in place (never a re-render while typing).
+  const onTradeField = (event) => {
+    if (event.target.dataset?.trade) onTradeInput(event.target);
+  };
+  document.addEventListener('input', onTradeField);
+  document.addEventListener('change', onTradeField);
 
   document.addEventListener('click', (event) => {
     const el = event.target.closest('[data-act], [data-ui]');

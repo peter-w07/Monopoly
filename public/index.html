@@ -80,6 +80,7 @@
               <div class="checks">
                 <label class="check"><input id="set-pot" type="checkbox"> Free Parking pot</label>
                 <label class="check"><input id="set-even" type="checkbox" checked> Build evenly</label>
+                <label class="check" title="A property its lander declines is auctioned to everyone"><input id="set-auction" type="checkbox" checked> Auctions</label>
               </div>
             </div>
             <button type="submit" class="btn primary block">Create game</button>
@@ -164,7 +165,25 @@
         </div>
         <aside class="panel" aria-label="Game panel">
           <div id="turn-banner"></div>
-          <!-- Narrow layouts: the buy / debt / jail / game-over details (wide layouts use #dialog-layer) -->
+          <!-- While a property is auctioned: for everyone at the table, on every layout -->
+          <section id="auction-sheet" class="auction-sheet" aria-labelledby="auction-title" hidden>
+            <div id="auction-head"></div>
+            <div id="auction-high" aria-live="polite"></div>
+            <div id="auction-status"></div>
+            <div id="auction-controls" class="auction-quick"></div>
+            <form id="auction-form" class="auction-form" novalidate hidden>
+              <label class="count-field money">
+                <span class="sr-only">Your bid in dollars</span>
+                <input id="bid-input" type="number" inputmode="numeric" min="1" step="1" autocomplete="off" enterkeyhint="send">
+              </label>
+              <!-- Fills in all my cash; the bid still needs the Bid button (quick bids never turn into "all in") -->
+              <button id="bid-max" type="button" class="btn" data-ui="bid-max">Max</button>
+              <button id="bid-submit" type="submit" class="btn primary">Bid</button>
+            </form>
+            <div id="auction-pass"></div>
+            <ul id="auction-people" class="auction-people" aria-label="Bidders"></ul>
+          </section>
+          <!-- Narrow layouts: the buy / debt / jail / trade / game-over details (wide layouts use #dialog-layer) -->
           <div id="panel-dialog" class="panel-dialog-slot"></div>
           <div id="action-bar" class="action-bar"></div>
           <!-- Narrow layouts: the latest log lines (the board's own log is tiny there) -->

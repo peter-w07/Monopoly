@@ -8,21 +8,22 @@ import {
 
 // Non-management actions that need no payload; unlisted ones must fail.
 const TURN_ACTIONS = [
-  'ROLL', 'BUY', 'DECLINE', 'END_TURN', 'PAY_JAIL_FINE', 'USE_JAIL_CARD',
-  'PAY_DEBT', 'DECLARE_BANKRUPTCY', 'START_GAME',
+  'ROLL', 'BUY', 'DECLINE', 'START_AUCTION', 'END_TURN', 'PAY_JAIL_FINE', 'USE_JAIL_CARD',
+  'PAY_DEBT', 'DECLARE_BANKRUPTCY', 'START_GAME', 'PASS_AUCTION', 'ACCEPT_TRADE', 'REJECT_TRADE',
 ];
 const MANAGEMENT = { build: 'BUILD', sellHouse: 'SELL_HOUSE', mortgage: 'MORTGAGE', unmortgage: 'UNMORTGAGE' };
-const NEVER_LISTED = ['TIMEOUT', 'START_AUCTION', 'BID', 'PROPOSE_TRADE', 'ACCEPT_TRADE', 'REJECT_TRADE'];
+const NEVER_LISTED = ['TIMEOUT'];
+const NEEDS_PAYLOAD = ['JOIN', 'BID', 'PROPOSE_TRADE']; // covered by lobby / auction / trade tests
 const ALL_TILES = [...Array(40).keys()];
 
 /** Check every listed action succeeds and every unlisted turn/management action fails. */
 function assertConsistent(state, playerId) {
   const legal = legalActions(state, playerId);
-  assert.deepEqual(Object.keys(legal).sort(), ['actions', 'build', 'mortgage', 'sellHouse', 'unmortgage']);
+  assert.deepEqual(Object.keys(legal).sort(), ['actions', 'auction', 'build', 'mortgage', 'sellHouse', 'tradeTargets', 'unmortgage']);
   for (const type of NEVER_LISTED) assert.ok(!legal.actions.includes(type), `${type} must never be listed`);
 
   for (const type of legal.actions) {
-    if (type === 'JOIN') continue; // needs a name/token payload
+    if (NEEDS_PAYLOAD.includes(type)) continue;
     const res = applyAction(state, { type, playerId });
     assert.ok(!res.error, `${playerId}: ${type} is listed but fails with ${JSON.stringify(res.error)}`);
   }
@@ -46,7 +47,7 @@ const sorted = (a) => [...a].sort((x, y) => x - y);
 
 describe('legalActions', () => {
   test('spectators', () => {
-    const empty = { actions: [], build: [], sellHouse: [], mortgage: [], unmortgage: [] };
+    const empty = { actions: [], build: [], sellHouse: [], mortgage: [], unmortgage: [], auction: null, tradeTargets: [] };
     assert.deepEqual(legalActions(lobby({ players: 2 }), null), { ...empty, actions: ['JOIN'] });
     assert.deepEqual(legalActions(lobby({ players: 2, settings: { maxPlayers: 2 } }), null), empty);
     assert.deepEqual(legalActions(newGame(), null), empty);

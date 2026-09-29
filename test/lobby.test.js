@@ -134,7 +134,7 @@ describe('JOIN', () => {
 
   test('spectators may JOIN while there is room', () => {
     assert.deepEqual(legalActions(lobby({ players: 1 }), null), {
-      actions: ['JOIN'], build: [], sellHouse: [], mortgage: [], unmortgage: [],
+      actions: ['JOIN'], build: [], sellHouse: [], mortgage: [], unmortgage: [], auction: null, tradeTargets: [],
     });
   });
 });

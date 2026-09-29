@@ -8,8 +8,8 @@ import { BOARD, TILES, getTile } from './board.js';
 import { getCard } from './cards.js';
 import { rollDice, shuffle } from './rng.js';
 import {
-  activePlayers, buildingRefund, canMortgage, currentPlayerId,
-  getPlayer, getTileState, liquidationValue, rentFor, unmortgageCost, validateAction,
+  activePlayers, buildingRefund, canMortgage, currentPlayerId, getPlayer, getTileState, liquidationValue,
+  normalizeTradeSide, rentFor, tradeFees, unmortgageCost, validateAction,
 } from './rules.js';
 
 const LOG_LIMIT = 100;
@@ -19,9 +19,9 @@ const POT_REASONS = new Set(['tax', 'card', 'jail_fine']);
 
 export function applyAction(state, action) {
   try {
-    // Validation and the handler read one shallow copy, so an action whose fields change between
-    // reads (getters, proxies) can't pass validation as one action and then run as another.
-    const a = action !== null && typeof action === 'object' ? { ...action } : action;
+    // Validation and the handler read one copy, so an action whose fields change between reads
+    // (getters, proxies) can't pass validation as one action and then run as another.
+    const a = action !== null && typeof action === 'object' ? readAction(action) : action;
     const error = validateAction(state, a);
     if (error) return { state, events: [], error };
     const ctx = { s: cloneState(state), events: [] };
@@ -36,6 +36,20 @@ export function applyAction(state, action) {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+/** A shallow copy of the action; a trade offer's two sides (and their tile lists) are copied too. */
+function readAction(action) {
+  const a = { ...action };
+  if (a.type === 'PROPOSE_TRADE') {
+    for (const key of ['give', 'get']) {
+      if (a[key] === null || typeof a[key] !== 'object' || Array.isArray(a[key])) continue;
+      const side = { ...a[key] };
+      if (Array.isArray(side.tiles)) side.tiles = [...side.tiles];
+      a[key] = side;
+    }
+  }
+  return a;
+}
 
 /**
  * Deep copy of the state, which is plain JSON data (CONTRACT §3). About 7× faster than
@@ -66,7 +80,7 @@ const mod = (n, m) => ((n % m) + m) % m;
 const actor = (ctx, action) => getPlayer(ctx.s, action.playerId);
 
 // ---------------------------------------------------------------------------
-// Handlers (one per action type; stubs never get here because validation rejects them)
+// Handlers (one per action type; they only ever see actions that passed validation)
 // ---------------------------------------------------------------------------
 
 const HANDLERS = {
@@ -93,11 +107,22 @@ const HANDLERS = {
       emit(ctx, 'player_left', { playerId: p.id });
       log(ctx, `${p.name} left the game.`);
     } else {
+      log(ctx, `${p.name} resigned.`);
+      const wasCurrent = currentPlayerId(s) === p.id;
+      // A pending trade that involves the leaver is called off first (restoring its phase); so is
+      // one whose proposer owes the leaver money (§4.8 step 4 is about to change that debt).
+      if (s.trade && (s.trade.fromPlayerId === p.id || s.trade.toPlayerId === p.id
+        || (s.trade.returnPhase === 'paying' && debtShare(s.turn.pendingDebt, p.id) > 0))) {
+        cancelTrade(ctx, 'resigned');
+      }
+      // The current player's auction is cancelled before the turn passes on.
+      if (s.auction && wasCurrent) cancelAuction(ctx);
       // Resigning is bankruptcy to the bank, except that a debtor who owes one player (the current
       // player in the paying phase) goes bankrupt to that creditor, exactly as DECLARE_BANKRUPTCY.
-      const owing = s.turn.phase === 'paying' && currentPlayerId(s) === p.id;
-      log(ctx, `${p.name} resigned.`);
-      goBankrupt(ctx, p, owing ? debtCreditor(s.turn.pendingDebt) : null);
+      const owing = s.turn.phase === 'paying' && wasCurrent;
+      goBankrupt(ctx, p, owing ? debtCreditor(s.turn.pendingDebt) : null, 'resigned');
+      // Anyone else leaving an auction counts as a pass (and loses the high bid).
+      if (s.auction && s.status === 'active') leaveAuction(ctx, p);
     }
   },
 
@@ -106,7 +131,7 @@ const HANDLERS = {
     s.status = 'active';
     Object.assign(s.turn, {
       order: s.players.map((p) => p.id), currentIndex: 0, number: 1,
-      doublesCount: 0, rollAgain: false, lastRoll: null, pendingPurchase: null, pendingDebt: null,
+      doublesCount: 0, rollAgain: false, lastRoll: null, pendingPurchase: null, pendingDebt: null, tradesProposed: 0,
     });
     emit(ctx, 'game_started', { order: [...s.turn.order] });
     log(ctx, `The game has started with ${s.players.length} players.`);
@@ -140,7 +165,77 @@ const HANDLERS = {
     s.turn.phase = 'end_turn';
     emit(ctx, 'declined', { playerId: p.id, tileIndex: index });
     log(ctx, `${p.name} declined to buy ${tileName(index)}.`);
-    if (s.settings.auctionOnDecline) log(ctx, 'Auctions are not implemented yet; the property stays unowned.');
+    if (s.settings.auctionOnDecline) startAuction(ctx, index);
+  },
+
+  START_AUCTION(ctx, a) {
+    HANDLERS.DECLINE(ctx, a); // validation made sure auctionOnDecline is on
+  },
+
+  BID(ctx, a) {
+    const p = actor(ctx, a);
+    const auction = ctx.s.auction;
+    auction.highBid = a.amount;
+    auction.highBidderId = p.id;
+    auction.bids.push({ playerId: p.id, amount: a.amount });
+    emit(ctx, 'auction_bid', { playerId: p.id, amount: a.amount });
+    log(ctx, `${p.name} bid ${money(a.amount)} for ${tileName(auction.tileIndex)}.`);
+    checkAuctionEnd(ctx);
+  },
+
+  PASS_AUCTION(ctx, a) {
+    const p = actor(ctx, a);
+    ctx.s.auction.passed.push(p.id);
+    emit(ctx, 'auction_passed', { playerId: p.id });
+    log(ctx, `${p.name} dropped out of the auction.`);
+    checkAuctionEnd(ctx);
+  },
+
+  PROPOSE_TRADE(ctx, a) {
+    const { s } = ctx;
+    const p = actor(ctx, a);
+    const trade = {
+      id: `t_${s.seq ?? 0}`, fromPlayerId: p.id, toPlayerId: a.toPlayerId,
+      give: normalizeTradeSide(a.give), get: normalizeTradeSide(a.get), returnPhase: s.turn.phase,
+    };
+    s.trade = trade;
+    s.turn.phase = 'trading';
+    s.turn.tradesProposed = (s.turn.tradesProposed ?? 0) + 1; // MAX_TRADES_PER_TURN (rules.js)
+    emit(ctx, 'trade_proposed', tradeEvent(trade));
+    log(ctx, `${p.name} offers ${getPlayer(s, trade.toPlayerId).name} ${describeSide(trade.give)} for ${describeSide(trade.get)}.`);
+  },
+
+  ACCEPT_TRADE(ctx) {
+    const { s } = ctx;
+    const trade = s.trade;
+    const from = getPlayer(s, trade.fromPlayerId);
+    const to = getPlayer(s, trade.toPlayerId);
+    const fees = tradeFees(s, from.id, trade); // before any tile moves; mortgages don't change
+    from.cash += trade.get.cash - trade.give.cash;
+    to.cash += trade.give.cash - trade.get.cash;
+    for (const index of trade.give.tiles) getTileState(s, index).ownerId = to.id;
+    for (const index of trade.get.tiles) getTileState(s, index).ownerId = from.id;
+    moveJailCards(from, to, trade.give.jailCards);
+    moveJailCards(to, from, trade.get.jailCards);
+    for (const p of [from, to]) p.cash -= fees[p.id]; // to the bank, never the pot
+    s.trade = null;
+    s.turn.phase = trade.returnPhase;
+    emit(ctx, 'trade_accepted', { ...tradeEvent(trade), fees: { ...fees } });
+    log(ctx, `${to.name} accepted ${from.name}'s trade.`);
+    for (const p of [from, to]) {
+      if (fees[p.id] > 0) log(ctx, `${p.name} paid the bank ${money(fees[p.id])} interest on mortgaged property received.`);
+    }
+  },
+
+  REJECT_TRADE(ctx, a) {
+    const { s } = ctx;
+    const trade = s.trade;
+    s.trade = null;
+    s.turn.phase = trade.returnPhase;
+    emit(ctx, 'trade_rejected', { tradeId: trade.id, byPlayerId: a.playerId });
+    log(ctx, a.playerId === trade.fromPlayerId
+      ? `${getPlayer(s, a.playerId).name} withdrew the trade offer.`
+      : `${getPlayer(s, a.playerId).name} rejected the trade.`);
   },
 
   END_TURN(ctx) {
@@ -210,10 +305,15 @@ const HANDLERS = {
   TIMEOUT(ctx, a) {
     const { s } = ctx;
     const p = actor(ctx, a);
+    emit(ctx, 'timeout', { playerId: p.id, phase: s.turn.phase });
+    // The auction clock running out is how auctions end, not the current player's fault; closeAuction logs the result.
+    if (s.turn.phase !== 'auction') log(ctx, `${p.name} ran out of time.`);
+    // An unanswered trade is called off, then the phase it interrupted times out as usual.
+    if (s.turn.phase === 'trading') cancelTrade(ctx, 'timeout');
     const phase = s.turn.phase;
-    emit(ctx, 'timeout', { playerId: p.id, phase });
-    log(ctx, `${p.name} ran out of time.`);
     switch (phase) {
+      case 'auction':
+        return closeAuction(ctx);
       case 'rolling':
       case 'jail_decision':
         return HANDLERS.ROLL(ctx, a);
@@ -258,7 +358,7 @@ function advanceTurn(ctx) {
       break;
     }
   }
-  Object.assign(t, { doublesCount: 0, rollAgain: false, lastRoll: null, pendingPurchase: null, pendingDebt: null });
+  Object.assign(t, { doublesCount: 0, rollAgain: false, lastRoll: null, pendingPurchase: null, pendingDebt: null, tradesProposed: 0 });
   t.number += 1;
   startTurn(ctx);
 }
@@ -620,6 +720,13 @@ function debtCreditor(debt) {
   return debt && !debt.payees ? debt.toPlayerId : null;
 }
 
+/** How much of a pending debt is owed to `playerId` (0 without a debt). */
+function debtShare(debt, playerId) {
+  if (!debt) return 0;
+  if (debt.payees) return debt.payees.filter((x) => x.playerId === playerId).reduce((sum, x) => sum + x.amount, 0);
+  return debt.toPlayerId === playerId ? debt.amount : 0;
+}
+
 /** The pending debt is gone (paid or cancelled): run its continuation, else back to end_turn. */
 function debtSettled(ctx, p, debt) {
   if (debt.then?.kind === 'jail_move') {
@@ -637,9 +744,7 @@ function debtSettled(ctx, p, debt) {
 function cancelDebtShare(ctx, gone) {
   const t = ctx.s.turn;
   const debt = t.pendingDebt;
-  const share = debt.payees
-    ? debt.payees.filter((x) => x.playerId === gone.id).reduce((sum, x) => sum + x.amount, 0)
-    : (debt.toPlayerId === gone.id ? debt.amount : 0);
+  const share = debtShare(debt, gone.id);
   if (share === 0) return;
   const debtor = getPlayer(ctx.s, currentPlayerId(ctx.s));
   if (debt.payees) debt.payees = debt.payees.filter((x) => x.playerId !== gone.id);
@@ -738,10 +843,128 @@ function autoRaise(ctx, p, target) {
 }
 
 // ---------------------------------------------------------------------------
+// Auctions (CONTRACT §4.12)
+// ---------------------------------------------------------------------------
+
+/** Every active player (in turn order, the decliner included) may bid; the current player stays current. */
+function startAuction(ctx, tileIndex) {
+  const { s } = ctx;
+  const participants = activePlayers(s).map((p) => p.id);
+  s.auction = { tileIndex, highBid: 0, highBidderId: null, bids: [], participants, passed: [] };
+  s.turn.phase = 'auction';
+  emit(ctx, 'auction_started', { tileIndex, participants: [...participants] });
+  log(ctx, `${tileName(tileIndex)} is up for auction.`);
+}
+
+/** The auction is over once nobody but the high bidder (if any) is still in it. */
+function checkAuctionEnd(ctx) {
+  const { s } = ctx;
+  const { participants, passed, highBidderId } = s.auction;
+  const stillIn = participants.some((id) => id !== highBidderId && !passed.includes(id) && !getPlayer(s, id).bankrupt);
+  if (!stillIn) closeAuction(ctx);
+}
+
+/** Ends the auction now: the high bidder pays the bank (never the pot) and gets the tile; no bids → unsold. */
+function closeAuction(ctx) {
+  const { s } = ctx;
+  const { tileIndex, highBid, highBidderId } = s.auction;
+  s.auction = null;
+  s.turn.phase = 'end_turn'; // rollAgain is preserved
+  if (highBidderId === null) {
+    emit(ctx, 'auction_unsold', { tileIndex });
+    log(ctx, `Nobody bid; ${tileName(tileIndex)} stays unowned.`);
+    return;
+  }
+  const winner = getPlayer(s, highBidderId);
+  winner.cash -= highBid;
+  getTileState(s, tileIndex).ownerId = winner.id;
+  emit(ctx, 'auction_won', { playerId: winner.id, tileIndex, amount: highBid });
+  log(ctx, `${winner.name} won ${tileName(tileIndex)} at auction for ${money(highBid)}.`);
+}
+
+/** Calls the auction off without a sale (the current player resigned, or the game ended). */
+function cancelAuction(ctx) {
+  const { s } = ctx;
+  const { tileIndex } = s.auction;
+  s.auction = null;
+  s.turn.phase = 'end_turn';
+  emit(ctx, 'auction_unsold', { tileIndex });
+  log(ctx, `The auction for ${tileName(tileIndex)} was called off; it stays unowned.`);
+}
+
+/**
+ * A participant resigned (and is already bankrupt): they count as passed, and if they had the high
+ * bid it falls back to the best bid by a player who is still in the auction (a player who passed
+ * dropped out of it, so their old bid no longer counts). Then the auction may be over.
+ */
+function leaveAuction(ctx, p) {
+  const { s } = ctx;
+  const auction = s.auction;
+  if (auction.participants.includes(p.id) && !auction.passed.includes(p.id)) {
+    auction.passed.push(p.id);
+    emit(ctx, 'auction_passed', { playerId: p.id });
+  }
+  if (auction.highBidderId === p.id) {
+    // Bids by players still in only ever rise, so the latest one is the best.
+    const best = auction.bids.findLast((b) => !auction.passed.includes(b.playerId) && !getPlayer(s, b.playerId).bankrupt);
+    auction.highBid = best ? best.amount : 0;
+    auction.highBidderId = best ? best.playerId : null;
+    log(ctx, best
+      ? `${getPlayer(s, best.playerId).name}'s bid of ${money(best.amount)} is the high bid again.`
+      : 'There are no bids left in the auction.');
+  }
+  checkAuctionEnd(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Trading (CONTRACT §4.13; validateTrade in rules.js)
+// ---------------------------------------------------------------------------
+
+function copySide(side) {
+  return { cash: side.cash, tiles: [...side.tiles], jailCards: side.jailCards };
+}
+
+function tradeEvent(trade) {
+  return {
+    tradeId: trade.id, fromPlayerId: trade.fromPlayerId, toPlayerId: trade.toPlayerId,
+    give: copySide(trade.give), get: copySide(trade.get),
+  };
+}
+
+function describeSide({ cash, tiles, jailCards }) {
+  const parts = [];
+  if (cash > 0) parts.push(money(cash));
+  for (const index of tiles) parts.push(tileName(index));
+  if (jailCards > 0) parts.push(jailCards === 1 ? 'a Get Out of Jail Free card' : `${jailCards} Get Out of Jail Free cards`);
+  if (parts.length === 0) return 'nothing';
+  return parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
+/** Hands over the giver's last `count` jail cards, keeping jailCards and getOutOfJailCards in sync. */
+function moveJailCards(giver, receiver, count) {
+  if (count <= 0) return;
+  const cards = giver.jailCards.splice(giver.jailCards.length - count, count);
+  receiver.jailCards.push(...cards);
+  giver.getOutOfJailCards -= count;
+  receiver.getOutOfJailCards += count;
+}
+
+/** Drops the pending trade and returns to the phase it interrupted. reason: "timeout" | "resigned". */
+function cancelTrade(ctx, reason) {
+  const { s } = ctx;
+  const trade = s.trade;
+  s.trade = null;
+  s.turn.phase = trade.returnPhase;
+  emit(ctx, 'trade_cancelled', { tradeId: trade.id, reason });
+  log(ctx, `The trade offer from ${getPlayer(s, trade.fromPlayerId).name} to ${getPlayer(s, trade.toPlayerId).name} was called off.`);
+}
+
+// ---------------------------------------------------------------------------
 // Bankruptcy & game over (CONTRACT §4.8)
 // ---------------------------------------------------------------------------
 
-function goBankrupt(ctx, p, creditorId) {
+/** reason: "resigned" (LEAVE) or "debt" (declared, TIMEOUT, or unable to pay a collect_each card). */
+function goBankrupt(ctx, p, creditorId, reason = 'debt') {
   const { s } = ctx;
   const t = s.turn;
   const wasCurrent = currentPlayerId(s) === p.id;
@@ -781,7 +1004,7 @@ function goBankrupt(ctx, p, creditorId) {
     t.pendingDebt = null;
     t.pendingPurchase = null;
   }
-  emit(ctx, 'bankrupt', { playerId: p.id, toPlayerId: creditor ? creditor.id : null, cash });
+  emit(ctx, 'bankrupt', { playerId: p.id, toPlayerId: creditor ? creditor.id : null, cash, reason });
   log(ctx, `${p.name} is bankrupt${creditor ? `; everything goes to ${creditor.name}` : ''}.`);
 
   // 4. Game over, or pass the turn on, or (someone else's turn) cancel what the current player owed them.
@@ -794,6 +1017,8 @@ function goBankrupt(ctx, p, creditorId) {
 /** Ends the game. turn.currentIndex has no meaning afterwards. */
 function endGame(ctx, winner) {
   const { s } = ctx;
+  if (s.auction) cancelAuction(ctx); // e.g. the only other bidder resigned
+  s.trade = null; // unreachable: a pending trade always has two active parties
   emit(ctx, 'turn_ended', { playerId: currentPlayerId(s) }); // every turn_started gets its turn_ended
   s.status = 'finished';
   s.winnerId = winner ? winner.id : null;

@@ -10,6 +10,7 @@
 //   lastActiveAt,                  idle clock: kept at "now" while a seated player is connected, else the
 //                                  time the last one left. Spectators never keep a room alive.
 //   graceUntil,                    restored rooms: no idle cleanup / eviction before this (players reconnecting)
+//   auctionSince,                  state.seq at which the running auction started (seq check for bids)
 //   finishing, archived, deleted, dropTimer   game-over / removal bookkeeping
 // }
 // Each socket carries ws.session = { room, playerId } (room null until hello, playerId null for spectators)
@@ -131,6 +132,7 @@ function makeRoom(state, secrets = new Map(), { lastActiveAt = Date.now(), grace
     timer: newTimerState(),
     lastActiveAt,
     graceUntil,
+    auctionSince: state.auction ? state.seq : null, // restored mid-auction: only seqs from now on count
     finishing: null,
     archived: false,
     deleted: false,
@@ -192,7 +194,7 @@ function safeLegal(state, playerId) {
     return legalActions(state, playerId);
   } catch (err) {
     logError(`legalActions failed for ${state.id}/${playerId}:`, err);
-    return { actions: [], build: [], sellHouse: [], mortgage: [], unmortgage: [] };
+    return { actions: [], build: [], sellHouse: [], mortgage: [], unmortgage: [], auction: null, tradeTargets: [] };
   }
 }
 
@@ -439,6 +441,7 @@ function commit(room, result, { forceTimer = false } = {}) {
   room.state = result.state;
   room.state.updatedAt = Date.now();
   room.lastActiveAt = room.state.updatedAt;
+  if (result.events.some((e) => e.type === 'auction_started')) room.auctionSince = room.state.seq;
   pruneSeats(room);
   reconcileTimer(room, { force: forceTimer });
   broadcast(room, result.events);
@@ -578,6 +581,21 @@ function handleHello(ws, msg) {
   sendState(room, ws);
 }
 
+// Bids race each other: every bid or pass moves state.seq, so an exact-seq check would turn most
+// simultaneous bids into STALE_STATE. For these two, any seq from the running auction is current
+// enough: the engine re-checks the amount against the high bid, and a repeated bid or pass can't
+// apply twice (ALREADY_HIGH_BIDDER, BID_TOO_LOW, ALREADY_PASSED). A seq from before the auction
+// started is still stale, so a late bid can never land in a later auction.
+const AUCTION_ACTIONS = new Set(['BID', 'PASS_AUCTION']);
+
+/** Is `seq` (the state.seq the client acted on; optional) too old for this action? */
+function isStale(room, type, seq) {
+  const { state, auctionSince } = room;
+  if (typeof seq !== 'number' || seq === state.seq) return false;
+  const fromThisAuction = Boolean(state.auction) && auctionSince !== null && seq >= auctionSince && seq < state.seq;
+  return !(AUCTION_ACTIONS.has(type) && fromThisAuction);
+}
+
 function sendEngineError(ws, room, error) {
   if (error.code === 'INTERNAL') logError(`engine error in ${room.id}: ${error.message}`);
   sendError(ws, error.code ?? 'ERROR', error.message ?? 'Action failed');
@@ -611,7 +629,7 @@ function handleAction(ws, msg) {
   }
   if (action.type === 'TIMEOUT') return sendError(ws, 'FORBIDDEN', 'TIMEOUT is a server-only action');
   // Optional seq = the state.seq the client acted on: a duplicate or late action is refused, not applied twice.
-  if (typeof msg.seq === 'number' && msg.seq !== room.state.seq) {
+  if (isStale(room, action.type, msg.seq)) {
     return sendError(ws, 'STALE_STATE', 'The game moved on — try again');
   }
 

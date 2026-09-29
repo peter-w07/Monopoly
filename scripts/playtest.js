@@ -17,6 +17,8 @@
 //   --verbose            log bot errors and socket problems as they happen
 //
 // Exit code: 0 if the game ended (game over or turn cap) and no bot received an error message, else 1.
+// (An action that lost a race to another player's move, e.g. a bid that was outbid in the meantime,
+// is counted under "races", not as an error.)
 
 import { pathToFileURL } from 'node:url';
 import { TOKENS, netWorth } from '../engine/index.js';
@@ -103,6 +105,8 @@ export async function playtest({
       timeouts: eventCounts.timeout ?? 0,
       events: eventCounts,
       errors: players.flatMap((b) => b.errors.map((e) => ({ bot: b.name, ...e }))),
+      races: players.reduce((n, b) => n + b.races.length, 0), // lost to another player's move; not errors
+      raceCodes: tally(players.flatMap((b) => b.races.map((e) => `${e.code} (${e.action})`))),
       reconnects: players.reduce((n, b) => n + Math.max(0, b.connects - 1), 0),
       problems,
     };
@@ -157,6 +161,13 @@ function leaderOf(state) {
 
 const nameOf = (state, id) => state?.players.find((p) => p.id === id)?.name ?? null;
 
+/** ['a', 'b', 'a'] → { a: 2, b: 1 } */
+function tally(list) {
+  const counts = {};
+  for (const item of list) counts[item] = (counts[item] ?? 0) + 1;
+  return counts;
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 
@@ -206,7 +217,11 @@ function printSummary(s) {
     const status = p.bankrupt ? 'bankrupt' : `${money(p.cash)} cash, net worth ${money(p.netWorth)}, ${p.properties} properties`;
     console.log(`  ${p.name.padEnd(6)} ${p.piece.padEnd(11)} ${status}`);
   }
-  console.log(`Turn timeouts: ${s.timeouts}   Reconnects: ${s.reconnects}`);
+  const n = (type) => s.events[type] ?? 0;
+  console.log(`Auctions: ${n('auction_started')} (${n('auction_won')} sold)   ` +
+    `Trades: ${n('trade_proposed')} proposed, ${n('trade_accepted')} accepted`);
+  const raced = Object.entries(s.raceCodes).map(([what, count]) => `${count}× ${what}`).join(', ');
+  console.log(`Turn timeouts: ${s.timeouts}   Reconnects: ${s.reconnects}   Lost races: ${s.races}${raced ? ` (${raced})` : ''}`);
   console.log(`Error messages received by bots: ${s.errors.length}`);
   for (const e of s.errors) console.log(`  ${e.bot}: ${e.code} ${e.message} (action ${e.action}, phase ${e.phase}, seq ${e.seq})`);
   for (const p of s.problems) console.log(`Problem: ${p}`);

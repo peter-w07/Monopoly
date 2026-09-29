@@ -141,12 +141,13 @@ describe('failed actions leave the state untouched', () => {
     assert.deepEqual(failed.events, []);
   });
 
-  test('stub actions are NOT_IMPLEMENTED once the game is active', () => {
-    const s = newGame();
-    for (const type of ['START_AUCTION', 'BID', 'PROPOSE_TRADE', 'ACCEPT_TRADE', 'REJECT_TRADE']) {
-      reject(s, { type, playerId: 'p1' }, 'NOT_IMPLEMENTED');
+  test('auction and trade actions need an active game (details: auction.test.js, trade.test.js)', () => {
+    for (const type of ['START_AUCTION', 'PASS_AUCTION', 'ACCEPT_TRADE', 'REJECT_TRADE']) {
       reject(lobby({ players: 2 }), { type, playerId: 'p1' }, 'GAME_NOT_ACTIVE');
     }
+    reject(lobby({ players: 2 }), { type: 'BID', playerId: 'p1', amount: 10 }, 'GAME_NOT_ACTIVE');
+    const offer = { toPlayerId: 'p2', give: { cash: 10 }, get: {} };
+    reject(lobby({ players: 2 }), { type: 'PROPOSE_TRADE', playerId: 'p1', ...offer }, 'GAME_NOT_ACTIVE');
   });
 });
 
@@ -169,7 +170,7 @@ describe('successful actions', () => {
   });
 
   test('seq increments by exactly 1 per successful action and not on failures', () => {
-    let s = lobby({ players: 0 });
+    let s = lobby({ players: 0, settings: { auctionOnDecline: false } });
     assert.equal(s.seq, 0);
     s = act(s, { type: 'JOIN', playerId: 'p1', name: 'A', token: 'car' }).state;
     assert.equal(s.seq, 1);

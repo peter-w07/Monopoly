@@ -14,6 +14,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import { createGame, applyAction } from '../engine/index.js';
+import { withDice } from './helpers.js';
 
 const SERVER = fileURLToPath(new URL('../server/index.js', import.meta.url));
 const children = new Set();
@@ -440,6 +441,143 @@ describe('server: action seq', () => {
     assert.deepEqual(seqs.filter((s) => s > seq), [seq + 1], 'state.seq advanced exactly once');
     alice.close();
     bob.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('server: auctions and trades over WebSocket', () => {
+  const GAME = 'g_auct23';
+  const ANN = { playerId: 'p_aaaaaaaa', token: 'a'.repeat(32) };
+  const BEN = { playerId: 'p_bbbbbbbb', token: 'b'.repeat(32) };
+  let dataDir;
+  let server;
+
+  // A saved game where Ann (to move) has just rolled 1+2 onto Baltic Avenue (3, $60): buy or decline.
+  before(async () => {
+    dataDir = makeTempDir();
+    let state = createGame({ id: GAME, seed: 7, settings: {} });
+    state = applyAction(state, { type: 'JOIN', playerId: ANN.playerId, name: 'Ann', token: 'car' }).state;
+    state = applyAction(state, { type: 'JOIN', playerId: BEN.playerId, name: 'Ben', token: 'dog' }).state;
+    state = applyAction(state, { type: 'START_GAME', playerId: ANN.playerId }).state;
+    state = applyAction(withDice(state, 1, 2), { type: 'ROLL', playerId: ANN.playerId }).state;
+    assert.equal(state.turn.phase, 'buying_or_auction');
+    state.createdAt = state.updatedAt = Date.now();
+    fs.mkdirSync(path.join(dataDir, 'games'), { recursive: true });
+    const secrets = { [ANN.playerId]: ANN.token, [BEN.playerId]: BEN.token };
+    fs.writeFileSync(path.join(dataDir, 'games', `${GAME}.json`), JSON.stringify({ version: 1, state, secrets }));
+    server = await startServer(dataDir);
+  });
+
+  after(async () => {
+    await killAll();
+    await removeTempDir(dataDir);
+  });
+
+  /** The next state frame at `seq` (skipping connection frames and older states). */
+  const stateAt = (client, seq, label) => client.take((m) => m.t === 'state' && m.state.seq === seq, label);
+  const cashOf = (msg, id) => msg.state.players.find((p) => p.id === id).cash;
+  const ownerOf = (msg, index) => msg.state.tiles.find((t) => t.index === index).ownerId;
+  const types = (msg) => msg.events.map((e) => e.type);
+  const clock = (msg) => msg.state.turn.deadlineAt - msg.now;
+
+  test('two sockets bid in an auction; then a trade is proposed and accepted off-turn', async () => {
+    const ann = await connect(server, { gameId: GAME, ...ANN });
+    await ann.welcome();
+    const ben = await connect(server, { gameId: GAME, ...BEN });
+    await ben.welcome();
+    const bothIn = (m) => m.t === 'state' && m.state.players.every((p) => p.connected);
+    let a = await ann.take(bothIn, 'both connected (Ann)');
+    await ben.take(bothIn, 'both connected (Ben)');
+    const seq0 = a.state.seq;
+    assert.ok(a.legal.actions.includes('DECLINE') && a.legal.actions.includes('START_AUCTION'));
+
+    // Ann declines: the auction opens for both, each with their own legal (BID range, PASS_AUCTION).
+    ann.send({ t: 'action', seq: seq0, action: { type: 'DECLINE' } });
+    const s1 = seq0 + 1;
+    a = await stateAt(ann, s1, 'auction start (Ann)');
+    let b = await stateAt(ben, s1, 'auction start (Ben)');
+    assert.deepEqual(types(b), ['declined', 'auction_started']);
+    assert.equal(b.state.turn.phase, 'auction');
+    assert.deepEqual(b.state.auction.participants, [ANN.playerId, BEN.playerId]);
+    for (const msg of [a, b]) {
+      assert.ok(msg.legal.actions.includes('BID') && msg.legal.actions.includes('PASS_AUCTION'));
+      assert.equal(msg.legal.auction.minBid, 1);
+    }
+    assert.equal(b.legal.auction.maxBid, cashOf(b, BEN.playerId));
+    assert.ok(clock(b) > 9_000 && clock(b) <= 10_000, `10 s auction clock, got ${clock(b)} ms`);
+
+    // Both bid on the state they saw (seq s1). Ann's arrives first; Ben's is then judged by the engine,
+    // not refused as stale: a tie is too low, a higher bid takes the lead and restarts the clock.
+    ann.send({ t: 'action', seq: s1, action: { type: 'BID', amount: 10 } });
+    await stateAt(ann, s1 + 1, 'bid from Ann (Ann)');
+    b = await stateAt(ben, s1 + 1, 'bid from Ann (Ben)');
+    assert.deepEqual(b.events, [{ type: 'auction_bid', playerId: ANN.playerId, amount: 10 }]);
+    assert.deepEqual(b.legal.auction, { minBid: 11, maxBid: cashOf(b, BEN.playerId) });
+    const deadlineAfterAnn = b.state.turn.deadlineAt;
+
+    ben.send({ t: 'action', seq: s1, action: { type: 'BID', amount: 10 } });
+    assert.equal((await ben.error('tied bid')).code, 'BID_TOO_LOW');
+    await sleep(20); // so the restarted deadline is measurably later
+    ben.send({ t: 'action', seq: s1, action: { type: 'BID', amount: 20 } });
+    a = await stateAt(ann, s1 + 2, 'bid from Ben (Ann)');
+    b = await stateAt(ben, s1 + 2, 'bid from Ben (Ben)');
+    assert.deepEqual(a.events, [{ type: 'auction_bid', playerId: BEN.playerId, amount: 20 }]);
+    assert.equal(a.state.auction.highBidderId, BEN.playerId);
+    assert.ok(a.state.turn.deadlineAt > deadlineAfterAnn, 'the bid restarted the auction clock');
+    assert.equal(b.legal.auction, null, 'the high bidder cannot bid again');
+    assert.ok(!b.legal.actions.includes('PASS_AUCTION'), 'or pass');
+
+    // A seq from before the auction started is still stale; the high bidder can't pass.
+    ann.send({ t: 'action', seq: seq0, action: { type: 'BID', amount: 30 } });
+    assert.equal((await ann.error('bid with a pre-auction seq')).code, 'STALE_STATE');
+    ben.send({ t: 'action', seq: s1 + 2, action: { type: 'PASS_AUCTION' } });
+    assert.equal((await ben.error('high bidder passing')).code, 'ALREADY_HIGH_BIDDER');
+
+    // Ann drops out (from a state one bid old): Ben wins the tile for $20, paid to the bank.
+    ann.send({ t: 'action', seq: s1 + 1, action: { type: 'PASS_AUCTION' } });
+    a = await stateAt(ann, s1 + 3, 'auction over (Ann)');
+    b = await stateAt(ben, s1 + 3, 'auction over (Ben)');
+    assert.deepEqual(types(b), ['auction_passed', 'auction_won']);
+    assert.deepEqual(b.events[1], { type: 'auction_won', playerId: BEN.playerId, tileIndex: 3, amount: 20 });
+    assert.equal(b.state.auction, null);
+    assert.equal(b.state.turn.phase, 'end_turn');
+    assert.equal(ownerOf(b, 3), BEN.playerId);
+    assert.equal(cashOf(b, BEN.playerId), 1480);
+    assert.ok(clock(a) > 80_000, `back on the 90 s turn clock, got ${clock(a)} ms`);
+    const turnDeadline = a.state.turn.deadlineAt;
+
+    // Ann offers $100 for Baltic Avenue; only Ben may accept.
+    assert.deepEqual(a.legal.tradeTargets, [BEN.playerId]);
+    assert.ok(a.legal.actions.includes('PROPOSE_TRADE'));
+    const offer = { type: 'PROPOSE_TRADE', toPlayerId: BEN.playerId, give: { cash: 100 }, get: { tiles: [3] } };
+    ann.send({ t: 'action', seq: s1 + 3, action: offer });
+    a = await stateAt(ann, s1 + 4, 'trade proposed (Ann)');
+    b = await stateAt(ben, s1 + 4, 'trade proposed (Ben)');
+    assert.deepEqual(types(b), ['trade_proposed']);
+    assert.equal(b.state.turn.phase, 'trading');
+    assert.equal(b.state.trade.id, `t_${s1 + 3}`);
+    assert.ok(b.legal.actions.includes('ACCEPT_TRADE') && b.legal.actions.includes('REJECT_TRADE'));
+    assert.ok(!a.legal.actions.includes('ACCEPT_TRADE') && a.legal.actions.includes('REJECT_TRADE'));
+    assert.equal(b.state.turn.deadlineAt, turnDeadline, 'proposing does not restart the turn clock');
+
+    // Ben answers the offer he read, by id (a replaced offer would be NO_TRADE).
+    ben.send({ t: 'action', seq: s1 + 4, action: { type: 'ACCEPT_TRADE', tradeId: 't_0' } });
+    assert.equal((await ben.error('accepting an offer that is not the pending one')).code, 'NO_TRADE');
+    ben.send({ t: 'action', seq: s1 + 4, action: { type: 'ACCEPT_TRADE', tradeId: b.state.trade.id } });
+    a = await stateAt(ann, s1 + 5, 'trade accepted (Ann)');
+    await stateAt(ben, s1 + 5, 'trade accepted (Ben)');
+    assert.deepEqual(types(a), ['trade_accepted']);
+    assert.deepEqual(a.events[0].fees, { [ANN.playerId]: 0, [BEN.playerId]: 0 });
+    assert.equal(ownerOf(a, 3), ANN.playerId);
+    assert.equal(cashOf(a, ANN.playerId), 1400);
+    assert.equal(cashOf(a, BEN.playerId), 1580);
+    assert.equal(a.state.turn.phase, 'end_turn');
+    assert.equal(a.state.turn.deadlineAt, turnDeadline, 'nor does answering');
+    assert.ok(a.legal.actions.includes('END_TURN'));
+
+    ann.close();
+    ben.close();
   });
 });
 

@@ -75,6 +75,7 @@ export function createGame({ id = null, seed = 0, settings } = {}) {
       lastRoll: null,
       pendingPurchase: null,
       pendingDebt: null,
+      tradesProposed: 0,
       deadlineAt: null,
     },
     tiles: OWNABLE_INDICES.map((index) => ({ index, ownerId: null, houses: 0, mortgaged: false })),

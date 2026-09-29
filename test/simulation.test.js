@@ -4,28 +4,37 @@ import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   BOARD, applyAction, createGame, currentPlayerId, getTile, groupIndices, legalActions,
-  makeRng, nextFloat, nextInt,
+  makeRng, nextFloat, nextInt, tradeFees, tradeableTiles, validateAction,
 } from '../engine/index.js';
 import { chooseAction } from './bot.js';
 
 const GAMES = 150;
 const MAX_ACTIONS = 1500;
-// Share of games that must reach game_over within MAX_ACTIONS. Without trading or auctions (both
-// stubs) colour groups rarely complete in 4–6 player games, so many of those stall; about half of
-// all games and nearly every 2-player game finish today.
-const MIN_FINISHED_SHARE = 0.4;
-const MIN_FINISHED_SHARE_2P = 0.8;
+// Share of games that must reach game_over within MAX_ACTIONS. Before auctions and trading, colour
+// groups rarely completed in 4–6 player games and about half of all games stalled (79/150; 4–6
+// players 31/92). With bots that bid and trade for the missing tile of a group, all 150 finish.
+const MIN_FINISHED_SHARE = 0.85;
+const MIN_FINISHED_SHARE_2P = 0.9;
+const MIN_FINISHED_SHARE_4_6P = 0.8;
 const REPLAY_GAMES = 5;           // games whose recorded actions are replayed to check determinism
 const TIMEOUT_RATE = 0.03;        // share of steps where the server's TIMEOUT acts instead of the bot
 const EXPLORE_RATE = 0.05;        // share of steps where a random listed action replaces the bot's choice
 const RESIGN_RATE = 1 / 3000;     // chance per step that an off-turn player resigns (LEAVE)
 const PAYING_RESIGN_RATE = 0.02;  // the same while a debt is pending (the debtor may resign too), to exercise
                                   // debts owed to or by a player who resigns
-const LEGAL_CHECK_EVERY = 50;     // every n-th step, cross-check the whole legalActions list
+const DEAL_RESIGN_RATE = 0.01;    // the same during an auction or a pending trade (anyone may resign)
+const LEGAL_CHECK_EVERY = 50;     // every n-th step, cross-check the whole legalActions list of every player
+const DEAL_CHECK_EVERY = 2;       // the same during auctions and trades, where every player may act
 
-const PLAY_PHASES = ['rolling', 'jail_decision', 'buying_or_auction', 'paying', 'end_turn'];
-const ROLL_AGAIN_PHASES = ['end_turn', 'buying_or_auction', 'paying'];
-const TURN_ACTIONS = ['ROLL', 'BUY', 'DECLINE', 'END_TURN', 'PAY_JAIL_FINE', 'USE_JAIL_CARD', 'PAY_DEBT', 'DECLARE_BANKRUPTCY'];
+const PLAY_PHASES = ['rolling', 'jail_decision', 'buying_or_auction', 'paying', 'end_turn', 'auction', 'trading'];
+const ROLL_AGAIN_PHASES = ['end_turn', 'buying_or_auction', 'paying', 'auction', 'trading'];
+const TRADE_PHASES = ['rolling', 'jail_decision', 'end_turn', 'paying']; // a trade's returnPhase
+const DEAL_PHASES = ['auction', 'trading'];
+// Listed-or-fails actions that need no payload (BID and PROPOSE_TRADE are checked with payloads).
+const TURN_ACTIONS = [
+  'ROLL', 'BUY', 'DECLINE', 'START_AUCTION', 'END_TURN', 'PAY_JAIL_FINE', 'USE_JAIL_CARD', 'PAY_DEBT',
+  'DECLARE_BANKRUPTCY', 'PASS_AUCTION', 'ACCEPT_TRADE', 'REJECT_TRADE',
+];
 const MANAGEMENT = { build: 'BUILD', sellHouse: 'SELL_HOUSE', mortgage: 'MORTGAGE', unmortgage: 'UNMORTGAGE' };
 const OWNABLE = BOARD.tiles.filter((t) => ['property', 'railroad', 'utility'].includes(t.type)).map((t) => t.index);
 const GROUPS = Object.keys(BOARD.groups).map((g) => groupIndices(g)).filter((g) => g.length > 0);
@@ -48,6 +57,7 @@ function startGame(seed, rng) {
     startingCash: [1500, 1500, 1000, 600][nextInt(rng, 0, 3)],
     freeParkingPot: nextFloat(rng) < 0.3,
     evenBuild: nextFloat(rng) < 0.8,
+    auctionOnDecline: nextFloat(rng) < 0.85,
   };
   let state = createGame({ id: `g_sim${seed}`, seed, settings });
   for (let i = 0; i < players; i++) {
@@ -58,38 +68,93 @@ function startGame(seed, rng) {
 }
 
 /**
- * The next action: usually the current player's bot; sometimes a TIMEOUT, a random listed action
- * (reaching moves a sensible bot never makes, e.g. building while poor) or a resignation (by an
- * off-turn player, or while a debt is pending also by the debtor).
+ * The next action: usually a bot's — the current player's, or during an auction or a trade any
+ * player with something to do; sometimes a TIMEOUT, a random listed action (reaching moves a
+ * sensible bot never makes, e.g. building while poor, withdrawing a trade) or a resignation (by an
+ * off-turn player; while a debt is pending also by the debtor, during an auction or trade by anyone).
  */
 function nextAction(state, rng, step, where) {
   const pid = currentPlayerId(state);
-  const paying = state.turn.phase === 'paying';
-  if (nextFloat(rng) < (paying ? PAYING_RESIGN_RATE : RESIGN_RATE)) {
-    const others = state.players.filter((p) => !p.bankrupt && (paying || p.id !== pid));
+  const { phase } = state.turn;
+  const dealing = DEAL_PHASES.includes(phase);
+  const paying = phase === 'paying';
+  if (nextFloat(rng) < (paying ? PAYING_RESIGN_RATE : dealing ? DEAL_RESIGN_RATE : RESIGN_RATE)) {
+    const others = state.players.filter((p) => !p.bankrupt && (paying || dealing || p.id !== pid));
     const quitter = others[nextInt(rng, 0, others.length - 1)];
     assert.ok(legalActions(state, quitter.id).actions.includes('LEAVE'), `${where}: LEAVE not listed for ${quitter.id}`);
     return { type: 'LEAVE', playerId: quitter.id };
   }
   if (nextFloat(rng) < TIMEOUT_RATE) return { type: 'TIMEOUT', playerId: pid };
 
-  const legal = legalActions(state, pid);
-  if (step % LEGAL_CHECK_EVERY === 0) checkLegalList(state, pid, legal, where);
-  const action = nextFloat(rng) < EXPLORE_RATE ? randomListed(legal, pid, rng) : chooseAction(state, legal, pid, rng);
-  if (!action) assert.fail(`${where}: nothing to do for ${pid} in ${state.turn.phase}`);
-  const key = Object.keys(MANAGEMENT).find((k) => MANAGEMENT[k] === action.type);
-  const listed = key ? legal[key].includes(action.tileIndex) : legal.actions.includes(action.type);
-  if (!listed) assert.fail(`${where}: the bot chose an unlisted action ${JSON.stringify(action)}`);
-  return action;
+  // Everyone who can do more than resign: normally just the current player; in an auction every
+  // bidder, in a trade both parties.
+  const candidates = [];
+  for (const p of state.players) {
+    if (p.bankrupt) continue;
+    const legal = legalActions(state, p.id);
+    if (step % (dealing ? DEAL_CHECK_EVERY : LEGAL_CHECK_EVERY) === 0) checkLegalList(state, p.id, legal, where);
+    const moves = legal.actions.some((type) => type !== 'LEAVE') || Object.keys(MANAGEMENT).some((key) => legal[key].length > 0);
+    if (moves) candidates.push({ playerId: p.id, legal });
+  }
+  if (candidates.length === 0) assert.fail(`${where}: nobody can act in ${phase}`);
+  if (!dealing) assert.deepEqual(candidates.map((c) => c.playerId), [pid], `${where}: only the current player acts in ${phase}`);
+
+  // Starting from a random candidate, the first whose bot wants to act does (a trade's proposer waits).
+  const first = nextInt(rng, 0, candidates.length - 1);
+  for (let k = 0; k < candidates.length; k++) {
+    const { playerId, legal } = candidates[(first + k) % candidates.length];
+    const explore = nextFloat(rng) < EXPLORE_RATE;
+    const action = explore ? randomListed(state, legal, playerId, rng) : chooseAction(state, legal, playerId, rng);
+    if (!action) continue;
+    if (!isListed(action, legal)) assert.fail(`${where}: the bot chose an unlisted action ${JSON.stringify(action)}`);
+    return action;
+  }
+  return assert.fail(`${where}: no bot wants to act in ${phase}`);
 }
 
-/** Any listed action except LEAVE, uniformly at random. */
-function randomListed(legal, playerId, rng) {
-  const options = legal.actions.filter((type) => type !== 'LEAVE').map((type) => ({ type, playerId }));
+/** Is the action one that `legal` lists (with a BID amount in range, a PROPOSE_TRADE to a listed target)? */
+function isListed(action, legal) {
+  const key = Object.keys(MANAGEMENT).find((k) => MANAGEMENT[k] === action.type);
+  if (key) return legal[key].includes(action.tileIndex);
+  if (!legal.actions.includes(action.type)) return false;
+  if (action.type === 'BID') return action.amount >= legal.auction.minBid && action.amount <= legal.auction.maxBid;
+  if (action.type === 'PROPOSE_TRADE') return legal.tradeTargets.includes(action.toPlayerId);
+  return true;
+}
+
+/** Any listed action except LEAVE, uniformly at random (a random bid; a random valid offer, if one turns up). */
+function randomListed(state, legal, playerId, rng) {
+  const options = [];
+  for (const type of legal.actions) {
+    if (type === 'LEAVE') continue;
+    if (type === 'BID') {
+      const { minBid, maxBid } = legal.auction;
+      options.push({ type, playerId, amount: nextInt(rng, minBid, Math.min(maxBid, minBid + 200)) });
+    } else if (type === 'PROPOSE_TRADE') {
+      const offer = randomOffer(state, legal, playerId, rng);
+      if (offer) options.push({ type, playerId, ...offer });
+    } else {
+      options.push({ type, playerId });
+    }
+  }
   for (const [key, type] of Object.entries(MANAGEMENT)) {
     for (const tileIndex of legal[key]) options.push({ type, playerId, tileIndex });
   }
   return options.length > 0 ? options[nextInt(rng, 0, options.length - 1)] : null;
+}
+
+/** A random offer to a random listed target (tiles, cash and jail cards on either side), or null if invalid. */
+function randomOffer(state, legal, playerId, rng) {
+  const toPlayerId = legal.tradeTargets[nextInt(rng, 0, legal.tradeTargets.length - 1)];
+  const side = (owner) => {
+    const p = state.players.find((x) => x.id === owner);
+    const tiles = tradeableTiles(state, owner).filter(() => nextFloat(rng) < 0.25);
+    const cash = nextFloat(rng) < 0.5 ? nextInt(rng, 0, Math.min(p.cash, 300)) : 0;
+    const jailCards = nextFloat(rng) < 0.5 ? p.getOutOfJailCards : 0;
+    return { cash, tiles, jailCards };
+  };
+  const offer = { toPlayerId, give: side(playerId), get: side(toPlayerId) };
+  return validateAction(state, { type: 'PROPOSE_TRADE', playerId, ...offer }) ? null : offer;
 }
 
 /**
@@ -103,7 +168,8 @@ function playGame(seed, { record = false } = {}) {
   let snapshot = jsonSnapshot(state, `seed ${seed} start`);
   const actions = [];
   const events = [];
-  const turn = { open: true }; // START_GAME opened the first turn
+  const turn = { open: true, auction: false }; // START_GAME opened the first turn
+  const stats = { auctions: 0, auctionsWon: 0, trades: 0, tradesAccepted: 0 };
   let steps = 0;
   for (; steps < MAX_ACTIONS && state.status === 'active'; steps++) {
     const where = `seed ${seed} step ${steps}`;
@@ -114,16 +180,26 @@ function playGame(seed, { record = false } = {}) {
     snapshot = jsonSnapshot(res.state, where);
     checkInvariants(res.state, where, action, state, res.events);
     checkEvents(state, res.state, res.events, turn, where, action);
+    checkDeals(state, res.state, res.events, where, action);
+    for (const e of res.events) {
+      if (e.type === 'auction_started') stats.auctions += 1;
+      if (e.type === 'auction_won') stats.auctionsWon += 1;
+      if (e.type === 'trade_proposed') stats.trades += 1;
+      if (e.type === 'trade_accepted') stats.tradesAccepted += 1;
+    }
     if (record) {
       actions.push(action);
       events.push(res.events);
     }
     state = res.state;
   }
-  if (state.status === 'finished') assert.ok(!turn.open, `seed ${seed}: the last turn never got a turn_ended`);
+  if (state.status === 'finished') {
+    assert.ok(!turn.open, `seed ${seed}: the last turn never got a turn_ended`);
+    assert.ok(!turn.auction, `seed ${seed}: an auction never got auction_won / auction_unsold`);
+  }
   // jsonSnapshot checks JSON-safety at every step; do one real round trip per game as well.
   assert.deepStrictEqual(JSON.parse(JSON.stringify(state)), state, `seed ${seed}: JSON round trip lost data`);
-  return { start, state, steps, actions, events };
+  return { start, state, steps, actions, events, stats };
 }
 
 // ---------------------------------------------------------------------------
@@ -226,11 +302,17 @@ function checkInvariants(s, where, action, prev, events) {
     expect(alive.length >= 2, 'an active game needs two players');
     const current = s.players.find((p) => p.id === currentPlayerId(s));
     expect(current && !current.bankrupt, 'the current player must be active');
-    expect(t.phase !== 'jail_decision' || current.inJail, 'jail_decision for a player who is not in jail');
+    const underlying = s.trade ? s.trade.returnPhase : t.phase; // the phase a pending trade interrupted
+    expect(underlying !== 'jail_decision' || current.inJail, 'jail_decision for a player who is not in jail');
   }
   expect((t.pendingPurchase !== null) === (t.phase === 'buying_or_auction'), 'pendingPurchase ⇔ buying_or_auction');
-  expect((t.pendingDebt !== null) === (t.phase === 'paying'), 'pendingDebt ⇔ paying');
+  const debtPhase = t.phase === 'paying' || (t.phase === 'trading' && s.trade?.returnPhase === 'paying');
+  expect((t.pendingDebt !== null) === debtPhase, 'pendingDebt ⇔ paying (or trading from paying)');
   expect(!t.rollAgain || ROLL_AGAIN_PHASES.includes(t.phase), () => `rollAgain in ${t.phase}`);
+  expect((s.auction !== null) === (t.phase === 'auction'), () => `auction ${JSON.stringify(s.auction)} in phase ${t.phase}`);
+  expect((s.trade !== null) === (t.phase === 'trading'), () => `trade ${JSON.stringify(s.trade)} in phase ${t.phase}`);
+  if (s.auction) checkAuction(s, expect);
+  if (s.trade) checkTrade(s, expect);
 
   // Players
   const held = { chance: 0, community: 0 };
@@ -303,6 +385,106 @@ function checkInvariants(s, where, action, prev, events) {
   expect(s.log.length <= 100, () => `log has ${s.log.length} lines`);
 }
 
+/** A running auction: sane bookkeeping, an affordable high bid, and someone besides the high bidder still in. */
+function checkAuction(s, expect) {
+  const a = s.auction;
+  const byId = (id) => s.players.find((p) => p.id === id);
+  const tile = s.tiles.find((x) => x.index === a.tileIndex);
+  expect(s.settings.auctionOnDecline, 'an auction although auctionOnDecline is off');
+  expect(tile && tile.ownerId === null, () => `auctioning tile ${a.tileIndex}, which is not an unowned ownable tile`);
+  expect(a.participants.every((id) => byId(id)) && new Set(a.participants).size === a.participants.length,
+    () => `participants ${a.participants}`);
+  expect(a.participants.includes(currentPlayerId(s)), 'the current player takes part in their auction');
+  expect(a.passed.every((id) => a.participants.includes(id)) && new Set(a.passed).size === a.passed.length,
+    () => `passed ${a.passed} vs participants ${a.participants}`);
+  expect(a.participants.every((id) => !byId(id).bankrupt || a.passed.includes(id)), 'a bankrupt participant has not passed');
+  expect(Number.isInteger(a.highBid) && a.highBid >= 0 && (a.highBid === 0) === (a.highBidderId === null),
+    () => `highBid ${a.highBid} / highBidderId ${a.highBidderId}`);
+  for (const bid of a.bids) {
+    expect(a.participants.includes(bid.playerId) && Number.isInteger(bid.amount) && bid.amount >= 1, () => `bid ${JSON.stringify(bid)}`);
+  }
+  // Bids by players still in the auction only ever rise (a resigned high bidder's bid drops out, and
+  // so do the bids of players who passed, so a later bid may repeat or undercut their amounts).
+  const standing = a.bids.filter((b) => !byId(b.playerId).bankrupt && !a.passed.includes(b.playerId));
+  expect(standing.every((b, i) => i === 0 || b.amount > standing[i - 1].amount), () => `bids do not rise: ${JSON.stringify(a.bids)}`);
+  if (a.highBidderId !== null) {
+    const bidder = byId(a.highBidderId);
+    expect(!bidder.bankrupt, 'the high bidder is bankrupt');
+    expect(a.highBid <= bidder.cash, () => `high bid ${a.highBid} > ${bidder.id}'s cash ${bidder.cash}`);
+    expect(a.bids.some((b) => b.playerId === a.highBidderId && b.amount === a.highBid), 'the high bid is not in the bid history');
+  }
+  const best = standing.at(-1);
+  expect(a.highBid === (best?.amount ?? 0), () => `high bid ${a.highBid}, best standing bid ${best?.amount}`);
+  const stillIn = a.participants.filter((id) => id !== a.highBidderId && !a.passed.includes(id));
+  expect(stillIn.length > 0, 'the auction should have closed: nobody but the high bidder is still in');
+}
+
+/** A pending trade: proposed by the current player to another active player, from a proposing phase, well-formed. */
+function checkTrade(s, expect) {
+  const t = s.trade;
+  const byId = (id) => s.players.find((p) => p.id === id);
+  expect(t.fromPlayerId === currentPlayerId(s), 'the pending trade was not proposed by the current player');
+  expect(t.toPlayerId !== t.fromPlayerId && byId(t.toPlayerId) && !byId(t.toPlayerId).bankrupt, () => `bad trade target ${t.toPlayerId}`);
+  expect(TRADE_PHASES.includes(t.returnPhase), () => `returnPhase ${t.returnPhase}`);
+  expect(/^t_\d+$/.test(t.id), () => `trade id ${t.id}`);
+  for (const side of [t.give, t.get]) {
+    expect(Object.keys(side).sort().join() === 'cash,jailCards,tiles', () => `trade side ${JSON.stringify(side)}`);
+    expect(Number.isInteger(side.cash) && side.cash >= 0 && Number.isInteger(side.jailCards) && side.jailCards >= 0,
+      () => `trade side ${JSON.stringify(side)}`);
+  }
+}
+
+/**
+ * Auction and trade actions: no bids by bankrupt or passed players; an accepted trade moves exactly
+ * the offered tiles, cash and jail cards between the two parties and only its fees leave the game;
+ * proposing, rejecting and cancelling move nothing at all.
+ */
+function checkDeals(prev, s, events, where, action) {
+  const expect = failer(where, action);
+  for (const e of events) {
+    if (e.type !== 'auction_bid') continue;
+    const bidder = prev.players.find((p) => p.id === e.playerId);
+    expect(prev.auction && !bidder.bankrupt && !prev.auction.passed.includes(bidder.id), () => `bid by ${e.playerId}, who is out`);
+  }
+  const accepted = events.find((e) => e.type === 'trade_accepted');
+  const dealOnly = events.every((e) => ['trade_proposed', 'trade_rejected', 'trade_cancelled', 'timeout'].includes(e.type));
+  if (!accepted && !(dealOnly && events.some((e) => e.type.startsWith('trade_')))) return;
+
+  const cashOf = (state, id) => state.players.find((p) => p.id === id).cash;
+  const cardsOf = (state, id) => state.players.find((p) => p.id === id).jailCards.join();
+  const moved = new Map(); // tile index → new owner
+  let fees = 0;
+  if (accepted) {
+    const trade = prev.trade;
+    expect(trade && accepted.tradeId === trade.id, 'trade_accepted for a trade that was not pending');
+    const expected = tradeFees(prev, trade.fromPlayerId, trade);
+    expect(sameJson(accepted.fees, expected), () => `fees ${JSON.stringify(accepted.fees)}, expected ${JSON.stringify(expected)}`);
+    fees = Object.values(expected).reduce((sum, n) => sum + n, 0);
+    for (const i of trade.give.tiles) moved.set(i, trade.toPlayerId);
+    for (const i of trade.get.tiles) moved.set(i, trade.fromPlayerId);
+    const net = trade.give.cash - trade.get.cash;
+    expect(cashOf(s, trade.fromPlayerId) === cashOf(prev, trade.fromPlayerId) - net - expected[trade.fromPlayerId], 'proposer cash');
+    expect(cashOf(s, trade.toPlayerId) === cashOf(prev, trade.toPlayerId) + net - expected[trade.toPlayerId], 'target cash');
+    const cards = (state) => state.players.reduce((sum, p) => sum + p.jailCards.length, 0);
+    expect(cards(s) === cards(prev), 'jail cards were created or lost');
+    const from = s.players.find((p) => p.id === trade.fromPlayerId);
+    const to = s.players.find((p) => p.id === trade.toPlayerId);
+    const before = (id) => prev.players.find((p) => p.id === id).jailCards.length;
+    expect(from.jailCards.length === before(from.id) - trade.give.jailCards + trade.get.jailCards, 'proposer jail cards');
+    expect(to.jailCards.length === before(to.id) - trade.get.jailCards + trade.give.jailCards, 'target jail cards');
+  } else {
+    for (const p of s.players) expect(cardsOf(s, p.id) === cardsOf(prev, p.id), () => `${p.id}'s jail cards changed`);
+  }
+  const total = (state) => state.players.reduce((sum, p) => sum + p.cash, 0);
+  expect(total(prev) - total(s) === fees, () => `cash total changed by ${total(prev) - total(s)}, fees ${fees}`);
+  for (const tile of s.tiles) {
+    const old = prev.tiles.find((x) => x.index === tile.index);
+    const owner = moved.has(tile.index) ? moved.get(tile.index) : old.ownerId;
+    expect(tile.ownerId === owner && tile.houses === old.houses && tile.mortgaged === old.mortgaged,
+      () => `tile ${tile.index}: ${JSON.stringify(old)} → ${JSON.stringify(tile)}`);
+  }
+}
+
 /**
  * Events are enough for an event-driven renderer: replaying one action's money events on the old
  * cash and pot gives exactly the new cash and pot, and turn_started / turn_ended alternate
@@ -347,6 +529,21 @@ function checkEvents(prev, next, events, turn, where, action) {
         cash.set(e.playerId, 0);
         if (e.toPlayerId) add(e.toPlayerId, e.cash);
         break;
+      case 'auction_started':
+        expect(!turn.auction, 'auction_started while an auction is open');
+        turn.auction = true;
+        break;
+      case 'auction_won':
+        add(e.playerId, -e.amount); // to the bank, never the pot
+        // falls through
+      case 'auction_unsold':
+        expect(turn.auction, `${e.type} without an open auction`);
+        turn.auction = false;
+        break;
+      case 'trade_accepted':
+        add(e.fromPlayerId, e.get.cash - e.give.cash - e.fees[e.fromPlayerId]);
+        add(e.toPlayerId, e.give.cash - e.get.cash - e.fees[e.toPlayerId]);
+        break;
       case 'turn_started':
         expect(!turn.open, 'turn_started while a turn is open');
         turn.open = true;
@@ -365,21 +562,73 @@ function checkEvents(prev, next, events, turn, where, action) {
   expect(pot === next.pot, () => `pot ${next.pot}, events give ${pot}: ${JSON.stringify(events)}`);
 }
 
-/** Every listed action succeeds and every unlisted turn / management action fails (CONTRACT §5). */
+/**
+ * Every listed action succeeds and every unlisted one fails (CONTRACT §5): payload-free actions as
+ * they are, BID at minBid and at maxBid, PROPOSE_TRADE with a simple valid offer to each listed
+ * target, management actions on every ownable tile.
+ */
 function checkLegalList(state, playerId, legal, where) {
+  const fails = (action) => applyAction(state, action).error;
+  const must = (ok, message) => {
+    if (!ok) assert.fail(`${where}: ${playerId}: ${typeof message === 'function' ? message() : message}`);
+  };
   for (const type of legal.actions) {
-    const res = applyAction(state, { type, playerId });
-    if (res.error) assert.fail(`${where}: listed ${type} fails with ${JSON.stringify(res.error)}`);
+    if (type === 'BID' || type === 'PROPOSE_TRADE') continue;
+    const error = fails({ type, playerId });
+    must(!error, () => `listed ${type} fails with ${JSON.stringify(error)}`);
   }
   for (const type of TURN_ACTIONS) {
-    if (!legal.actions.includes(type) && !applyAction(state, { type, playerId }).error) {
-      assert.fail(`${where}: unlisted ${type} succeeds`);
+    if (!legal.actions.includes(type)) must(fails({ type, playerId }), `unlisted ${type} succeeds`);
+  }
+
+  // BID: the whole range [minBid, maxBid] works (checked at both ends), nothing works when unlisted.
+  const me = state.players.find((p) => p.id === playerId);
+  const lowest = (state.auction?.highBid ?? 0) + 1;
+  if (legal.actions.includes('BID')) {
+    must(sameJson(legal.auction, { minBid: lowest, maxBid: me.cash }), () => `auction ${JSON.stringify(legal.auction)}`);
+    for (const amount of [lowest, me.cash]) {
+      const error = fails({ type: 'BID', playerId, amount });
+      must(!error, () => `listed BID ${amount} fails with ${JSON.stringify(error)}`);
+    }
+  } else {
+    must(legal.auction === null, 'auction set but BID unlisted');
+    for (const amount of [lowest, me.cash]) must(fails({ type: 'BID', playerId, amount }), `unlisted BID ${amount} succeeds`);
+  }
+
+  // PROPOSE_TRADE: a simple valid offer to every listed target works; unlisted, none does.
+  const others = state.players.filter((p) => !p.bankrupt && p.id !== playerId).map((p) => p.id);
+  const simpleOffer = (toPlayerId) => {
+    const target = state.players.find((p) => p.id === toPlayerId);
+    // In debt a gift is UNFAIR_TRADE (§4.13), so the debtor asks for something instead.
+    const inDebt = state.turn.phase === 'paying';
+    if (me.cash > 0 && !inDebt) return { toPlayerId, give: { cash: 1 }, get: {} };
+    if (target.cash > 0) return { toPlayerId, give: {}, get: { cash: 1 } };
+    if (inDebt) {
+      const theirs = tradeableTiles(state, toPlayerId).filter((i) => !state.tiles.find((x) => x.index === i).mortgaged);
+      return theirs.length > 0 ? { toPlayerId, give: {}, get: { tiles: [theirs[0]] } } : null;
+    }
+    const tiles = tradeableTiles(state, playerId);
+    return tiles.length > 0 ? { toPlayerId, give: { tiles: [tiles[0]] }, get: {} } : null;
+  };
+  if (legal.actions.includes('PROPOSE_TRADE')) {
+    must(sameJson(legal.tradeTargets, others), () => `tradeTargets ${legal.tradeTargets}, active others ${others}`);
+    for (const toPlayerId of legal.tradeTargets) {
+      const offer = simpleOffer(toPlayerId);
+      const error = offer && fails({ type: 'PROPOSE_TRADE', playerId, ...offer });
+      must(!error, () => `listed PROPOSE_TRADE ${JSON.stringify(offer)} fails with ${JSON.stringify(error)}`);
+    }
+  } else {
+    must(legal.tradeTargets.length === 0, 'tradeTargets set but PROPOSE_TRADE unlisted');
+    for (const toPlayerId of others) {
+      const offer = simpleOffer(toPlayerId);
+      if (offer) must(fails({ type: 'PROPOSE_TRADE', playerId, ...offer }), `unlisted PROPOSE_TRADE ${JSON.stringify(offer)} succeeds`);
     }
   }
+
   for (const [key, type] of Object.entries(MANAGEMENT)) {
     for (const tileIndex of OWNABLE) {
-      const ok = !applyAction(state, { type, playerId, tileIndex }).error;
-      if (ok !== legal[key].includes(tileIndex)) assert.fail(`${where}: ${type} ${tileIndex} listed/succeeds disagree`);
+      const ok = !fails({ type, playerId, tileIndex });
+      must(ok === legal[key].includes(tileIndex), `${type} ${tileIndex} listed/succeeds disagree`);
     }
   }
 }
@@ -391,9 +640,11 @@ describe('simulation', () => {
     let finished = 0;
     let actions = 0;
     const byPlayers = {};
+    const totals = { auctions: 0, auctionsWon: 0, trades: 0, tradesAccepted: 0 };
     for (let seed = 1; seed <= GAMES; seed++) {
       const game = playGame(seed);
       actions += game.steps;
+      for (const key of Object.keys(totals)) totals[key] += game.stats[key];
       const n = game.start.players.length;
       byPlayers[n] ??= { games: 0, finished: 0 };
       byPlayers[n].games += 1;
@@ -404,9 +655,14 @@ describe('simulation', () => {
     }
     t.diagnostic(`${GAMES} games, ${finished} reached game over, ${actions} actions`);
     t.diagnostic(`finished by player count: ${Object.entries(byPlayers).map(([n, c]) => `${n}p ${c.finished}/${c.games}`).join(', ')}`);
+    t.diagnostic(`auctions ${totals.auctions} (${totals.auctionsWon} sold), trades proposed ${totals.trades} (${totals.tradesAccepted} accepted)`);
+    assert.ok(totals.auctionsWon > 0 && totals.tradesAccepted > 0, 'the bots should win auctions and make trades');
     assert.ok(finished >= GAMES * MIN_FINISHED_SHARE, `only ${finished}/${GAMES} games finished`);
     const two = byPlayers[2];
     assert.ok(two.finished >= two.games * MIN_FINISHED_SHARE_2P, `only ${two.finished}/${two.games} 2-player games finished`);
+    const big = [4, 5, 6].map((n) => byPlayers[n] ?? { games: 0, finished: 0 })
+      .reduce((sum, c) => ({ games: sum.games + c.games, finished: sum.finished + c.finished }));
+    assert.ok(big.finished >= big.games * MIN_FINISHED_SHARE_4_6P, `only ${big.finished}/${big.games} 4–6 player games finished`);
   });
 
   test('replaying a game from its (JSON-restored) start state is identical', () => {

@@ -1,11 +1,11 @@
 // public/renderer2d.js — the 2D board renderer.
 //
 // Contract (docs/CONTRACT.md §8):
-//   * exports ONLY render(state, events, myPlayerId)
-//   * owns every DOM node inside <div id="board">; no other module touches it
+//   * exports render(state, events, myPlayerId) and dispose()
+//   * owns every DOM node inside <div id="board"> while it is the active renderer
 //   * loads the board itself (GET /api/board) and injects its own stylesheet (/renderer2d.css)
-// A future Three.js renderer replaces this file and renderer2d.css with no other changes, so all
-// knowledge of how the board is laid out and drawn lives here.
+// renderer-switch.js hands #board to this module or to renderer3d.js; all knowledge of how the 2D
+// board is laid out and drawn lives here.
 //
 // Model: the static board (40 tiles + centre panel) is built once. Every render() diffs the public
 // state against what is on screen and touches only what changed. State is the truth; events only
@@ -346,6 +346,7 @@ function buildCenter() {
     d1: die(),
     d2: die(),
     doubles: el('div', 'r2d-doubles', 'Doubles!'),
+    auction: el('div', 'r2d-auction'),
     pot: el('div', 'r2d-pot'),
     log: el('ol', 'r2d-log'),
     winner: el('div', 'r2d-winner'),
@@ -360,8 +361,9 @@ function buildCenter() {
   center.dice.append(center.d1, center.d2, center.doubles);
   center.card.setAttribute('role', 'status');
   center.card.addEventListener('click', () => nextCard());
-  for (const part of [center.turn, center.dice, center.pot, center.log, center.winner]) part.hidden = true;
-  node.append(el('div', 'r2d-title', 'MONOPOLY'), center.turn, center.dice, center.pot, center.log,
+  center.auction.setAttribute('role', 'status');
+  for (const part of [center.turn, center.dice, center.auction, center.pot, center.log, center.winner]) part.hidden = true;
+  node.append(el('div', 'r2d-title', 'MONOPOLY'), center.turn, center.dice, center.auction, center.pot, center.log,
     center.winner, center.card);
   return node;
 }
@@ -412,10 +414,18 @@ function draw(state, events, me) {
   drawTokens(ctx);
   drawTurn(ctx);
   drawDice(ctx);
+  drawAuction(ctx);
   drawPot(ctx);
   drawLog(ctx);
   drawWinner(ctx);
   queueCards(ctx);
+}
+
+/** Removes the board from #board and forgets the game on screen (renderer-switch calls this). */
+export function dispose() {
+  if (!root) return;
+  resetGame(undefined);
+  root.remove();
 }
 
 /** A different game is on screen: forget tokens, animations and caches. */
@@ -439,8 +449,15 @@ function resetGame(id) {
 
 // --- tiles -----------------------------------------------------------------
 
+/** The tile being auctioned right now, or null. */
+function auctionTile(ctx) {
+  const index = ctx.active && ctx.turn.phase === 'auction' ? ctx.state.auction?.tileIndex : null;
+  return Number.isInteger(index) && tiles[index] ? index : null;
+}
+
 function drawTiles(ctx) {
-  const pending = ctx.active ? ctx.turn.pendingPurchase : null;
+  // The tile awaiting a buy decision, or (the same highlight) the one under the hammer.
+  const pending = ctx.active ? ctx.turn.pendingPurchase ?? auctionTile(ctx) : null;
   BOARD.tiles.forEach((tile, i) => {
     const refs = tiles[i];
     if (!refs.ownable) return;
@@ -923,6 +940,29 @@ function stopTumble() {
   center.diceTimer = null;
   center.diceTarget = null;
   dropClass(center.dice, 'is-rolling');
+}
+
+/** "🔨 Auction · Illinois Avenue" with the high bid, in the bidder's colour, while an auction runs. */
+function drawAuction(ctx) {
+  const index = auctionTile(ctx);
+  const a = index == null ? null : ctx.state.auction;
+  const bidder = a?.highBidderId ? ctx.byId.get(a.highBidderId) : null;
+  const sig = a ? [index, a.highBid, bidder?.id, bidder?.name, ctx.colorOf.get(bidder?.id), bidder?.id === ctx.me].join('|') : '';
+  if (center.sig.auction === sig) return;
+  center.sig.auction = sig;
+
+  const box = center.auction;
+  box.hidden = !a;
+  box.replaceChildren();
+  if (!a) return;
+  const bid = el('span', 'r2d-auction-bid');
+  if (bidder) {
+    bid.style.setProperty('--pc', ctx.colorOf.get(bidder.id));
+    bid.append(el('i', 'r2d-auction-dot'), `${money(a.highBid)} · ${bidder.id === ctx.me ? 'you' : bidder.name}`);
+  } else {
+    bid.append('No bids yet');
+  }
+  box.append(el('span', 'r2d-auction-kicker', '🔨 Auction'), el('span', 'r2d-auction-tile', BOARD.tiles[index].name), bid);
 }
 
 function drawPot(ctx) {

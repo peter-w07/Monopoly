@@ -1,5 +1,5 @@
 /* style.css — app shell: screens, side panel, dialogs, toasts.
-   Everything inside #board is styled by renderer2d.css; here we only size the #board box.
+   Everything inside #board is styled by the active renderer (renderer2d.css or r3d/r3d.css); here we only size the #board box.
    Class names are kept specific so they don't collide with the renderer's. */
 
 :root {
@@ -86,6 +86,17 @@ h1, h2, h3 { line-height: 1.2; }
 
 .muted { color: var(--muted); }
 .small { font-size: 13px; }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  border: 0;
+  white-space: nowrap;
+}
 
 kbd {
   font: 600 12px var(--mono);
@@ -159,6 +170,31 @@ kbd {
 .checks { display: grid; gap: 8px; align-content: end; padding-bottom: 4px; }
 .check { display: flex; align-items: center; gap: 8px; font-weight: 500; cursor: pointer; }
 .check input { width: 18px; height: 18px; margin: 0; accent-color: var(--primary); }
+
+/* A number box, optionally with a "$" in front (bids, trade cash). */
+.count-field { position: relative; display: flex; align-items: center; min-width: 0; }
+.count-field input {
+  width: 100%;
+  min-width: 0;
+  min-height: 40px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.count-field input:focus { outline: 2px solid var(--focus); outline-offset: -1px; }
+.count-field.money::before {
+  content: "$";
+  position: absolute;
+  left: 10px;
+  color: var(--muted);
+  font-weight: 700;
+  pointer-events: none;
+}
+.count-field.money input { padding-left: 22px; }
 
 .form-error { margin: 0; color: var(--danger); font-size: 13px; font-weight: 600; }
 .hint { margin: 0; color: var(--muted); font-size: 13px; }
@@ -506,6 +542,7 @@ kbd {
 
 /* Narrow layouts: dialog content inside the panel, above the action bar (see renderDialog) */
 .panel-dialog-slot:empty { display: none; }
+.panel-dialog-slot { scroll-margin-top: calc(var(--topbar-h) + 8px); } /* scrolled to when the trade builder opens */
 .panel-dialog {
   padding: 10px 12px;
   border: 1px solid var(--border);
@@ -537,6 +574,7 @@ kbd {
   font-weight: 700;
 }
 .pgroup-head .tag { margin-left: auto; }
+.pgroup-note { padding: 6px 10px; border-top: 1px solid var(--border); font-size: 12px; }
 .prop { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 10px; border-top: 1px solid var(--border); }
 .prop-info { flex: 1 1 150px; min-width: 0; }
 .prop.mortgaged { background: repeating-linear-gradient(-45deg, transparent 0 8px, color-mix(in srgb, var(--danger) 5%, transparent) 8px 16px); }
@@ -632,6 +670,170 @@ kbd {
 .raise-name { flex: 1; min-width: 0; overflow: hidden; font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .raise-list .btn { flex: none; }
 
+/* ---------------------------------------------------------------- auction sheet (side panel, everyone) */
+
+.auction-sheet {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 2px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface));
+  animation: pop .18s ease-out;
+  scroll-margin-top: calc(var(--topbar-h) + 8px); /* phones: scrolled to when an auction starts */
+}
+.auction-sheet > :empty { display: none; }
+.auction-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 26px; }
+.auction-kicker { color: var(--accent-text); font-size: 12px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+.auction-clock { background: var(--surface); }
+.auction-timebar {
+  height: 4px;
+  margin: 6px 0 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+.auction-timebar i { display: block; width: 100%; height: 100%; background: var(--accent); transition: width .25s linear; }
+.auction-timebar.urgent i { background: var(--danger); }
+.auction-sheet .deed { margin: 0; background: var(--surface); }
+
+.auction-high { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; }
+.auction-label { flex-basis: 100%; color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.auction-amount { font-size: 28px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.auction-amount.none { color: var(--muted); font-size: 18px; }
+.auction-amount.bump { animation: bid-pop .4s ease-out; }
+.auction-high.winning .auction-amount { color: var(--ok); }
+.auction-bidder { display: inline-flex; align-items: center; gap: 6px; min-width: 0; font-weight: 700; overflow-wrap: anywhere; }
+.auction-status { margin: 0; font-size: 14px; }
+.auction-status.good { color: var(--ok); font-weight: 600; }
+.auction-status.warn { color: var(--warn); font-weight: 600; }
+
+.auction-quick { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.quick-bid { flex-direction: column; gap: 0; min-height: 48px; padding: 4px 2px; }
+.qb-step { font-size: 15px; }
+.qb-total { color: var(--muted); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.auction-form { display: flex; gap: 8px; }
+.auction-form .count-field { flex: 1; }
+.auction-form .count-field input { min-height: 44px; }
+.auction-form .btn { flex: none; min-width: 96px; min-height: 44px; }
+.auction-form #bid-max { min-width: 0; padding-inline: 12px; }
+#auction-pass .btn { min-height: 44px; }
+.auction-people { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.ap {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 2px 9px 2px 7px;
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 12px;
+}
+.ap .pdot { width: 8px; height: 8px; }
+.ap-name { overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ap-state { color: var(--muted); white-space: nowrap; }
+.ap-passed, .ap-out { opacity: .6; }
+.ap-passed .ap-name, .ap-out .ap-name { text-decoration: line-through; }
+.ap-high { box-shadow: inset 0 0 0 1.5px var(--pc); }
+.ap-high .ap-state { color: var(--text); font-weight: 700; }
+
+/* ---------------------------------------------------------------- trading */
+
+/* The builder is opened on purpose, so it may cover the dice: bigger than the other dialogs. */
+.dialog-layer:has(.dialog-trade) { align-items: center; padding: 2%; }
+.dialog.dialog-trade { width: min(600px, 100%); max-height: 100%; }
+.dialog.dialog-offer { width: min(460px, 100%); max-height: 72%; }
+.dialog-trade .dialog-btns, .panel-dialog .dialog-btns { margin: 12px 0 0; }
+
+.trade-targets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.trade-target {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 40px;
+  padding: 4px 12px 4px 10px;
+  border: 2px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.trade-target:hover:not(:disabled) { background: var(--surface-3); }
+.trade-target.selected { border-color: var(--pc); background: color-mix(in srgb, var(--pc) 14%, var(--surface)); }
+.trade-target:disabled { opacity: .6; cursor: default; }
+.tt-token { line-height: 1; }
+.tt-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tt-cash { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+/* Two columns (you give / you get) where they fit, stacked on phones. */
+.trade-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr)); gap: 10px; }
+.trade-cols.offer { grid-template-columns: repeat(auto-fit, minmax(min(100%, 140px), 1fr)); }
+.trade-col {
+  min-width: 0;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.trade-col-head { margin-bottom: 6px; padding: 0 2px; color: var(--muted); font-size: 12px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+legend.trade-col-head { margin-bottom: 0; padding: 0 4px; }
+.trade-tiles { display: grid; gap: 4px; margin: 4px 0 8px; }
+.trade-tiles > .muted { margin: 2px; }
+.trade-tile {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 4px 8px;
+  border-left: 4px solid var(--gc);
+  border-radius: 6px;
+  background: var(--surface);
+  cursor: pointer;
+}
+.trade-tile input { flex: none; width: 18px; height: 18px; margin: 0; accent-color: var(--primary); }
+.trade-tile-name { flex: 1; min-width: 0; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.trade-tile .tag { flex: none; }
+.trade-tile:has(input:checked) {
+  background: color-mix(in srgb, var(--primary) 12%, var(--surface));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 45%, transparent);
+}
+.trade-tile.locked { opacity: .55; cursor: not-allowed; }
+.trade-lock { flex: none; color: var(--muted); font-size: 11px; }
+.trade-count { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 6px; margin-top: 6px; font-size: 13px; }
+.trade-count-label { font-weight: 600; white-space: nowrap; }
+.trade-count-max { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.trade-summary { margin-top: 10px; }
+.trade-summary:empty { display: none; }
+.trade-sum { display: grid; margin: 0; font-size: 13px; }
+.trade-sum div { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+.trade-sum dt { flex: none; color: var(--muted); }
+.trade-sum dd { min-width: 0; margin: 0; font-weight: 600; text-align: right; overflow-wrap: anywhere; }
+.trade-summary .form-error, .trade-summary .hint { margin-top: 6px; }
+
+/* A pending offer (target / proposer) */
+.trade-items { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.trade-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  padding: 5px 8px;
+  border-left: 4px solid var(--gc, transparent);
+  border-radius: 6px;
+  background: var(--surface);
+  font-size: 13px;
+  font-weight: 600;
+}
+.trade-item-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.trade-fee { margin: 8px 0 0; color: var(--warn); font-size: 13px; font-weight: 600; }
+.trade-sets { margin: 8px 0 0; color: var(--ok); font-size: 13px; font-weight: 700; }
+.trade-note { color: var(--text); overflow-wrap: anywhere; }
+
 /* Final standings (game-over dialog) */
 .standings { display: grid; gap: 6px; margin: 0 0 12px; padding: 0; list-style: none; counter-reset: rank; }
 .standings li { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: var(--radius-sm); background: var(--surface-2); counter-increment: rank; }
@@ -698,6 +900,7 @@ kbd {
 @keyframes pulse { 50% { opacity: .45; } }
 @keyframes pop { from { opacity: 0; transform: scale(.96); } }
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
+@keyframes bid-pop { 0% { transform: scale(1.18); color: var(--accent); } 100% { transform: none; } }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
@@ -768,6 +971,8 @@ kbd {
 /* Touch screens: bigger targets for the small buttons */
 @media (pointer: coarse) {
   .btn.small { min-height: 40px; }
+  .trade-tile { min-height: 44px; }
+  .trade-tile input { width: 22px; height: 22px; }
   .prop-btns { gap: 10px; }
   .dialog-x { width: 40px; height: 40px; }
   .toast-x { width: 34px; height: 34px; top: 2px; right: 2px; }

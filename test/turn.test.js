@@ -107,7 +107,7 @@ describe('movement and GO', () => {
 
 describe('doubles', () => {
   test('doubles force another roll: END_TURN rejected, then ROLL works', () => {
-    let { state } = roll(newGame(), 'p1', 5, 5); // → 10 just visiting
+    let { state } = roll(newGame({ settings: { auctionOnDecline: false } }), 'p1', 5, 5); // → 10 just visiting
     assert.equal(state.turn.phase, 'end_turn');
     assert.equal(state.turn.rollAgain, true);
     assert.equal(state.turn.doublesCount, 1);
@@ -183,8 +183,8 @@ describe('buying and declining', () => {
     assertEvent(events, 'bought', { playerId: 'p1', tileIndex: 3, price: 60 });
   });
 
-  test('DECLINE leaves the tile unowned', () => {
-    const { state } = roll(newGame(), 'p1', 1, 2);
+  test('DECLINE leaves the tile unowned (auctionOnDecline off; with it on see auction.test.js)', () => {
+    const { state } = roll(newGame({ settings: { auctionOnDecline: false } }), 'p1', 1, 2);
     const { state: after, events } = act(state, { type: 'DECLINE', playerId: 'p1' });
     assert.equal(tile(after, 3).ownerId, null);
     assert.equal(player(after, 'p1').cash, 1500);
@@ -220,7 +220,7 @@ describe('buying and declining', () => {
 
 describe('ending the turn', () => {
   test('END_TURN passes to the next player and resets the turn', () => {
-    let s = roll(newGame({ players: 3 }), 'p1', 1, 2).state;
+    let s = roll(newGame({ players: 3, settings: { auctionOnDecline: false } }), 'p1', 1, 2).state;
     s = act(s, { type: 'DECLINE', playerId: 'p1' }).state;
     const { state, events } = act(s, { type: 'END_TURN', playerId: 'p1' });
     assert.equal(current(state), 'p2');

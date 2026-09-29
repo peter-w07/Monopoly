@@ -5,26 +5,30 @@ process serves the static client, a small JSON API and a WebSocket endpoint, and
 games in memory with JSON files on disk for persistence. There is no database, no build
 step and no front-end framework; the only dependency is [`ws`](https://github.com/websockets/ws).
 The rules engine is pure and deterministic, so any saved game replays identically.
-The 2D client is a stand-in: board drawing is isolated in one module so a Three.js
-renderer can replace it later.
+The board has two interchangeable renderers — a classic 2D board and an early 3D board
+(Three.js) inspired by Monopoly Plus — switched with the 2D | 3D toggle on the board.
 
-**What works in this first slice**
+**What works**
 
 - Lobby: create a game (starting cash, turn timer, max players, Free Parking pot, even
-  building), share a 6-character code or invite link, pick a token, host starts.
+  building, auctions), share a 6-character code or invite link, pick a token, host starts.
 - Full turn flow: dice, doubles (three doubles → jail), passing and landing on GO, buying
   or declining, rent (monopoly double rent, railroads, utilities), taxes, all 32 Chance /
   Community Chest cards, jail (fine, card, rolling for doubles, forced fine on the third miss).
+- Auctions: a declined property goes to an open auction that everyone at the table can bid in.
+- Trading: properties, cash and Get Out of Jail Free cards, one offer at a time, on your turn
+  (also to raise cash when you're in debt).
 - Houses and hotels with the even-build rule and the bank's limited supply, selling,
   mortgaging and unmortgaging (10% interest).
-- Debt: raise cash by selling and mortgaging, then pay; bankruptcy to a player or to the
-  bank; game over and standings.
+- Debt: raise cash by selling, mortgaging or trading, then pay; bankruptcy to a player or to
+  the bank; game over and standings.
 - Turn timer with auto-play for absent players, reconnect and seat resume, several tabs
   as different players, spectators.
 - Games survive a server restart or redeploy.
-
-**Stubbed, not implemented:** auctions and trading. The engine answers `NOT_IMPLEMENTED` to
-those actions, and a declined property simply stays unowned.
+- 3D board (early, work in progress): a toy board on a table, hopping tokens, thrown dice,
+  a camera that follows the action (drag to orbit, scroll to zoom, ⟲ to reset), and a small
+  town that grows as properties are bought and built on. Click **3D** on the board to try it;
+  it falls back to 2D on devices without WebGL2.
 
 ---
 
@@ -88,12 +92,54 @@ Stop the server with Ctrl+C: it saves every game before exiting.
 - **Jail:** pay the $50 fine, use a Get Out of Jail Free card, or roll for doubles. On the third
   failed roll you pay the fine and move.
 - **Debt:** when you owe more than you have, the debt dialog lists what you can sell or
-  mortgage. Pay once you have enough, or **Declare bankruptcy**.
+  mortgage, and you can also trade (see below). Pay once you have enough, or **Declare
+  bankruptcy**. Once you can pay, the bankruptcy button goes away (Resign is still there).
 - **Information:** tap or click a board tile for its price, owner, buildings and current
   rent. Tap a player's row for everything they own. Spectators can do both.
 - Phones and narrow windows (≤ 899px): dialogs appear in the panel above the buttons, with a
   *Raise cash* list, and the panel shows the last 5 log lines. Phone-sized boards use short
   tile names; tap a tile for the full one.
+
+**Auctions.** When the player who landed on an unowned property declines it (with *Auctions*
+on, the default), it goes up for auction at once, and everyone still in the game can bid, the
+decliner and off-turn players included. The auction panel shows the deed, the high bid, a
+10-second clock and your options:
+
+- Quick bids raise the high bid by $1, $10, $50 or $100. After every new bid they ignore
+  clicks for 0.7 s, so a click meant for the old amount can't bid the new one; a step you
+  can't afford stays greyed out. Type any amount in the box instead (**Max** fills in all your
+  cash), then press **Bid**.
+- **Pass** drops you out for good. The high bidder can't pass.
+- Every bid restarts the 10 s clock (passes don't). The auction ends when everyone else has
+  passed or the clock runs out; an auction never runs longer than 2 minutes in total. The
+  winner pays the bank (never the Free Parking pot); with no bids the property stays unowned.
+- You can't bid more than your cash, and nobody's cash changes during an auction (no
+  mortgaging or trading meanwhile), so a winner can always pay.
+- Disconnected players aren't waited for. On a phone, the page scrolls to the auction panel
+  when one starts.
+- If the high bidder resigns, the high bid falls back to the best bid by someone still in the
+  auction (never to a player who passed). If the current player resigns, the auction is
+  called off.
+
+**Trading.** On your turn, before or after rolling, in jail or while in debt, **Trade** opens
+the offer builder: pick a player, tick properties on either side, add cash and Get Out of
+Jail Free cards. It shows the fees and your cash afterwards, and won't send an offer the game
+would refuse.
+
+- Properties in a colour group with buildings can't be traded (sell the buildings first).
+- Mortgaged properties change hands still mortgaged, and whoever receives one pays the bank
+  10% of its mortgage value at once.
+- The other player sees the offer (and which colour sets it would complete) and can
+  **Accept** or **Reject**; you can **Withdraw** it. Accept only works after the offer has
+  been on screen for a second, and it accepts exactly that offer: if you withdraw and send a
+  different one, a click meant for the old one does nothing.
+- One offer can be pending at a time, and you can make at most 5 offers per turn.
+- Your turn clock keeps running while an offer waits. If it runs out, the offer is cancelled
+  and your turn is played as usual.
+- **In debt you may sell but not give away:** what you get (cash, plus properties at their
+  mortgage value, minus fees) must be worth at least what you give (properties at their
+  mortgage value; mortgaged ones and jail cards count as $0). So a player about to go
+  bankrupt can't hand everything to a friend instead of their creditor.
 
 **Turn timer and absent players.** With a turn timer set (default 90 s), an expired turn is
 played automatically: roll, decline the purchase, end the turn, or pay a debt. To pay, it
@@ -126,6 +172,9 @@ debt to them is cancelled (a *pay each player* card debt shrinks by their share)
   for a while after that.
 - Property handed over in a bankruptcy keeps its mortgage, and the new owner pays no 10% fee.
   Property returned to the bank becomes unowned and unmortgaged.
+- Property received in a trade pays the 10% fee at once; lifting the mortgage later costs the
+  mortgage value plus 10% again, as in the official rules when the mortgage isn't lifted
+  straight away. (There is no option to lift it at the moment of the trade.)
 - Free Parking pot (optional house rule): taxes, card fees and jail fines go into a pot that
   whoever lands on Free Parking collects.
 - Card decks are reshuffled when they run out. A held Get Out of Jail Free card is out of the
@@ -176,7 +225,8 @@ server/    node:http + ws. index.js (HTTP API, static files, /ws, shutdown), roo
            broadcast), persist.js (atomic JSON saves, instance lock), timers.js (turn timer, AFK),
            limits.js (abuse limits).
 public/    Vanilla ES-module client, served as-is. ui.js (screens, panel, dialogs), net.js (socket,
-           reconnect), renderer2d.js + renderer2d.css (the board), boarddata.js, style.css.
+           reconnect), renderer-switch.js (2D | 3D), renderer2d.js + renderer2d.css (2D board),
+           renderer3d.js + r3d/ (3D board), vendor/three/ (three.js r186, MIT), boarddata.js, style.css.
 test/      node:test suites: engine unit tests, a 150-game simulation, server integration tests.
            bot.js is the bots' move chooser (shared with scripts/).
 scripts/   bot-client.js (headless WebSocket player), playtest.js (bot game against a live server).
@@ -184,16 +234,15 @@ docs/      SPEC.md (the original brief), CONTRACT.md (authoritative interfaces: 
            events, protocol, persistence).
 ```
 
-**Renderer isolation.** `public/renderer2d.js` is the only module that knows the board is
-2D. It exports exactly one function, `render(state, events, myPlayerId)`, and owns every DOM
-node inside `<div id="board">`. It loads `/api/board` itself and injects its own stylesheet.
-`ui.js` owns everything outside the board and imports the renderer in one line.
+**Renderer isolation.** Only the renderers know what the board looks like. `renderer2d.js`
+and `renderer3d.js` each export `render(state, events, myPlayerId)` and `dispose()`, own every
+node inside `<div id="board">` while active, load `/api/board` themselves and inject their own
+styles. `renderer-switch.js` hands the board to one of them (remembered in
+`localStorage["monopoly.renderer"]`; `?renderer=3d` forces 3D once) and is the one module
+`ui.js` imports. three.js is only downloaded when 3D is chosen.
 
-A Three.js renderer would plug in like this:
+Rules every renderer follows:
 
-- Write a module with the same `render(state, events, myPlayerId)` export that draws into
-  `#board`.
-- Point the import in `ui.js` at it, or replace `renderer2d.js`.
 - On every call, **state is the truth**: always converge on it.
 - Use `events` only for animation: `dice_rolled`, `moved` (with `from`, `to`, signed `steps`
   and `via`), `passed_go`, `bought`, `built`, `card_drawn`, `sent_to_jail` and so on (the full
@@ -248,22 +297,25 @@ Everything lives under `DATA_DIR`:
 npm test
 ```
 
-Runs every suite with `node:test` (about 220 tests in about 10 s; passes on Node 20 and 24):
+Runs every suite with `node:test` (about 290 tests in about 10 s; passes on Node 20 and 24):
 
 - **Engine unit tests:** movement and GO, doubles and three-doubles jail, buying, rent
   (monopolies, railroads, utilities, mortgages), taxes, cards and decks, jail escapes,
   building and selling (including the house shortage), mortgages, debt, bankruptcy to a player
-  or the bank, resigning, TIMEOUT auto-play, `legalActions`, the lobby, the RNG, determinism
-  (same seed + same actions = same state), and "failed actions never change the state".
-- **Simulation:** 150 seeded bot games with random timeouts and resignations. After every
-  action it checks the invariants: cash never negative, houses and hotels conserved, the input
-  state never mutated, the cash and pot changes described by the events match the new state,
-  and every listed legal action succeeds (unlisted ones fail). Five games are replayed from a
+  or the bank, resigning, TIMEOUT auto-play, auctions (bids, passes, the clock, resignations),
+  trading (validation, fees, the in-debt rule, the per-turn limit, answering a named offer),
+  `legalActions`, the lobby, the RNG, determinism (same seed + same actions = same state), and
+  "failed actions never change the state".
+- **Simulation:** 150 seeded bot games with random timeouts and resignations; the bots bid in
+  auctions and trade for the missing lot of a colour group, and all 150 games reach game over.
+  After every action it checks the invariants: cash never negative, houses and hotels conserved,
+  the input state never mutated, the cash and pot changes described by the events match the new
+  state, auction and trade bookkeeping, and every listed legal action succeeds (unlisted ones fail). Five games are replayed from a
   JSON copy of their start state and must come out identical.
 - **Server integration:** starts real servers on temporary data directories. Covers the HTTP
   API, the WebSocket protocol, seat resume, restart-and-resume, stale-action (`seq`) rejection,
   rate limits and connection caps, corrupt saves, a failed save at shutdown, and the instance
-  lock. Also turn-timer unit tests.
+  lock. Also turn-timer unit tests (including the auction clock and its 2-minute limit).
 
 **Bot playtest** against a running server:
 
@@ -276,8 +328,11 @@ npm run playtest -- --url http://localhost:3000 --bots 6 --max-turns 300 --think
 Options: `--url`, `--bots 2-6` (default 4), `--max-turns` (default 500), `--think <ms>`,
 `--seed`, `--cash`, `--turn-timeout <s>`, `--timeout <s>` (wall clock, default 300),
 `--keep` (leave the game running at the turn cap), `--json`, `--verbose`. The exit code is 0
-if the game ended (game over or turn cap) with no errors sent to the bots. Without trading,
-colour groups rarely complete, so games with 4 or more bots usually stop at the turn cap.
+if the game ended (game over or turn cap) with no errors sent to the bots. The summary lists
+each bot's result, then the auctions (and how many sold), trades proposed and accepted, turn
+timeouts, reconnects, and "lost races": actions another player's move beat to it, such as a bid
+that was outbid a moment earlier (`BID_TOO_LOW`). Those are part of play, not errors. With
+auctions and trading, 4- and 6-bot games normally reach game over in 100–200 turns.
 
 ---
 
@@ -366,9 +421,15 @@ running the new container on the same volume.
 
 ## Limits and known gaps
 
-- **No auctions or trading** (stubs). Declined properties, and properties returned to the bank
-  by a bankruptcy, stay unowned. Without trading, colour groups are hard to complete, so games
-  with 4 or more players can run very long.
+- **Trading limits:** no counter-offers (reject and let them propose again), one pending offer
+  at a time, only on your own turn, at most 5 offers per turn. Properties returned to the bank
+  by a bankruptcy stay unowned (they aren't auctioned).
+- **Gifts and kingmaking:** outside a debt, a player may give anything away (as the official
+  rules allow), so someone about to resign can still pick who benefits. In debt, gifts are
+  refused, but mortgaged properties and jail cards count as $0 there, so those can still be
+  given away before a bankruptcy.
+- **Auctions don't wait:** disconnected players aren't waited for, and each bid gives the others
+  10 s to answer.
 - **No accounts.** A seat is a secret token in one browser's storage. Clearing site data loses
   the seat, and a seat can't be moved to another device. There is no chat, no kicking players,
   and no way to hand over the host role except leaving the lobby.

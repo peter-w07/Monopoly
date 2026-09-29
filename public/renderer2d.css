@@ -525,6 +525,49 @@
   transform: rotate(10deg);
 }
 
+/* Auction running: what is under the hammer and the high bid (bidder's colour). */
+.r2d-auction {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25em 0.6em;
+  max-width: 100%;
+  padding: 0.3em 0.9em;
+  border: max(1px, 0.3cqi) solid var(--r2d-highlight);
+  border-radius: 999px;
+  background: var(--r2d-panel);
+  box-shadow: 0 0 0 max(1px, 0.3cqi) rgb(0 0 0 / 0.12), 0 0 1.6cqi 0.2cqi var(--r2d-highlight);
+  font-size: clamp(8px, 1.8cqi, 20px);
+  font-weight: 700;
+  text-align: center;
+}
+.r2d-auction-kicker {
+  color: var(--r2d-accent);
+  font-size: 0.85em;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.r2d-auction-tile {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.r2d-auction-bid {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.r2d-auction-dot {
+  width: 0.7em;
+  height: 0.7em;
+  border-radius: 50%;
+  background: var(--pc);
+}
+
 .r2d-pot {
   padding: 0.25em 0.8em;
   border-radius: 999px;
