@@ -1,0 +1,508 @@
+/* public/r3d/r3d.css — styles for everything inside #board while the 3D renderer is active
+   (injected by renderer3d.js). All class names start with r3d- so they never collide with ui.js. */
+
+.r3d {
+  position: relative;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  border-radius: 8px;
+  background: #1b130e;
+  box-shadow: 0 2px 6px rgb(0 0 0 / 0.2), 0 12px 32px rgb(0 0 0 / 0.18);
+  container-type: inline-size;
+  color: #17211b;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.r3d *,
+.r3d *::before,
+.r3d *::after {
+  box-sizing: border-box;
+}
+
+.r3d [hidden] {
+  display: none !important;
+}
+
+.r3d-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  outline: none;
+  cursor: grab;
+}
+
+.r3d-canvas:active {
+  cursor: grabbing;
+}
+
+/* Soft vignette: pulls the eye to the board. */
+.r3d::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(ellipse at 50% 46%, transparent 55%, rgb(10 6 3 / 0.55) 100%);
+}
+
+.r3d-ui {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.r3d-ui > * {
+  pointer-events: auto;
+}
+
+/* ---- whose turn --------------------------------------------------------------------------------- */
+
+.r3d-turn {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+  max-width: calc(100% - 150px);
+  padding: 0.35em 0.8em 0.35em 0.5em;
+  border-left: 5px solid var(--pc, #999);
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.92);
+  box-shadow: 0 2px 10px rgb(0 0 0 / 0.35);
+  font-size: clamp(12px, 2.4cqi, 17px);
+  line-height: 1.2;
+  pointer-events: none;
+}
+
+.r3d-turn.is-new {
+  animation: r3d-turn-in 0.5s cubic-bezier(0.2, 0.9, 0.25, 1.2);
+}
+
+@keyframes r3d-turn-in {
+  from { transform: translateX(-120%) scale(1.15); }
+  to { transform: none; }
+}
+
+.r3d-turn-token {
+  font-size: 1.25em;
+}
+
+.r3d-turn-name {
+  overflow: hidden;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.r3d-turn-meta {
+  color: #58685e;
+  font-size: 0.85em;
+  white-space: nowrap;
+}
+
+/* ---- camera buttons ----------------------------------------------------------------------------- */
+
+.r3d-tools {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.r3d-free-chip {
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: rgb(20 14 10 / 0.7);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.r3d-btn {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid rgb(255 255 255 / 0.25);
+  border-radius: 50%;
+  background: rgb(20 14 10 / 0.6);
+  color: #fff;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  backdrop-filter: blur(4px);
+}
+
+.r3d-btn:hover,
+.r3d-btn.is-on {
+  background: rgb(255 255 255 / 0.9);
+  color: #17211b;
+}
+
+.r3d-btn:focus-visible {
+  outline: 2px solid #2b7de9;
+  outline-offset: 2px;
+}
+
+/* ---- floating money labels ---------------------------------------------------------------------- */
+
+.r3d-floats {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.r3d-float {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 0.3em;
+  padding: 0.1em 0.45em;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.94);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 0.35);
+  font-size: clamp(12px, 2.6cqi, 20px);
+  font-weight: 900;
+  white-space: nowrap;
+  transform: translate(-50%, -100%);
+  animation: r3d-float 1.4s ease-out forwards;
+}
+
+@keyframes r3d-float {
+  0% { opacity: 0; translate: 0 8px; scale: 0.7; }
+  15% { opacity: 1; translate: 0 0; scale: 1.08; }
+  25% { scale: 1; }
+  75% { opacity: 1; }
+  100% { opacity: 0; translate: 0 -38px; }
+}
+
+.r3d-float-chip {
+  flex: none;
+  width: 0.7em;
+  height: 0.7em;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 0.25);
+}
+
+/* Off screen: stuck to the edge, with an arrow toward where it belongs. */
+.r3d-float[data-edge]::after {
+  font-size: 0.8em;
+  opacity: 0.75;
+}
+.r3d-float[data-edge="left"]::after { content: "◀"; order: -1; }
+.r3d-float[data-edge="right"]::after { content: "▶"; }
+.r3d-float[data-edge="up"]::after { content: "▲"; }
+.r3d-float[data-edge="down"]::after { content: "▼"; }
+
+.r3d-float-plus { color: #1d8a55; }
+.r3d-float-minus { color: #d0373c; }
+.r3d-float-gold { background: #f4c542; color: #3b2a00; }
+.r3d-float-info { color: #17211b; }
+.r3d-float-big {
+  background: #c8102e;
+  color: #fff;
+  font-size: clamp(14px, 3.6cqi, 28px);
+  letter-spacing: 0.04em;
+}
+
+/* ---- callouts (dice total, DOUBLES!, GO TO JAIL!) ------------------------------------------------ */
+
+.r3d-callouts {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: start center;
+  padding-top: 20%;
+  pointer-events: none;
+}
+
+.r3d-callout {
+  padding: 0.12em 0.55em;
+  border-radius: 0.4em;
+  background: rgb(255 255 255 / 0.95);
+  box-shadow: 0 0.2em 1em rgb(0 0 0 / 0.4);
+  color: #17211b;
+  font-size: clamp(22px, 7cqi, 64px);
+  font-weight: 900;
+  letter-spacing: 0.03em;
+  line-height: 1.1;
+  white-space: nowrap;
+  animation: r3d-callout var(--ms, 1000ms) cubic-bezier(0.2, 0.9, 0.3, 1.2) forwards;
+}
+
+.r3d-callout-doubles,
+.r3d-callout-alert {
+  background: #c8102e;
+  color: #fff;
+  font-size: clamp(26px, 8.5cqi, 78px);
+}
+
+@keyframes r3d-callout {
+  0% { opacity: 0; transform: scale(0.4); }
+  18% { opacity: 1; transform: scale(1.12); }
+  30% { transform: scale(1); }
+  78% { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: translateY(-12px) scale(0.96); }
+}
+
+/* ---- drawn card ------------------------------------------------------------------------------- */
+
+.r3d-card {
+  position: absolute;
+  top: calc(10px + 2.6em);
+  left: 50%;
+  z-index: 3;
+  width: min(460px, calc(100% - 20px));
+  padding: 0.5em 0.9em 0.6em;
+  border-left: max(5px, 0.8cqi) solid #f07c1a;
+  border-radius: 10px;
+  background: rgb(255 244 224 / 0.97);
+  box-shadow: 0 4px 18px rgb(0 0 0 / 0.4);
+  color: #2b1d08;
+  font-size: clamp(12px, 2.3cqi, 16px);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, -12px);
+  transition: opacity 0.25s ease, transform 0.3s ease;
+}
+
+.r3d-card.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate(-50%, 0);
+}
+
+.r3d-card.is-community {
+  border-left-color: #2b8fd6;
+  background: rgb(233 245 253 / 0.97);
+  color: #0d2436;
+}
+
+.r3d-card-deck {
+  font-size: 0.78em;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  opacity: 0.75;
+}
+
+.r3d-card-text {
+  margin-top: 0.15em;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+/* ---- game log (bottom-left; ui.js shows its own below 900px) -------------------------------- */
+
+.r3d-log {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  width: min(34%, 300px);
+  padding: 4px 8px 6px;
+  border-radius: 10px;
+  background: rgb(20 14 10 / 0.62);
+  color: #f3eee6;
+  font-size: 11.5px;
+  line-height: 1.35;
+  backdrop-filter: blur(4px);
+}
+
+.r3d-log-head {
+  display: block;
+  width: 100%;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: #fff;
+  font: 800 11px/1.2 system-ui, sans-serif;
+  letter-spacing: 0.04em;
+  text-align: left;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.r3d-log-head::after {
+  content: " ▾";
+  opacity: 0.7;
+}
+
+.r3d-log.is-collapsed .r3d-log-head::after {
+  content: " ▸";
+}
+
+.r3d-log-list {
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.r3d-log-list li {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.8;
+}
+
+.r3d-log-list li:last-child {
+  font-weight: 700;
+  opacity: 1;
+}
+
+.r3d-log.is-collapsed .r3d-log-list li:not(:last-child) {
+  display: none;
+}
+
+@media (max-width: 899px) {
+  .r3d-log { display: none; }
+}
+
+/* ---- tile info card ------------------------------------------------------------------------------ */
+
+.r3d-info {
+  position: absolute;
+  z-index: 4;
+  width: min(260px, calc(100% - 16px));
+  overflow: hidden;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.45);
+  color: #17211b;
+  font-size: 12.5px;
+  line-height: 1.35;
+  cursor: pointer;
+}
+
+.r3d-info-head {
+  padding: 7px 10px;
+  border-top: 12px solid var(--band, #cfd8d2);
+  background: #f7f7f2;
+  font-weight: 800;
+  text-align: center;
+}
+
+.r3d-info-status {
+  padding: 6px 10px 0;
+  font-weight: 650;
+}
+
+.r3d-info-owner::before {
+  content: "";
+  display: inline-block;
+  width: 0.7em;
+  height: 0.7em;
+  margin-right: 0.35em;
+  border-radius: 50%;
+  background: var(--owner, #999);
+}
+
+.r3d-info-facts {
+  padding: 6px 10px 8px;
+  color: #3d4a42;
+}
+
+/* ---- winner --------------------------------------------------------------------------------------- */
+
+.r3d-winner {
+  position: absolute;
+  top: 26%;
+  left: 50%;
+  z-index: 3;
+  width: min(62cqi, 92%);
+  padding: 2.4cqi 2cqi;
+  border: max(2px, 0.5cqi) solid #fff;
+  border-radius: 2cqi;
+  background: linear-gradient(160deg, #fff6c9, #ffd54a);
+  box-shadow: 0 0 0 max(2px, 0.45cqi) var(--pc, #e0a800), 0 1.4cqi 5cqi rgb(0 0 0 / 0.45);
+  color: #3b2a00;
+  text-align: center;
+  transform: translate(-50%, -50%);
+  animation: r3d-winner-in 0.6s cubic-bezier(0.2, 0.9, 0.3, 1.3);
+  pointer-events: none;
+}
+
+@keyframes r3d-winner-in {
+  from { transform: translate(-50%, -50%) scale(0.4); opacity: 0; }
+}
+
+.r3d-winner-trophy { font-size: clamp(24px, 8cqi, 64px); line-height: 1; }
+.r3d-winner-name { margin-top: 0.2em; font-size: clamp(16px, 4.6cqi, 40px); font-weight: 900; }
+.r3d-winner-sub { margin-top: 0.3em; font-size: clamp(10px, 2cqi, 18px); opacity: 0.8; }
+
+/* ---- messages ------------------------------------------------------------------------------------ */
+
+.r3d-msg {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 4;
+  width: min(360px, 86%);
+  padding: 18px 20px;
+  border-radius: 14px;
+  background: rgb(255 255 255 / 0.96);
+  box-shadow: 0 10px 40px rgb(0 0 0 / 0.45);
+  color: #17211b;
+  text-align: center;
+  transform: translate(-50%, -50%);
+}
+
+.r3d-msg p {
+  margin: 0 0 12px;
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+.r3d-msg-btn {
+  margin: 0 4px;
+  padding: 8px 16px;
+  border: 0;
+  border-radius: 9px;
+  background: #1a8754;
+  color: #fff;
+  font: 600 14px system-ui, sans-serif;
+  cursor: pointer;
+}
+
+.r3d-msg-btn + .r3d-msg-btn {
+  background: #e7ece8;
+  color: #17211b;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .r3d-turn.is-new,
+  .r3d-winner,
+  .r3d-float,
+  .r3d-callout {
+    animation: none;
+  }
+  .r3d-card {
+    transition: none;
+  }
+}
+
+/* "Loading 3D…" while shaders compile: a quiet label, no card. */
+.r3d-msg.is-quiet {
+  width: auto;
+  padding: 8px 14px;
+  background: rgb(20 14 10 / 0.6);
+  box-shadow: none;
+  color: #fff;
+}
+
+.r3d-msg.is-quiet p {
+  margin: 0;
+  font-weight: 700;
+}
