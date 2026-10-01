@@ -1,9 +1,19 @@
 // ui.js — everything outside #board: screens (home / lobby / game), the side panel, dialogs,
-// toasts and the turn countdown. The board itself is drawn by renderer2d.js; the server is the
-// only source of truth, so every screen is re-rendered from the latest `state` + `legal`.
+// toasts, the turn countdown, the settings popover and interface sounds. The board itself is drawn
+// by the renderer renderer-switch.js picks (2D DOM or 3D Three.js); the server is the only source
+// of truth, so every screen is re-rendered from the latest `state` + `legal`.
+//
+// With the 3D board on (body.board-3d) the board fills the whole window: the header floats over it,
+// the side panel becomes a floating card on the right (a bottom sheet on phones held upright), and
+// ui.js tells the renderer which part of the board they cover (#board.dataset.safeTop/Right/Bottom/
+// Left + a 'monopoly:safearea' window event) so it can frame the board in the rest.
 
 import { BOARD } from './boarddata.js';
-import { render as renderBoard, busyUntil as boardBusyUntil } from './renderer-switch.js';
+import {
+  render as renderBoard, busyUntil as boardBusyUntil, getMode as boardMode, setMode as setBoardMode,
+  onModeChange as onBoardModeChange, getStatus as boardStatus, onStatus as onBoardStatus, probe3d,
+  setOptions as setBoardOptions, setBoardToggle,
+} from './renderer-switch.js';
 import { connectGame } from './net.js';
 
 // ---------------------------------------------------------------------------
@@ -20,8 +30,9 @@ const EMPTY_LEGAL = { actions: [], build: [], sellHouse: [], mortgage: [], unmor
 const HOME_REFRESH_MS = 5000;
 const BUSY_TIMEOUT_MS = 4000;
 // After a move, dialogs wait this long so the board can show the dice and the token's walk first
-// (the same buttons are in the side panel right away).
-const DIALOG_HOLD_MS = 1500;
+// (the same buttons are in the side panel right away) — per animation speed (settings). The 3D
+// board says itself how long it needs (busyUntil).
+const DIALOG_HOLD_MS = { normal: 1500, fast: 800, instant: 0 };
 // Space/Enter can't end the turn this soon after my roll (a double press would skip the move).
 const END_TURN_KEY_HOLD_MS = 700;
 const RECENT_LOG_LINES = 5;
@@ -30,9 +41,23 @@ const NOT_FOUND = Symbol('not found');
 // above the action bar instead of floating over the board.
 const NARROW = window.matchMedia('(max-width: 899px)');
 const COARSE = window.matchMedia('(pointer: coarse)');
+// Must match style.css: in the 3D layout, the side panel becomes a bottom sheet here (phones held
+// upright). Narrow landscape windows keep a (narrower) side panel, which leaves the board more room.
+const SHEET = window.matchMedia('(max-width: 899px) and (orientation: portrait)');
+const REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduce)');
+// The 3D overview shows the board about this much wider than tall: the safe-area maths uses it to
+// decide whether a folded panel is better kept out of the way on the right or above the board.
+const BOARD_VIEW_ASPECT = 1.35;
+// …and switches between the two only when the other is this much better (no flip-flopping).
+const SAFE_SWITCH_MARGIN = 1.08;
+// The bottom sheet's tallest drag (share of the window height; style.css caps it the same way).
+const SHEET_MAX_SHARE = 0.7;
+// The last seconds of an auction I'm in tick (sfx 'tick'), once per second.
+const AUCTION_TICK_SECONDS = 3;
 
 const KEY_NAME = 'monopoly.name';
 const KEY_SESSIONS = 'monopoly.sessions';
+const KEY_SETTINGS = 'monopoly.settings';
 const seatKey = (gameId) => `monopoly.seat.${gameId}`;
 
 // Actions that don't depend on what the player saw last: sent without the state seq.
@@ -53,6 +78,25 @@ const TRADE_ARM_MS = 1000;
 const MAX_TRADES_PER_TURN = 5;
 // The server's auction clock (CONTRACT §9); only used to draw the "going, going…" bar.
 const AUCTION_CLOCK_MS = 10_000;
+
+// Board settings (localStorage KEY_SETTINGS), passed to the renderers through renderer-switch.
+// The first choice of each is the default. `hints` explain the choice on screen.
+const SETTINGS = {
+  speed: {
+    choices: ['normal', 'fast', 'instant'],
+    hints: { normal: 'Every roll, walk and card is animated.', fast: 'Animations play about twice as fast.', instant: 'No board animations — the board just updates.' },
+  },
+  camera: {
+    choices: ['cinematic', 'calm', 'free'],
+    hints: { cinematic: 'The camera follows the action and pushes in on landings.', calm: 'A steady overview with gentle close-ups.', free: 'The camera only moves when you drag it.' },
+  },
+  quality: {
+    choices: ['auto', 'low', 'medium', 'high'],
+    hints: { auto: 'Picked for this device.', low: 'Fastest: for phones and older computers.', medium: 'Soft shadows and more detail.', high: 'Everything on: for strong graphics cards.' },
+  },
+};
+// Interface controls that make a sound of their own instead of the generic click.
+const OWN_SOUND_UI = new Set(['board-view', 'settings', 'settings-close', 'panel-toggle', 'fullscreen', 'dismiss', 'trade-open', 'trade-cancel']);
 
 const ERROR_TEXT = {
   NOT_YOUR_TURN: "It's not your turn.",
@@ -106,7 +150,42 @@ const app = {
   tradeSeen: null,        // { id, at }: the trade offer on screen and when it first appeared (TRADE_ARM_MS)
   tradeDraft: null,       // trade builder: { to, give: side, get: side }, side = { tiles, cash, jail } (cash/jail as typed)
   tradeWith: null,        // whom I last sent an offer to: the builder's default target next time
+  settings: null,         // { speed, camera, quality } (see SETTINGS; loaded in boot)
+  panelOpen: { side: true, sheet: false }, // 3D layout: is the panel unfolded (per layout, this page only)
+  sheetDrag: null,        // bottom-sheet drag in progress: { id, y0, h0, moved, lastY, lastT, v }
+  sheetClickBlock: 0,     // the handle's click is ignored until then (it ends a drag, not a tap)
+  sheetForTrade: false,   // the bottom sheet was unfolded for the trade builder: fold it when that closes
+  safe: '',               // the safe area last written to #board (see updateSafeArea)
+  safeUnder: false,       // a folded 3D panel keeps the board under it (true) or beside it
+  tickKey: '',            // the auction second that last ticked
 };
+
+// ---------------------------------------------------------------------------
+// Interface sounds (sfx.js, synthesised with WebAudio). The renderers play the board's own sounds
+// (dice, hops, coins…); ui.js only plays interface ones: clicks, toggles, open / close, my turn,
+// a trade offer for me, an auction's last seconds, errors. Loaded on the side: the game works
+// the same without it (a missing or failing sfx.js just means silence).
+// ---------------------------------------------------------------------------
+
+let sfx = null;
+let sfxFailed = false; // sfx.js couldn't be loaded: the sound settings say so
+import('./sfx.js')
+  .then((mod) => {
+    sfx = mod.sfx ?? null;
+    renderSettings();
+  })
+  .catch((err) => {
+    console.warn('[ui] sound is unavailable:', err);
+    sfxFailed = true;
+    renderSettings();
+  });
+
+/** Plays an interface sound (sfx names, see sfx.js). Never throws; silent until sfx.js is loaded. */
+function sound(name, opts) {
+  try {
+    sfx?.play(name, opts);
+  } catch { /* sound is a nicety */ }
+}
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -356,7 +435,9 @@ function showScreen(name) {
   app.screen = name;
   for (const el of document.querySelectorAll('.screen')) el.hidden = el.id !== `screen-${name}`;
   $('#topbar-game').hidden = !['loading', 'lobby', 'game'].includes(name);
+  $('#view-pill').hidden = name !== 'game';
   document.body.dataset.screen = name;
+  syncBoardLayout();
   if (name === 'home') startHomeRefresh();
   else stopHomeRefresh();
 }
@@ -375,7 +456,7 @@ function closeGame() {
     conn: null, gameId: null, seat: null, takeover: null, state: null,
     legal: EMPTY_LEGAL, net: { status: 'closed' }, selectedToken: null, resigned: false,
     autoJoin: null, focusMemo: null, lastRollAt: 0, lastAction: null, auctionKey: null, auctionBids: 0,
-    auctionHigh: 0, quickBidsAt: 0, tradeSeen: null, tradeDraft: null, tradeWith: null,
+    auctionHigh: 0, quickBidsAt: 0, tradeSeen: null, tradeDraft: null, tradeWith: null, sheetForTrade: false,
   });
   clearTimeout(app.armTimer);
   $('#bid-input').value = '';
@@ -500,7 +581,7 @@ function handleState(msg) {
     app.autoJoin = null;
     if (app.screen !== 'game') showScreen('game');
     if (!firstState && !document.hidden && events.some((e) => e.type === 'moved')) {
-      app.dialogAt = Date.now() + DIALOG_HOLD_MS;
+      app.dialogAt = Date.now() + (DIALOG_HOLD_MS[app.settings.speed] ?? DIALOG_HOLD_MS.normal);
     }
     const myId = me()?.id;
     if (myId && events.some((e) => e.type === 'dice_rolled' && e.playerId === myId)) app.lastRollAt = Date.now();
@@ -582,6 +663,7 @@ function handleError(msg) {
     clearTabSeat(app.gameId);
     forgetSession(app.gameId);
     goHome();
+    sound('error');
     toast(`Game ${code} doesn't exist anymore.`, 'error');
     return;
   }
@@ -590,6 +672,7 @@ function handleError(msg) {
     // few seconds (the unattached socket is closed, net.js reconnects, same answer), so go home.
     const code = codeOf(app.gameId);
     goHome();
+    sound('error');
     toast(`Too many people are watching game ${code} right now — try again in a little while.`, 'error', 8000);
     return;
   }
@@ -597,6 +680,7 @@ function handleError(msg) {
     clearTabSeat(app.gameId);
     forgetSession(app.gameId, app.seat?.playerId);
     app.seat = null;
+    sound('error');
     toast('Your saved seat is no longer valid — you are watching as a visitor.', 'error');
     rerender();
     return;
@@ -622,6 +706,7 @@ function handleError(msg) {
   }
   // The engine's own wording is the most precise for trades ("Bob doesn't own Boardwalk.").
   const text = TRADE_ACTIONS.has(last) && msg.message ? msg.message : ERROR_TEXT[msg.code] ?? msg.message;
+  sound('error');
   toast(text ?? msg.code ?? 'Something went wrong.', 'error');
   rerender();
 }
@@ -646,6 +731,7 @@ function handleStatus(status) {
   app.net = status;
   const replaced = status.status === 'replaced';
   $('#replaced-banner').hidden = !replaced;
+  updateSafeArea(); // the banner sits under the header, over the 3D board
   // Another tab has this seat now. Mark it so that reloading this stale tab doesn't quietly take
   // the seat back (it offers "Take over" instead); "Use here" takes it back on purpose.
   if (replaced && app.gameId && app.seat) setTabSeat(app.gameId, { ...app.seat, replaced: true });
@@ -693,6 +779,7 @@ function act(type, payload = {}) {
   if (!app.conn || app.busy) return false;
   const seq = SEQ_FREE.has(type) ? undefined : app.state?.seq;
   if (!app.conn.send({ type, ...payload }, seq)) {
+    sound('error');
     toast('Not connected right now — please wait a moment.', 'error');
     return false;
   }
@@ -748,12 +835,27 @@ function tick() {
     if (bar.style.width !== width) bar.style.width = width;
     bar.parentElement.classList.toggle('urgent', !!deadline && leftMs <= 3000);
   }
+  auctionTick(deadline, leftMs);
   const offline = document.querySelector('[data-offline-in]');
   if (offline && deadline && offline.textContent !== clock) offline.textContent = clock;
   const retry = document.querySelector('[data-retry-in]');
   if (retry && app.net.retryAt) {
     retry.textContent = `${Math.max(0, Math.ceil((app.net.retryAt - Date.now()) / 1000))}s`;
   }
+}
+
+/** The last AUCTION_TICK_SECONDS of an auction I'm still bidding in tick (sfx), once a second. */
+function auctionTick(deadline, leftMs) {
+  const s = app.state;
+  const a = s?.status === 'active' && s.turn.phase === 'auction' ? s.auction : null;
+  const m = me();
+  const bidding = !!a && !!m && !m.bankrupt && a.participants.includes(m.id) && !a.passed.includes(m.id);
+  const sec = Math.ceil(leftMs / 1000);
+  if (!bidding || !deadline || sec < 1 || sec > AUCTION_TICK_SECONDS) return;
+  const key = `${deadline}:${sec}`; // a new bid restarts the clock: its last seconds tick again
+  if (app.tickKey === key) return;
+  app.tickKey = key;
+  sound('tick', { rate: sec === 1 ? 1.25 : 1 });
 }
 
 // ---------------------------------------------------------------------------
@@ -997,6 +1099,10 @@ function joinLobby(event) {
 function renderGame() {
   syncTradeDraft();
   syncTradeSeen();
+  if (app.sheetForTrade && !app.tradeDraft) {
+    app.sheetForTrade = false;
+    if (in3dLayout() && SHEET.matches) setPanelOpen(false, { quiet: true });
+  }
   renderBanner();
   renderAuction();
   renderActions();
@@ -1006,6 +1112,7 @@ function renderGame() {
   renderFooter();
   renderDialog();
   tick();
+  updateSafeArea(); // a folded bottom sheet grows and shrinks with what it shows
 }
 
 function renderBanner() {
@@ -1316,13 +1423,19 @@ function revealAuctionControls() {
   if (!NARROW.matches || !(can('BID') || can('PASS_AUCTION'))) return;
   const sheet = $('#auction-sheet');
   const controls = $('#auction-pass').firstElementChild ?? $('#auction-controls');
+  if (in3dLayout()) {
+    // The page doesn't scroll in the 3D layout: the floating panel / bottom sheet does.
+    const behavior = document.hidden || REDUCED_MOTION.matches ? 'auto' : 'smooth';
+    controls.scrollIntoView({ block: 'nearest', behavior });
+    return;
+  }
   const top = parseFloat(getComputedStyle(sheet).scrollMarginTop) || 0;
   const box = controls.getBoundingClientRect();
   if (box.top >= top && box.bottom <= window.innerHeight) return;
   // The whole sheet if it fits under the top bar, else just enough to show the controls at the bottom.
   const fits = sheet.getBoundingClientRect().height + top <= window.innerHeight;
   // A hidden tab doesn't animate (a smooth scroll would never happen): jump, so it's there on return.
-  const behavior = document.hidden || window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth';
+  const behavior = document.hidden || REDUCED_MOTION.matches ? 'auto' : 'smooth';
   if (fits) sheet.scrollIntoView({ block: 'start', behavior });
   else controls.scrollIntoView({ block: 'end', behavior });
 }
@@ -1405,13 +1518,19 @@ function openTradeBuilder() {
   const to = targets.includes(app.tradeWith) ? app.tradeWith : targets[0];
   app.tradeDraft = { to, give: emptyTradeSide(), get: emptyTradeSide() };
   app.dismissed.delete('trade-build');
+  // 3D on phones: the builder needs the whole sheet (folded again when it closes, see renderGame).
+  if (in3dLayout() && SHEET.matches && !panelOpen()) {
+    setPanelOpen(true, { quiet: true });
+    app.sheetForTrade = true;
+  }
   renderGame();
   // Phones: the builder opens above the action bar, which may be further down the page.
-  if (NARROW.matches) $('#panel-dialog').scrollIntoView({ block: 'start', behavior: 'smooth' });
+  if (NARROW.matches) $('#panel-dialog').scrollIntoView({ block: 'start', behavior: REDUCED_MOTION.matches ? 'auto' : 'smooth' });
 }
 
 function closeTradeBuilder() {
   app.tradeDraft = null;
+  sound('close');
   rerender();
 }
 
@@ -1878,8 +1997,13 @@ function renderDialog() {
   dialog.after?.(box); // e.g. put the trade builder's typed values back
   box.querySelectorAll(scrollers).forEach((e, k) => { if (scrolled[k]) e.scrollTop = scrolled[k]; });
   // Only a newly opened dialog pops in; updates to the one on screen (cash, buttons) don't.
-  if (alreadyShown) box.firstElementChild?.classList.add('shown');
-  else focusNewDialog(box, narrow, dialog.focus);
+  if (alreadyShown) {
+    box.firstElementChild?.classList.add('shown');
+  } else {
+    focusNewDialog(box, narrow, dialog.focus);
+    // Trade offers have their own sound (announce), the game's end the board's fanfare.
+    if (!/^(trade-in|trade-out|game-over)/.test(dialog.key)) sound('open', { volume: 0.7 });
+  }
 }
 
 // Keyboard users continue in a new dialog: if focus was lost to a re-render (after Roll) or is in
@@ -2131,6 +2255,7 @@ function announce(events, prevTrade = null) {
     if (announceDeal(ev, s, myId, name, prevTrade, gone)) continue;
     switch (ev.type) {
       case 'turn_started':
+        if (mine) sound('notify');
         if (mine && !document.hasFocus()) toast("🎲 It's your turn!", 'info', 2500);
         break;
       case 'passed_go':
@@ -2220,7 +2345,10 @@ function announceDeal(ev, s, myId, name, prevTrade, gone) {
       toast(`🔨 No sale — ${tileName(ev.tileIndex)} stays with the bank`, 'info');
       return true;
     case 'trade_proposed':
-      if (ev.toPlayerId === myId) toast(`🤝 ${name(ev.fromPlayerId)} offered you a trade`, 'card', 5000);
+      if (ev.toPlayerId === myId) {
+        sound('offer');
+        toast(`🤝 ${name(ev.fromPlayerId)} offered you a trade`, 'card', 5000);
+      }
       return true;
     case 'trade_accepted': {
       const fee = myId ? ev.fees?.[myId] ?? 0 : 0;
@@ -2248,6 +2376,420 @@ function announceDeal(ev, s, myId, name, prevTrade, gone) {
     default:
       return false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Settings popover (the header's gear): sound (sfx.js keeps it in localStorage "monopoly.audio"),
+// board view (renderer-switch keeps it in "monopoly.renderer"), and the board options below, kept
+// in KEY_SETTINGS and passed to the renderers through renderer-switch's setOptions.
+// ---------------------------------------------------------------------------
+
+/** fn(), or `fallback` if it throws (sfx.js is written separately and must never break the UI). */
+function attempt(fn, fallback) {
+  try {
+    return fn();
+  } catch {
+    return fallback;
+  }
+}
+
+function loadSettings() {
+  const saved = readJson('localStorage', KEY_SETTINGS, {});
+  const settings = {};
+  for (const [key, { choices }] of Object.entries(SETTINGS)) {
+    settings[key] = choices.includes(saved?.[key]) ? saved[key] : choices[0];
+  }
+  return settings;
+}
+
+function saveSettings() {
+  const saved = readJson('localStorage', KEY_SETTINGS, {});
+  writeJson('localStorage', KEY_SETTINGS, { ...(saved && typeof saved === 'object' ? saved : {}), ...app.settings });
+}
+
+/** Brings every control in the settings popover in line with the current settings. */
+function renderSettings() {
+  if (!app.settings) return; // before boot
+  const on = !!sfx && attempt(() => sfx.isEnabled(), false);
+  const soundBox = $('#opt-sound');
+  soundBox.checked = on;
+  soundBox.disabled = !sfx;
+  const range = $('#opt-volume');
+  range.value = String(Math.round(attempt(() => sfx.getVolume(), 0.7) * 100));
+  range.disabled = !on;
+  $('#opt-volume-out').textContent = `${range.value}%`;
+  const music = $('#opt-music');
+  music.checked = !!sfx && attempt(() => sfx.isMusicOn(), false);
+  music.disabled = !on;
+  $('#opt-sound-note').hidden = !sfxFailed;
+  for (const [key, { hints }] of Object.entries(SETTINGS)) {
+    for (const input of document.querySelectorAll(`input[name="opt-${key}"]`)) input.checked = input.value === app.settings[key];
+    setHint(key, hints[app.settings[key]]);
+  }
+  renderViewControls();
+  renderFullscreen();
+}
+
+function setHint(key, text) {
+  const el = document.querySelector(`#settings [data-hint="${key}"]`);
+  if (el && el.textContent !== text) el.textContent = text;
+}
+
+function openSettings() {
+  const pop = $('#settings');
+  probe3d(); // the Board choice says whether 3D can run here
+  renderSettings();
+  pop.hidden = false;
+  $('#settings-btn').setAttribute('aria-expanded', 'true');
+  sound('open');
+  pop.querySelector('input:not(:disabled)')?.focus({ preventScroll: true });
+}
+
+/** `refocus`: put keyboard focus back on the gear (Esc, ×) — not when closed by clicking elsewhere. */
+function closeSettings({ refocus = true } = {}) {
+  const pop = $('#settings');
+  if (pop.hidden) return;
+  pop.hidden = true;
+  $('#settings-btn').setAttribute('aria-expanded', 'false');
+  sound('close');
+  if (refocus) $('#settings-btn').focus({ preventScroll: true });
+}
+
+/** A settings control changed (a change event from inside #settings). */
+function onSettingChange(el) {
+  if (el.id === 'opt-sound') {
+    attempt(() => {
+      sfx.setEnabled(el.checked);
+      if (el.checked) sfx.unlock();
+    });
+    sound('toggle'); // only audible when switched on
+  } else if (el.id === 'opt-music') {
+    attempt(() => {
+      sfx.unlock();
+      sfx.setMusic(el.checked);
+    });
+    sound('toggle');
+  } else if (el.id === 'opt-volume') {
+    sound('click'); // hear the new level
+  } else if (el.name === 'opt-board') {
+    chooseBoardView(el.value);
+  } else if (el.name?.startsWith('opt-')) {
+    const key = el.name.slice(4);
+    if (!SETTINGS[key]?.choices.includes(el.value)) return;
+    app.settings = { ...app.settings, [key]: el.value };
+    saveSettings();
+    setBoardOptions({ ...app.settings });
+    sound('toggle');
+  }
+  renderSettings();
+}
+
+/** 2D or 3D board, from the header pill or the settings. 3D without WebGL2 just says so. */
+function chooseBoardView(mode) {
+  if (mode === '3d' && !probe3d()) {
+    sound('error');
+    toast("3D isn't available in this browser — it needs WebGL2.", 'error');
+    renderViewControls();
+    return;
+  }
+  if (mode !== boardMode()) sound('toggle');
+  setBoardMode(mode); // also retries a 3D board that failed or was paused
+}
+
+/** The header's 2D|3D pill and the settings' Board choice, from renderer-switch's status. */
+function renderViewControls(status = boardStatus()) {
+  const trouble = !status.loading && !status.unsupported && (!!status.paused || status.failed);
+  const title3d = status.unsupported
+    ? "3D isn't available in this browser (it needs WebGL2)"
+    : status.loading
+      ? 'Loading 3D…'
+      : status.paused === 'lost'
+        ? '3D paused (the graphics card reset) — click to try again'
+        : status.paused
+          ? "3D couldn't start on this device — click to try again"
+          : status.failed
+            ? '3D failed to load — click to try again'
+            : '3D board';
+  for (const b of document.querySelectorAll('#view-pill button')) {
+    b.setAttribute('aria-pressed', String(b.dataset.key === status.mode));
+    if (b.dataset.key !== '3d') continue;
+    b.classList.toggle('is-loading', status.loading);
+    b.classList.toggle('is-paused', trouble);
+    b.setAttribute('aria-disabled', String(status.unsupported));
+    b.title = title3d;
+  }
+  for (const input of document.querySelectorAll('input[name="opt-board"]')) {
+    input.checked = input.value === status.mode;
+    if (input.value === '3d') input.disabled = status.unsupported;
+  }
+  let hint = status.mode === '3d' ? 'A 3D table that fills the window.' : 'The classic flat board.';
+  if (status.unsupported) hint = "3D needs WebGL2, which this browser doesn't have.";
+  else if (status.loading) hint = 'Loading the 3D board…';
+  else if (trouble) hint = `${title3d.replace(/ — click to try again$/, '')}. Choose 3D to try again.`;
+  setHint('board', hint);
+}
+
+// ---- full screen ----------------------------------------------------------------------------------
+
+const fullscreenElement = () => document.fullscreenElement ?? document.webkitFullscreenElement ?? null;
+
+/** False e.g. on iPhone Safari, which only lets videos go full screen: the buttons stay hidden. */
+function fullscreenSupported() {
+  const root = document.documentElement;
+  return !!(document.fullscreenEnabled || document.webkitFullscreenEnabled)
+    && typeof (root.requestFullscreen ?? root.webkitRequestFullscreen) === 'function';
+}
+
+function toggleFullscreen() {
+  if (!fullscreenSupported()) return;
+  const failed = () => {
+    sound('error');
+    toast("Couldn't switch to full screen here.", 'error');
+  };
+  try {
+    let request;
+    if (fullscreenElement()) {
+      sound('close');
+      request = (document.exitFullscreen ?? document.webkitExitFullscreen).call(document);
+    } else {
+      sound('open');
+      const root = document.documentElement;
+      request = (root.requestFullscreen ?? root.webkitRequestFullscreen).call(root, { navigationUI: 'hide' });
+    }
+    Promise.resolve(request).catch(failed);
+  } catch {
+    failed();
+  }
+}
+
+function renderFullscreen() {
+  const supported = fullscreenSupported();
+  const on = !!fullscreenElement();
+  for (const b of document.querySelectorAll('[data-fullscreen]')) {
+    b.hidden = !supported;
+    b.classList.toggle('is-on', on);
+    if (b.classList.contains('icon-btn')) {
+      b.setAttribute('aria-pressed', String(on));
+      b.title = on ? 'Exit full screen' : 'Full screen';
+    } else {
+      b.textContent = on ? 'Exit full screen' : 'Full screen';
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The full-screen 3D layout (body.board-3d, style.css): #board fills the window behind a
+// translucent header; the side panel floats on the right (a bottom sheet under 900px held upright)
+// and folds down to the turn banner and the action buttons. The safe area — how much of the board
+// the header / panel / sheet cover — is kept in #board.dataset.safeTop / safeRight / safeBottom /
+// safeLeft (CSS px, as strings) and in --safe-* on <body> (for the dialogs and toasts); every
+// change fires a 'monopoly:safearea' window event. All zero outside the 3D layout.
+// ---------------------------------------------------------------------------
+
+const in3dLayout = () => document.body.classList.contains('board-3d');
+const panelLayout = () => (SHEET.matches ? 'sheet' : 'side');
+const panelOpen = () => app.panelOpen[panelLayout()];
+
+/** 3D board + game screen = the 3D layout. Runs on screen changes and before a board mode switch. */
+function syncBoardLayout() {
+  const on = app.screen === 'game' && boardMode() === '3d';
+  if (in3dLayout() !== on) {
+    document.body.classList.toggle('board-3d', on);
+    if (on) window.scrollTo(0, 0); // a phone may have been scrolled down to the 2D panel
+  }
+  applyPanelState();
+  updateSafeArea();
+}
+
+/** Folds (false) or unfolds (true) the 3D panel / sheet. Not remembered past this page. */
+function setPanelOpen(open, { quiet = false } = {}) {
+  const layout = panelLayout();
+  if (app.panelOpen[layout] !== open) {
+    app.panelOpen[layout] = open;
+    if (!quiet) {
+      sound(open ? 'open' : 'close');
+      app.sheetForTrade = false; // folded or unfolded by hand: it stays that way
+    }
+    // Keyboard focus in the part that folds away moves to the control that folded it.
+    if (!open && $('#panel-more').contains(document.activeElement)) {
+      $(layout === 'sheet' ? '#sheet-handle' : '#panel-toggle').focus({ preventScroll: true });
+    }
+  }
+  applyPanelState();
+  updateSafeArea();
+}
+
+function applyPanelState() {
+  const folded = in3dLayout() && !panelOpen();
+  $('#game-panel').classList.toggle('is-folded', folded);
+  const label = folded ? 'Show players and properties' : 'Hide players and properties';
+  for (const b of [$('#panel-toggle'), $('#sheet-handle')]) b.setAttribute('aria-expanded', String(!folded));
+  $('#sheet-handle').setAttribute('aria-label', label);
+  $('#panel-toggle').title = label;
+}
+
+/** A fixed element's box in window px, ignoring transforms (so entrance animations don't count). */
+function layoutBox(el) {
+  const top = el.offsetTop;
+  const left = el.offsetLeft;
+  return { top, left, bottom: top + el.offsetHeight, right: left + el.offsetWidth };
+}
+
+/** How much of #board (px from each edge) the header, the replaced banner and the panel cover. */
+function measureSafeArea() {
+  const board = $('#board');
+  const b = layoutBox(board);
+  const W = board.offsetWidth;
+  const H = board.offsetHeight;
+  let top = 0;
+  let right = 0;
+  let bottom = 0;
+  for (const el of [$('.topbar'), $('#replaced-banner')]) {
+    if (el.offsetHeight) top = Math.max(top, layoutBox(el).bottom - b.top);
+  }
+  const panel = $('#game-panel');
+  if (panel.offsetHeight) {
+    const p = layoutBox(panel);
+    if (SHEET.matches) {
+      bottom = b.bottom - p.top;
+    } else {
+      // A card on the right: the board goes beside it — or, when the card is folded short, under
+      // it, if that leaves the board more room (a wide board in a squarish window). The other
+      // choice must be clearly better before the board moves (the card's height changes with
+      // what it shows).
+      const room = ({ top: t, right: r }) => Math.min((W - r) / BOARD_VIEW_ASPECT, H - t);
+      const beside = { top, right: b.right - p.left };
+      const under = { top: Math.max(top, p.bottom - b.top), right: 0 };
+      app.safeUnder = app.safeUnder
+        ? room(under) * SAFE_SWITCH_MARGIN >= room(beside)
+        : room(under) >= room(beside) * SAFE_SWITCH_MARGIN;
+      ({ top, right } = app.safeUnder ? under : beside);
+    }
+  }
+  const clamp = (v, max) => Math.round(Math.min(Math.max(v, 0), max));
+  return { top: clamp(top, H), right: clamp(right, W), bottom: clamp(bottom, H), left: 0 };
+}
+
+/** Recomputes the safe area; writes it and fires 'monopoly:safearea' only when it changed. */
+function updateSafeArea() {
+  const board = $('#board');
+  if (!board) return;
+  const area = in3dLayout() ? measureSafeArea() : { top: 0, right: 0, bottom: 0, left: 0 };
+  const key = `${area.top},${area.right},${area.bottom},${area.left}`;
+  if (key === app.safe) return;
+  app.safe = key;
+  const style = document.body.style;
+  for (const [side, prop] of [['top', 'safeTop'], ['right', 'safeRight'], ['bottom', 'safeBottom'], ['left', 'safeLeft']]) {
+    board.dataset[prop] = String(area[side]);
+    style.setProperty(`--safe-${side}`, `${area[side]}px`);
+  }
+  window.dispatchEvent(new Event('monopoly:safearea'));
+}
+
+// ---- the bottom sheet's handle: tap to fold / unfold, or drag it to any height and let go ------------
+
+function onSheetPointerDown(event) {
+  if (!in3dLayout() || !SHEET.matches || event.button > 0) return;
+  const panel = $('#game-panel');
+  app.sheetDrag = { id: event.pointerId, y0: event.clientY, h0: panel.offsetHeight, moved: false, lastY: event.clientY, lastT: event.timeStamp, v: 0 };
+  attempt(() => event.currentTarget.setPointerCapture(event.pointerId));
+}
+
+function onSheetPointerMove(event) {
+  const d = app.sheetDrag;
+  if (!d || d.id !== event.pointerId) return;
+  const dy = event.clientY - d.y0;
+  if (!d.moved && Math.abs(dy) < 6) return; // still a tap
+  const panel = $('#game-panel');
+  if (!d.moved) {
+    d.moved = true;
+    panel.classList.add('is-dragging');
+    panel.classList.remove('is-folded'); // everything shows while the sheet is pulled
+  }
+  const height = Math.min(Math.max(d.h0 - dy, 64), Math.round(window.innerHeight * SHEET_MAX_SHARE));
+  panel.style.height = `${height}px`;
+  const dt = event.timeStamp - d.lastT;
+  if (dt > 0) d.v = (event.clientY - d.lastY) / dt; // px per ms, positive = downwards
+  d.lastY = event.clientY;
+  d.lastT = event.timeStamp;
+  updateSafeArea();
+}
+
+function onSheetPointerUp(event) {
+  const d = app.sheetDrag;
+  if (!d || d.id !== event.pointerId) return;
+  app.sheetDrag = null;
+  if (!d.moved) return; // a tap: the click that follows folds / unfolds
+  app.sheetClickBlock = Date.now() + 400; // …but not the click that ends a drag
+  const panel = $('#game-panel');
+  const share = panel.offsetHeight / (window.innerHeight * SHEET_MAX_SHARE);
+  panel.style.height = '';
+  panel.classList.remove('is-dragging');
+  let open = app.panelOpen.sheet;
+  if (event.type !== 'pointercancel') open = d.v < -0.35 || (d.v <= 0.35 && share >= 0.5); // a flick, else the nearer end
+  setPanelOpen(open); // also puts the fold back if it stays folded
+}
+
+function bootShell() {
+  app.settings = loadSettings();
+  setBoardOptions({ ...app.settings });
+  setBoardToggle(false); // the header pill and the settings replace the board's own 2D|3D toggle
+  onBoardModeChange(syncBoardLayout); // runs before the board is redrawn in the new mode
+  onBoardStatus(renderViewControls);
+
+  const settings = $('#settings');
+  settings.addEventListener('change', (event) => onSettingChange(event.target));
+  $('#opt-volume').addEventListener('input', (event) => {
+    attempt(() => sfx.setVolume(Number(event.target.value) / 100));
+    $('#opt-volume-out').textContent = `${event.target.value}%`;
+  });
+  settings.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    event.stopPropagation(); // Esc here closes the settings; it doesn't also skip the 3D animation
+    closeSettings();
+  });
+  // Clicking anywhere else closes the settings (the gear's own click toggles them).
+  document.addEventListener('pointerdown', (event) => {
+    if (!settings.hidden && !settings.contains(event.target) && !event.target.closest?.('#settings-btn')) {
+      closeSettings({ refocus: false });
+    }
+  }, true);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !settings.hidden) closeSettings({ refocus: false });
+  });
+  // WebGL2 is only probed once someone shows interest in 3D.
+  const want3d = document.querySelector('#view-pill [data-key="3d"]');
+  want3d.addEventListener('pointerenter', () => probe3d());
+  want3d.addEventListener('focus', () => probe3d());
+
+  const handle = $('#sheet-handle');
+  handle.addEventListener('pointerdown', onSheetPointerDown);
+  handle.addEventListener('pointermove', onSheetPointerMove);
+  handle.addEventListener('pointerup', onSheetPointerUp);
+  handle.addEventListener('pointercancel', onSheetPointerUp);
+
+  const onViewport = () => {
+    applyPanelState();
+    updateSafeArea();
+  };
+  window.addEventListener('resize', onViewport);
+  window.addEventListener('orientationchange', onViewport);
+  window.visualViewport?.addEventListener('resize', onViewport);
+  SHEET.addEventListener('change', onViewport);
+  for (const type of ['fullscreenchange', 'webkitfullscreenchange']) {
+    document.addEventListener(type, () => {
+      renderFullscreen();
+      onViewport();
+    });
+  }
+  // Anything else that changes the size of what floats over the board (a player's holdings opened
+  // in the sheet, the "opened in another tab" banner, the header wrapping).
+  if (typeof ResizeObserver === 'function') {
+    const ro = new ResizeObserver(() => updateSafeArea());
+    for (const el of [$('#game-panel'), $('.topbar'), $('#replaced-banner')]) ro.observe(el);
+  }
+  renderSettings();
+  syncBoardLayout(); // also writes the (zero) safe area, so #board always has one
 }
 
 // ---------------------------------------------------------------------------
@@ -2337,6 +2879,7 @@ function onUiClick(el, event) {
         closeTradeBuilder(); // the builder has nothing in the side panel to fall back on
         break;
       }
+      sound('close');
       app.dismissed.add(el.dataset.key);
       renderDialog();
       break;
@@ -2362,6 +2905,23 @@ function onUiClick(el, event) {
     case 'trade-send':
       sendTrade();
       break;
+    case 'board-view':
+      chooseBoardView(el.dataset.key);
+      break;
+    case 'settings':
+      if ($('#settings').hidden) openSettings();
+      else closeSettings({ refocus: false });
+      break;
+    case 'settings-close':
+      closeSettings();
+      break;
+    case 'fullscreen':
+      toggleFullscreen();
+      break;
+    case 'panel-toggle':
+      if (Date.now() < app.sheetClickBlock) break; // the end of a drag on the sheet's handle, not a tap
+      setPanelOpen(!panelOpen());
+      break;
     default:
       break;
   }
@@ -2378,6 +2938,7 @@ function onKeyDown(event) {
   const type = keyboardAction();
   if (!type || !ready()) return;
   event.preventDefault();
+  sound('click');
   act(type);
 }
 
@@ -2413,8 +2974,10 @@ function boot() {
   document.addEventListener('change', onTradeField);
 
   document.addEventListener('click', (event) => {
+    if (event.target.closest?.('summary') && !event.target.closest('#board')) sound('toggle', { volume: 0.5 });
     const el = event.target.closest('[data-act], [data-ui]');
     if (!el || el.disabled || el.closest('#board')) return; // #board belongs to the renderer
+    if (!OWN_SOUND_UI.has(el.dataset.ui)) sound('click');
     if (el.dataset.act) {
       // A mouse or touch click (detail > 0) must not leave focus on the button, or on the control
       // setHtmlKeepFocus moves it to (Unmortgage → Mortgage): Space/Enter would then press that
@@ -2442,6 +3005,7 @@ function boot() {
     rerender();
   });
   setInterval(tick, 250);
+  bootShell();
 
   const param = new URLSearchParams(location.search).get('game');
   if (param) {

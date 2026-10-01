@@ -7,3 +7,7 @@ export * from '../vendor/three/three.module.js';
 export { OrbitControls } from '../vendor/three/addons/OrbitControls.js';
 export { RoundedBoxGeometry } from '../vendor/three/addons/RoundedBoxGeometry.js';
 export { RoomEnvironment } from '../vendor/three/addons/RoomEnvironment.js';
+// Postprocessing (used only on the 'high' quality tier: tilt-shift + soft bloom, see world-post.js).
+export { FullScreenQuad } from '../vendor/three/addons/Pass.js';
+export { OutputPass } from '../vendor/three/addons/OutputPass.js';
+export { UnrealBloomPass } from '../vendor/three/addons/UnrealBloomPass.js';

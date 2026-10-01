@@ -20,7 +20,81 @@
       <span id="conn-status" class="conn" aria-live="polite"></span>
       <button type="button" class="btn ghost small" data-ui="home">Home</button>
     </div>
+    <div class="topbar-tools">
+      <!-- Game screen: the board view (the settings have it too) -->
+      <div id="view-pill" class="view-pill" role="group" aria-label="Board view" hidden>
+        <button type="button" data-ui="board-view" data-key="2d" aria-pressed="true" title="Classic 2D board">2D</button>
+        <button type="button" data-ui="board-view" data-key="3d" aria-pressed="false" title="3D board">3D</button>
+      </div>
+      <button type="button" id="settings-btn" class="icon-btn" data-ui="settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="settings" aria-label="Settings" title="Settings">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor">
+          <circle cx="12" cy="12" r="6.2" stroke-width="2"/>
+          <circle cx="12" cy="12" r="2.4" stroke-width="2"/>
+          <path stroke-width="3.2" d="M12 2.6v3.2M12 18.2v3.2M2.6 12h3.2M18.2 12h3.2M5.35 5.35l2.26 2.26M16.39 16.39l2.26 2.26M5.35 18.65l2.26-2.26M16.39 7.61l2.26-2.26"/>
+        </svg>
+      </button>
+      <!-- Hidden where the Fullscreen API is missing (e.g. iPhone Safari) -->
+      <button type="button" class="icon-btn fs-btn" data-ui="fullscreen" data-fullscreen aria-pressed="false" aria-label="Full screen" title="Full screen" hidden>
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path class="fs-enter" d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/>
+          <path class="fs-exit" d="M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5"/>
+        </svg>
+      </button>
+    </div>
   </header>
+
+  <!-- Settings (the header's gear): sound, board view, animation speed, 3D camera and graphics.
+       Saved in localStorage "monopoly.settings" (sound: "monopoly.audio" via sfx.js). -->
+  <div id="settings" class="settings-pop" role="dialog" aria-labelledby="settings-title" hidden>
+    <div class="sp-head">
+      <h2 id="settings-title">Settings</h2>
+      <button type="button" class="sp-x" data-ui="settings-close" aria-label="Close settings" title="Close">×</button>
+    </div>
+    <fieldset class="sp-group">
+      <legend>Sound</legend>
+      <label class="sp-switch"><span>Sound effects</span><input id="opt-sound" type="checkbox" role="switch"></label>
+      <label class="sp-range"><span>Volume</span><input id="opt-volume" type="range" min="0" max="100" step="5"><output id="opt-volume-out" for="opt-volume"></output></label>
+      <label class="sp-switch"><span>Music</span><input id="opt-music" type="checkbox" role="switch"></label>
+      <p id="opt-sound-note" class="hint" hidden>Sound isn't available in this browser.</p>
+    </fieldset>
+    <fieldset class="sp-group">
+      <legend>Board</legend>
+      <div class="seg">
+        <label><input type="radio" name="opt-board" value="2d"><span>2D</span></label>
+        <label><input type="radio" name="opt-board" value="3d"><span>3D</span></label>
+      </div>
+      <p class="hint" data-hint="board"></p>
+    </fieldset>
+    <fieldset class="sp-group">
+      <legend>Animation speed</legend>
+      <div class="seg">
+        <label><input type="radio" name="opt-speed" value="normal"><span>Normal</span></label>
+        <label><input type="radio" name="opt-speed" value="fast"><span>Fast</span></label>
+        <label><input type="radio" name="opt-speed" value="instant"><span>Instant</span></label>
+      </div>
+      <p class="hint" data-hint="speed"></p>
+    </fieldset>
+    <fieldset class="sp-group">
+      <legend>3D camera</legend>
+      <div class="seg">
+        <label><input type="radio" name="opt-camera" value="cinematic"><span>Cinematic</span></label>
+        <label><input type="radio" name="opt-camera" value="calm"><span>Calm</span></label>
+        <label><input type="radio" name="opt-camera" value="free"><span>Free</span></label>
+      </div>
+      <p class="hint" data-hint="camera"></p>
+    </fieldset>
+    <fieldset class="sp-group">
+      <legend>3D graphics</legend>
+      <div class="seg">
+        <label><input type="radio" name="opt-quality" value="auto"><span>Auto</span></label>
+        <label><input type="radio" name="opt-quality" value="low"><span>Low</span></label>
+        <label><input type="radio" name="opt-quality" value="medium"><span>Medium</span></label>
+        <label><input type="radio" name="opt-quality" value="high"><span>High</span></label>
+      </div>
+      <p class="hint" data-hint="quality"></p>
+    </fieldset>
+    <button type="button" class="btn block" data-ui="fullscreen" data-fullscreen hidden>Full screen</button>
+  </div>
 
   <div id="replaced-banner" class="replaced" role="alert" hidden>
     <span>Opened in another tab</span>
@@ -156,14 +230,17 @@
       </div>
     </section>
 
-    <!-- Game table: board (renderer2d.js) + side panel (ui.js) -->
+    <!-- Game table: board (renderer-switch.js: 2D or 3D) + side panel (ui.js). With the 3D board the
+         board fills the window and the panel floats over it (style.css, body.board-3d). -->
     <section id="screen-game" class="screen screen-game" hidden>
       <div class="game-layout">
         <div class="board-wrap">
           <div id="board"></div>
           <div id="dialog-layer" class="dialog-layer"></div>
         </div>
-        <aside class="panel" aria-label="Game panel">
+        <aside id="game-panel" class="panel" aria-label="Game panel">
+          <!-- 3D on phones (bottom sheet): tap or drag to show / hide the players and properties -->
+          <button type="button" id="sheet-handle" class="sheet-handle" data-ui="panel-toggle" aria-controls="panel-more" aria-expanded="true" aria-label="Hide players and properties"><i aria-hidden="true"></i></button>
           <div id="turn-banner"></div>
           <!-- While a property is auctioned: for everyone at the table, on every layout -->
           <section id="auction-sheet" class="auction-sheet" aria-labelledby="auction-title" hidden>
@@ -188,15 +265,22 @@
           <div id="action-bar" class="action-bar"></div>
           <!-- Narrow layouts: the latest log lines (the board's own log is tiny there) -->
           <ol id="recent-log" class="recent-log" aria-label="Recent events"></ol>
-          <section class="panel-section">
-            <h2 class="section-title">Players</h2>
-            <ul id="game-players" class="plist"></ul>
-          </section>
-          <section id="props-section" class="panel-section">
-            <h2 class="section-title">My properties</h2>
-            <div id="my-props"></div>
-          </section>
-          <div id="panel-footer" class="panel-footer"></div>
+          <!-- 3D, wide layouts: the floating panel folds down to the banner and the buttons above -->
+          <button type="button" id="panel-toggle" class="panel-toggle" data-ui="panel-toggle" aria-controls="panel-more" aria-expanded="true">
+            <span class="panel-toggle-text">Players &amp; properties</span><i class="panel-toggle-chev" aria-hidden="true"></i>
+          </button>
+          <!-- display: contents outside the 3D layout, so the 2D panel's grid is unchanged -->
+          <div id="panel-more" class="panel-more">
+            <section class="panel-section">
+              <h2 class="section-title">Players</h2>
+              <ul id="game-players" class="plist"></ul>
+            </section>
+            <section id="props-section" class="panel-section">
+              <h2 class="section-title">My properties</h2>
+              <div id="my-props"></div>
+            </section>
+            <div id="panel-footer" class="panel-footer"></div>
+          </div>
         </aside>
       </div>
     </section>

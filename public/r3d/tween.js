@@ -7,6 +7,9 @@
 //   * finishAll() runs every pending item to its end, in schedule order, right now ("skip").
 //   * A timer backstop finishes everything if frames stop arriving (hidden tab, occluded webview),
 //     so the board can never get stuck mid-animation.
+//   * `rate` scales animation time against real time (the "fast" speed setting, and catching up
+//     when newer states queue behind the running batch). Delays and durations stay in animation
+//     seconds; real seconds = animation seconds / rate.
 
 export const ease = {
   linear: (t) => t,
@@ -50,13 +53,26 @@ export class Animator {
     this.lastStepAt = 0;
     this.backstop = null;
     this.finishing = false;
+    this._rate = 1;
   }
 
   get busy() {
     return this.items.length > 0;
   }
 
-  /** Seconds until the last scheduled item ends. */
+  /** Animation seconds per real second (1 = normal). */
+  get rate() {
+    return this._rate;
+  }
+
+  set rate(r) {
+    const next = Number.isFinite(r) && r > 0 ? r : 1;
+    if (next === this._rate) return;
+    this._rate = next;
+    if (this.items.length && !this.finishing) this.armBackstop(); // its deadline is in real time
+  }
+
+  /** Animation seconds until the last scheduled item ends (real seconds: divide by `rate`). */
   get remaining() {
     let end = 0;
     for (const it of this.items) end = Math.max(end, it.at + it.duration - this.time);
@@ -87,10 +103,10 @@ export class Animator {
     return this.add({ delay, start: fn });
   }
 
-  /** Advances time by dt seconds. Returns true while items remain. */
+  /** Advances time by dt real seconds (× rate). Returns true while items remain. */
   step(dt) {
     this.lastStepAt = performance.now();
-    this.time += dt;
+    this.time += dt * this._rate;
     const list = this.items.slice();
     for (const it of list) this.advance(it, this.time);
     this.items = this.items.filter((it) => !it.done);
@@ -132,22 +148,7 @@ export class Animator {
     return true;
   }
 
-  /**
-   * Speeds up everything scheduled by `factor` from now on (a newer state arrived mid-animation:
-   * play the rest quickly instead of snapping). Running items keep their progress.
-   */
-  compress(factor) {
-    if (!(factor > 1) || !this.items.length) return;
-    const now = this.time;
-    for (const it of this.items) {
-      it.at = now + (it.at - now) / factor;
-      it.duration /= factor;
-    }
-    this.items.sort((a, b) => a.at - b.at);
-    this.armBackstop();
-  }
-
-  /** Seconds until `item` starts (0 if it already ran or is unknown). */
+  /** Animation seconds until `item` starts (0 if it already ran or is unknown). */
   until(item) {
     return item && !item.done && this.items.includes(item) ? Math.max(0, item.at - this.time) : 0;
   }
@@ -160,7 +161,7 @@ export class Animator {
 
   armBackstop() {
     this.disarm();
-    const ms = this.remaining * 1000 + BACKSTOP_SLACK_MS;
+    const ms = (this.remaining / this._rate) * 1000 + BACKSTOP_SLACK_MS;
     this.backstop = setTimeout(() => {
       this.backstop = null;
       if (!this.items.length) return;

@@ -1,7 +1,7 @@
 // public/renderer2d.js — the 2D board renderer.
 //
 // Contract (docs/CONTRACT.md §8):
-//   * exports render(state, events, myPlayerId) and dispose()
+//   * exports render(state, events, myPlayerId), dispose() and setOptions({ speed })
 //   * owns every DOM node inside <div id="board"> while it is the active renderer
 //   * loads the board itself (GET /api/board) and injects its own stylesheet (/renderer2d.css)
 // renderer-switch.js hands #board to this module or to renderer3d.js; all knowledge of how the 2D
@@ -9,15 +9,39 @@
 //
 // Model: the static board (40 tiles + centre panel) is built once. Every render() diffs the public
 // state against what is on screen and touches only what changed. State is the truth; events only
-// drive short presentation effects (token hops, dice tumble, card popup).
+// drive short presentation effects (token hops, dice tumble, card popup) and the sounds that go
+// with them (sfx.js; interface sounds are ui.js's).
 
 const PALETTE = ['#e74c3c', '#3498db', '#2ecc71', '#f1c40f', '#9b59b6', '#e67e22', '#1abc9c', '#e84393'];
 
-const HOP_MS = 110; // one square of a dice walk
-const TELEPORT_MS = 450; // direct moves: cards, jail, settling, shuffling within a tile
-const DICE_MS = 520; // dice tumble
-const CARD_MS = 4000; // how long a drawn card stays up
+// Animation timings (ms) per speed setting — setOptions({ speed }): 'fast' halves them, 'instant'
+// skips hops, tumbles and glides altogether (tokens snap into place; drawn cards still show).
+//   hop: one square of a dice walk · teleport: direct moves (cards, jail, settling, shuffling within
+//   a tile) · dice: the tumble · card: how long a drawn card stays up
+const TIMINGS = {
+  normal: { hop: 110, teleport: 450, dice: 520, card: 4000 },
+  fast: { hop: 55, teleport: 225, dice: 260, card: 2000 },
+  instant: { hop: 0, teleport: 0, dice: 0, card: 2000 },
+};
+let speed = 'normal';
+let timing = TIMINGS.normal;
 const LOG_LINES = 8;
+
+// Each token's voice: the pitch of its hops (sfx rate) and a signature sound as it sets off on a walk.
+const TOKEN_VOICES = {
+  car: { rate: 0.9, start: 'drive' },
+  dog: { rate: 1.18, start: 'bark' },
+  hat: { rate: 1.06, start: 'hatSpin' },
+  ship: { rate: 0.8, start: 'horn' },
+  boot: { rate: 0.86, start: 'stomp' },
+  cat: { rate: 1.24, start: 'purr' },
+  thimble: { rate: 1.34, start: 'clink' },
+  wheelbarrow: { rate: 1, start: 'squeak' },
+};
+// Without animation (instant speed, reduced motion) a batch plays only its most telling sound.
+const SUMMARY_ORDER = ['victory', 'bankrupt', 'jailSlam', 'passGo', 'hotel', 'cashRegister', 'sold', 'rent',
+  'tax', 'jailFree', 'build', 'demolish', 'stamp', 'unstamp', 'tradeAccept', 'tradeReject', 'tradePropose',
+  'auctionEnd', 'gavel', 'bid', 'coins', 'coin', 'doubles', 'cardFlip', 'land', 'diceBounce'];
 
 // Board geometry in "units": 1.5 per corner + 9 × 1 per edge tile = 12 per side.
 // These must match the grid tracks and sizes in renderer2d.css.
@@ -52,7 +76,12 @@ let lastSeq = null; // seq whose events have already been played
 let lastArgs = null; // [state, myPlayerId] of the latest render, for a late board load
 let boardRetry = null;
 let info = null; // tile info card (tap / click a tile): { card, index, ctx, sig }
+let sfx = { play() {} }; // sound effects: sfx.js once loaded, silent until then (or if it can't load)
 
+import('./sfx.js').then(
+  (mod) => { if (typeof mod?.sfx?.play === 'function') sfx = mod.sfx; },
+  (err) => console.warn('[renderer2d] sound effects unavailable:', err),
+);
 injectStylesheet();
 BOARD = await loadBoard();
 
@@ -71,6 +100,18 @@ export function render(state, events, myPlayerId) {
     // A rendering bug must never take the rest of the UI down with it.
     console.error('[renderer2d] render failed:', err);
   }
+}
+
+/**
+ * Renderer options (renderer-switch forwards ui.js's settings). Only `speed` matters in 2D:
+ * 'normal' | 'fast' (half the hop, glide, tumble and card times) | 'instant' (no animation).
+ * Takes effect from the next animation; unknown keys and values are ignored.
+ */
+export function setOptions(opts) {
+  const next = opts?.speed;
+  if (!Object.hasOwn(TIMINGS, next)) return;
+  speed = next;
+  timing = TIMINGS[next];
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +427,8 @@ function draw(state, events, me) {
   if (!state || typeof state !== 'object') return;
 
   if (state.id !== gameId) resetGame(state.id);
+  // The first render of a game (page load, reconnect, switching from 3D) shows it as it is: no sounds.
+  const fresh = lastSeq !== null;
   // Each engine action bumps seq; re-rendering the same seq must not replay its events.
   if (typeof state.seq === 'number') {
     if (state.seq === lastSeq) events = [];
@@ -399,6 +442,7 @@ function draw(state, events, me) {
     state,
     turn,
     events,
+    fresh,
     me,
     players,
     byId: new Map(players.map((p) => [p.id, p])),
@@ -419,6 +463,7 @@ function draw(state, events, me) {
   drawLog(ctx);
   drawWinner(ctx);
   queueCards(ctx);
+  playSounds(ctx);
 }
 
 /** Removes the board from #board and forgets the game on screen (renderer-switch calls this). */
@@ -672,7 +717,7 @@ function createToken(id) {
     order: 0, // index in state.players: stable slot order on shared tiles
     spot: makeSpot(0, false), // where the token is drawn right now
     visible: false,
-    dur: TELEPORT_MS, // transition length for its next left/top change
+    dur: timing.teleport, // transition length for its next left/top change
     instant: false, // next placement skips the transition
     timers: null, // pending walk steps, if walking
     final: null, // spotKey the running walk ends on
@@ -749,7 +794,7 @@ function drawTokens(ctx) {
       walk(t, mine, truth, delay);
     } else {
       t.spot = truth;
-      t.dur = TELEPORT_MS;
+      t.dur = timing.teleport;
     }
   }
   layoutTokens();
@@ -758,14 +803,14 @@ function drawTokens(ctx) {
 /** Let the dice land before a token starts walking. */
 function walkDelay(events) {
   const rolled = events.some((e) => e?.type === 'dice_rolled' && e.purpose !== 'utility');
-  return rolled ? Math.round(DICE_MS * 0.8) : 0;
+  return rolled ? Math.round(timing.dice * 0.8) : 0;
 }
 
 /** A dice move hops square by square; anything else (cards, jail) glides straight there. */
 const isHopMove = (m) => m.via === 'roll' && Number.isInteger(m.steps) && m.steps > 0 && m.steps < 40;
 
 /** How long walk() spends on one `moved` event (matches the step waits below). */
-const moveTime = (m) => (isHopMove(m) ? m.steps * HOP_MS : TELEPORT_MS + 120);
+const moveTime = (m) => (isHopMove(m) ? m.steps * timing.hop : timing.teleport + 120);
 
 /** Plays a player's moves: dice walks hop square by square, teleports glide; then settle on the truth. */
 function walk(t, moves, truth, delay) {
@@ -773,12 +818,12 @@ function walk(t, moves, truth, delay) {
   for (const m of moves) {
     if (isHopMove(m)) {
       const from = makeSpot(m.from, false).index;
-      for (let s = 1; s <= m.steps; s++) steps.push({ spot: makeSpot(from + s, false), dur: HOP_MS, wait: HOP_MS, hop: true });
+      for (let s = 1; s <= m.steps; s++) steps.push({ spot: makeSpot(from + s, false), dur: timing.hop, wait: timing.hop, hop: true });
     } else {
-      steps.push({ spot: makeSpot(m.to, m.via === 'jail'), dur: TELEPORT_MS, wait: moveTime(m) });
+      steps.push({ spot: makeSpot(m.to, m.via === 'jail'), dur: timing.teleport, wait: moveTime(m) });
     }
   }
-  steps.push({ spot: truth, dur: TELEPORT_MS, wait: TELEPORT_MS });
+  steps.push({ spot: truth, dur: timing.teleport, wait: timing.teleport });
 
   t.final = spotKey(truth);
   t.timers = [];
@@ -805,14 +850,14 @@ function stopWalk(t) {
   if (t.timers) t.timers.forEach(clearTimeout);
   t.timers = null;
   t.final = null;
-  t.dur = TELEPORT_MS;
+  t.dur = timing.teleport;
   dropClass(t.el, 'is-moving');
 }
 
 function hop(t) {
   t.inner.animate?.(
     [{ transform: 'none' }, { transform: 'translateY(-38%) scale(1.1)' }, { transform: 'none' }],
-    { duration: HOP_MS, easing: 'ease-out' },
+    { duration: timing.hop, easing: 'ease-out' },
   );
 }
 
@@ -855,10 +900,11 @@ function reducedMotion() {
   return window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
 }
 
-// No hops or tumbles in a background tab: its timers are throttled, so an animation would only
-// replay late when the player switches back. Tokens just jump to where they belong.
+// No hops or tumbles at the 'instant' speed, with reduced motion, or in a background tab (its timers
+// are throttled, so an animation would only replay late when the player switches back). Tokens
+// just jump to where they belong.
 function animate() {
-  return !reducedMotion() && !document.hidden;
+  return speed !== 'instant' && !reducedMotion() && !document.hidden;
 }
 
 // --- centre panel ------------------------------------------------------------
@@ -920,19 +966,21 @@ function tumble(target) {
   stopTumble();
   center.diceTarget = String(target);
   dropClass(center.doubles, 'is-on');
+  // The CSS tumble lasts as long as this speed's tumble (the stylesheet's 0.52 s is the normal one).
+  for (const die of [center.d1, center.d2]) die.style.animationDuration = `${timing.dice}ms`;
   void center.dice.offsetWidth; // restart the CSS tumble animation
   center.dice.classList.add('is-rolling');
   const started = performance.now();
   const face = () => 1 + Math.floor(Math.random() * 6);
   center.diceTimer = setInterval(() => {
-    if (performance.now() - started >= DICE_MS) {
+    if (performance.now() - started >= timing.dice) {
       stopTumble();
       showRoll(target);
       return;
     }
     center.d1.dataset.v = face();
     center.d2.dataset.v = face();
-  }, 70);
+  }, Math.max(35, Math.round(timing.dice / 7.5)));
 }
 
 function stopTumble() {
@@ -1018,7 +1066,8 @@ function queueCards(ctx) {
   ctx.events.forEach((e, k) => {
     if (e?.type !== 'card_drawn') return;
     const who = e.playerId === ctx.me ? 'You' : ctx.byId.get(e.playerId)?.name ?? 'Someone';
-    center.cardQueue.push({ deck: e.deck, text: String(e.text ?? ''), who, at: now + cardDelay(ctx.events, k, e.playerId) });
+    const at = now + cardDelay(ctx.events, k, e.playerId);
+    center.cardQueue.push({ deck: e.deck, text: String(e.text ?? ''), who, at, sound: ctx.fresh });
   });
   if (center.cardQueue.length > 3) center.cardQueue.splice(0, center.cardQueue.length - 3);
   if (!center.cardShowing && center.cardQueue.length) nextCard();
@@ -1062,8 +1111,140 @@ function nextCard() {
   );
   box.classList.add('is-visible');
   center.cardShowing = true;
+  if (card.sound && animate()) { // the card slides off its pile and flips open as it fades in
+    sfx.play('cardDraw');
+    sfx.play('cardFlip', { delay: 0.12 });
+  }
   center.cardTimer = setTimeout(() => {
     box.classList.remove('is-visible');
     center.cardTimer = setTimeout(nextCard, 350); // after the fade-out
-  }, CARD_MS);
+  }, timing.card);
+}
+
+// --- sounds -------------------------------------------------------------------
+// The board's event sounds (sfx.js), timed to the animations above: the dice clatter with the
+// tumble, each token hop taps as it touches down, and whatever happens on arrival (rent, a purchase,
+// jail…) sounds when the token gets there. Interface sounds (clicks, "your turn", auction ticks)
+// belong to ui.js. Cards sound in nextCard(), when they actually appear.
+
+const CUE_REPEAT_MS = 150; // the same sound twice at one moment (a building sell-off) is staggered
+const CUE_REPEATS = 3; // … at most this many times per batch
+const ARRIVE_BEAT_MS = 150; // what happens on a tile sounds just after the landing's thock (normal speed)
+
+/** Stereo position of a tile: a little left or right, following the board. */
+function panOf(index) {
+  if (!Number.isInteger(index)) return 0;
+  const r = tileRect(((index % 40) + 40) % 40);
+  return ((r.x + r.w / 2) / UNITS * 2 - 1) * 0.6;
+}
+
+function tokenVoice(ctx, playerId) {
+  return TOKEN_VOICES[ctx.byId.get(playerId)?.token] ?? { rate: 1, start: null };
+}
+
+/**
+ * The batch's sounds as [ms from now, name, sfx options], in the order its animation plays them.
+ * Each player's events happen when that player's token has arrived (after its walks so far).
+ */
+function soundCues(ctx) {
+  const { events } = ctx;
+  const cues = [];
+  const repeats = new Map(); // "name@ms" → how many times it was cued for that moment
+  const cue = (ms, name, opts = {}) => {
+    const key = `${name}@${Math.round(ms)}`;
+    const n = repeats.get(key) ?? 0;
+    if (n >= CUE_REPEATS) return;
+    repeats.set(key, n + 1);
+    cues.push([ms + n * CUE_REPEAT_MS, name, opts]);
+  };
+  const dice = timing.dice;
+  const walkStart = walkDelay(events);
+  const clock = new Map(); // playerId → ms when its token has arrived
+  const goAt = new Map(); // playerId → ms when its token passes GO
+  const jailBound = new Set(); // players whose next move is the trip to jail
+  let bigEnd = 0; // when the last long fanfare ends, so the next one waits for it
+
+  const beat = (ARRIVE_BEAT_MS * timing.hop) / TIMINGS.normal.hop; // scales with the speed
+  for (const e of events) {
+    const id = e?.playerId;
+    const arrived = clock.get(id);
+    const at = arrived ?? walkStart; // when the player's next move starts
+    const now = arrived === undefined ? walkStart : arrived + beat; // when what happened to them sounds
+    const pan = panOf(e?.tileIndex);
+    switch (e?.type) {
+      case 'dice_rolled':
+        cue(0, 'diceThrow');
+        cue(dice * 0.3, 'diceBounce', { volume: 0.9 });
+        cue(dice * 0.55, 'diceBounce', { volume: 0.6, rate: 1.1 });
+        cue(dice * 0.8, 'diceSettle');
+        if (e.doubles && e.purpose === 'move') cue(dice + 60, 'doubles');
+        break;
+      case 'moved': { // cued on walk()'s own clock: hops touch down at the end of each step
+        const voice = tokenVoice(ctx, id);
+        if (isHopMove(e)) {
+          if (voice.start) cue(at, voice.start, { volume: 0.55, pan: panOf(e.from) });
+          for (let s = 1; s <= e.steps; s++) {
+            const index = (e.from + s) % 40;
+            const touch = at + s * timing.hop;
+            if (index === 0) goAt.set(id, touch);
+            const last = s === e.steps;
+            cue(touch, last ? 'land' : 'hop', { rate: voice.rate, volume: last ? 0.9 : 0.75, pan: panOf(index) });
+          }
+        } else { // a card or jail teleport: whoosh away, arrive
+          const arrive = at + timing.teleport;
+          cue(at, 'whoosh', { volume: 0.7, pan: panOf(e.to) });
+          if (jailBound.delete(id)) cue(arrive, 'jailSlam', { pan: panOf(e.to) });
+          else cue(arrive, 'land', { pan: panOf(e.to) });
+          goAt.set(id, arrive);
+        }
+        clock.set(id, at + moveTime(e));
+        break;
+      }
+      case 'passed_go': cue(goAt.get(id) ?? now, 'passGo'); break;
+      case 'sent_to_jail': jailBound.add(id); break;
+      case 'left_jail': cue(now, 'jailFree'); break;
+      case 'bought': cue(now, 'cashRegister', { pan }); break;
+      case 'paid_rent': cue(now, 'rent', { pan }); break;
+      case 'paid_tax': cue(now, 'tax', { pan }); break;
+      case 'paid': cue(now, e.reason === 'jail_fine' ? 'coin' : 'rent', { volume: 0.8 }); break;
+      case 'collected': cue(now, 'coins'); break;
+      case 'debt_paid': cue(now, 'coins', { volume: 0.7 }); break;
+      case 'built': cue(now, e.houses >= 5 ? 'hotel' : 'build', { pan }); break;
+      case 'sold_house': cue(now, 'demolish', { pan }); break;
+      case 'mortgaged': cue(now, 'stamp', { pan }); break;
+      case 'unmortgaged': cue(now, 'unstamp', { pan }); break;
+      case 'auction_started': cue(now, 'gavel', { pan }); break;
+      case 'auction_bid': cue(0, 'bid'); break;
+      case 'auction_won': cue(0, 'auctionEnd'); cue(750, 'sold', { pan }); break;
+      case 'auction_unsold': cue(0, 'auctionEnd'); break;
+      case 'trade_proposed': if (e.toPlayerId !== ctx.me) cue(0, 'tradePropose'); break; // ui.js chimes for the target
+      case 'trade_accepted': cue(0, 'tradeAccept'); break;
+      case 'trade_rejected':
+      case 'trade_cancelled': cue(0, 'tradeReject', { volume: e.type === 'trade_cancelled' ? 0.6 : 1 }); break;
+      case 'bankrupt': cue(now, 'bankrupt'); bigEnd = now + 2200; break;
+      case 'game_over': {
+        const at = Math.max(walkStart, bigEnd) + 300;
+        cue(at, 'victory');
+        cue(at + 700, 'cheer', { volume: 0.8 });
+        break;
+      }
+      case 'card_drawn': if (!animate()) cue(now, 'cardFlip'); break; // animated: nextCard() sounds it
+      default: break;
+    }
+  }
+  return cues;
+}
+
+/** Plays this batch's sounds (not on a game's first render: that is a snapshot, not news). */
+function playSounds(ctx) {
+  if (!ctx.fresh || !ctx.events.length) return;
+  const cues = soundCues(ctx);
+  if (!cues.length) return;
+  if (!animate()) { // no animation to follow: the single most telling sound, now
+    const names = new Set(cues.map((c) => c[1]));
+    const best = SUMMARY_ORDER.find((n) => names.has(n));
+    if (best) sfx.play(best);
+    return;
+  }
+  for (const [ms, name, opts] of cues) sfx.play(name, { ...opts, delay: ms / 1000 });
 }

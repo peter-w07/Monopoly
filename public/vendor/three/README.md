@@ -13,6 +13,12 @@
 | `addons/OrbitControls.js` | `examples/jsm/controls/OrbitControls.js` | import specifier rewritten |
 | `addons/RoundedBoxGeometry.js` | `examples/jsm/geometries/RoundedBoxGeometry.js` | import specifier rewritten |
 | `addons/RoomEnvironment.js` | `examples/jsm/environments/RoomEnvironment.js` | import specifier rewritten |
+| `addons/OutputPass.js` | `examples/jsm/postprocessing/OutputPass.js` | import specifiers rewritten (see below) |
+| `addons/UnrealBloomPass.js` | `examples/jsm/postprocessing/UnrealBloomPass.js` | 〃 |
+| `addons/Pass.js` | `examples/jsm/postprocessing/Pass.js` | 〃 (`FullScreenQuad`; base class of the passes) |
+| `addons/CopyShader.js` | `examples/jsm/shaders/CopyShader.js` | 〃 |
+| `addons/OutputShader.js` | `examples/jsm/shaders/OutputShader.js` | 〃 |
+| `addons/LuminosityHighPassShader.js` | `examples/jsm/shaders/LuminosityHighPassShader.js` | 〃 |
 
 ## How it was vendored
 
@@ -21,8 +27,14 @@
    files were minified once with `npx esbuild@0.28.2 <file> --minify --format=esm --legal-comments=inline`
    (2.1 MB → 0.77 MB). The export list was checked against the unminified build in Node: same 444
    exports, `REVISION === '186'`.
-3. Each addon's bare `} from 'three';` was rewritten to `} from '../three.module.js';` (the only import
-   they have), so the browser resolves them without an import map.
+3. Each addon's bare `} from 'three';` was rewritten to `} from '../three.module.js';`, so the browser
+   resolves them without an import map. The postprocessing files also import each other; those relative
+   specifiers were flattened to the single `addons/` folder (`'../shaders/CopyShader.js'` →
+   `'./CopyShader.js'`, `'./Pass.js'` stays). Nothing else in the files was changed:
+   `sed -e "s#} from 'three';#} from '../three.module.js';#" -e "s#from '\.\./shaders/\([A-Za-z]*\)\.js'#from './\1.js'#"`.
+   The postprocessing addons are unminified (≈ 30 KB together) and only used on the 'high' 3D quality tier;
+   `r3d/world-post.js` chains them itself (EffectComposer is deliberately not vendored: its two ping-pong
+   targets would both be multisampled).
 
 ## Rules
 

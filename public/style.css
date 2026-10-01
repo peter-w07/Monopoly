@@ -1,5 +1,8 @@
-/* style.css — app shell: screens, side panel, dialogs, toasts.
-   Everything inside #board is styled by the active renderer (renderer2d.css or r3d/r3d.css); here we only size the #board box.
+/* style.css — app shell: screens, header (2D|3D pill, settings, full screen), side panel, dialogs,
+   toasts, and the full-screen 3D layout (body.board-3d, at the end).
+   Everything inside #board is styled by the active renderer (renderer2d.css or r3d/r3d.css); here we
+   only size the #board box (plus, in the 3D layout, drop the renderer root's frame and hide the 2D
+   board that waits underneath while 3D loads).
    Class names are kept specific so they don't collide with the renderer's. */
 
 :root {
@@ -24,6 +27,12 @@
   --banner-text: #5c4300;
   --shadow: 0 1px 2px rgb(16 24 20 / .06), 0 4px 16px rgb(16 24 20 / .07);
   --shadow-lg: 0 12px 40px rgb(16 24 20 / .22);
+  /* Translucent surfaces floating over the full-screen 3D board */
+  --glass: rgb(252 253 252 / .8);
+  --glass-2: rgb(240 244 241 / .74);
+  --glass-3: rgb(226 233 228 / .86);
+  --glass-edge: rgb(255 255 255 / .55);
+  --table: #1b130e; /* behind the 3D board until it draws (matches r3d.css) */
   --radius: 14px;
   --radius-sm: 9px;
   --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
@@ -60,6 +69,10 @@
     --banner-text: #ffe3a1;
     --shadow: 0 1px 2px rgb(0 0 0 / .4), 0 4px 16px rgb(0 0 0 / .3);
     --shadow-lg: 0 12px 40px rgb(0 0 0 / .55);
+    --glass: rgb(21 28 24 / .8);
+    --glass-2: rgb(36 47 40 / .72);
+    --glass-3: rgb(48 61 53 / .86);
+    --glass-edge: rgb(255 255 255 / .09);
   }
 }
 
@@ -302,6 +315,172 @@ kbd {
   font-weight: 600;
 }
 
+/* Right-hand tools: 2D|3D pill (game screen), settings, full screen */
+.topbar-tools { display: flex; flex: none; align-items: center; gap: 6px; margin-left: auto; }
+.topbar-game:not([hidden]) + .topbar-tools { margin-left: 0; }
+
+.icon-btn {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  transition: background-color .15s;
+}
+.icon-btn:hover, .icon-btn[aria-expanded="true"] { background: var(--surface-3); }
+.icon-btn svg { display: block; }
+#settings-btn svg { transition: transform .4s cubic-bezier(.3, 1.5, .5, 1); }
+#settings-btn[aria-expanded="true"] svg { transform: rotate(90deg); }
+.fs-btn .fs-exit, .fs-btn.is-on .fs-enter { display: none; }
+.fs-btn.is-on .fs-exit { display: inline; }
+
+.view-pill {
+  display: flex;
+  flex: none;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+}
+.view-pill button {
+  min-width: 34px;
+  padding: 5px 9px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.1;
+  cursor: pointer;
+  transition: background-color .2s, color .2s;
+}
+.view-pill button:hover { color: var(--text); }
+.view-pill button[aria-pressed="true"] { background: var(--primary); color: var(--primary-text); }
+.view-pill button[aria-disabled="true"] { opacity: .45; cursor: not-allowed; }
+.view-pill button.is-loading::after { content: "\2026"; }
+.view-pill button.is-paused::after { content: " !"; color: var(--warn); }
+.view-pill button.is-loading { animation: pulse 1s ease-in-out infinite; }
+
+/* ---------------------------------------------------------------- settings popover (header gear) */
+
+.settings-pop {
+  position: fixed;
+  top: calc(var(--topbar-h) + 6px);
+  right: 8px;
+  z-index: 60;
+  display: grid;
+  gap: 14px;
+  width: min(340px, calc(100vw - 16px));
+  max-height: calc(100vh - var(--topbar-h) - 16px);
+  overflow: auto;
+  padding: 12px 16px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow-lg);
+  overscroll-behavior: contain;
+  transform-origin: calc(100% - 40px) 0;
+  animation: drop-in .18s ease-out;
+}
+@supports (height: 100dvh) {
+  .settings-pop { max-height: calc(100dvh - var(--topbar-h) - 16px); }
+}
+.sp-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.sp-head h2 { margin: 0; font-size: 16px; }
+.sp-x {
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+.sp-x:hover { background: var(--surface-3); color: var(--text); }
+.sp-group { display: grid; gap: 8px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.sp-group legend {
+  margin-bottom: 6px;
+  padding: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.sp-group .hint { font-size: 12px; }
+.sp-group .hint:empty { display: none; }
+
+/* On/off switches (checkbox role="switch") */
+.sp-switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 32px; font-weight: 600; cursor: pointer; }
+.sp-switch input {
+  position: relative;
+  flex: none;
+  width: 42px;
+  height: 24px;
+  margin: 0;
+  border-radius: 999px;
+  background: var(--surface-3);
+  box-shadow: inset 0 0 0 1px var(--border);
+  cursor: pointer;
+  appearance: none;
+  transition: background-color .2s;
+}
+.sp-switch input::before {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgb(0 0 0 / .35);
+  transition: transform .2s cubic-bezier(.3, 1.4, .5, 1);
+}
+.sp-switch input:checked { background: var(--primary); box-shadow: none; }
+.sp-switch input:checked::before { transform: translateX(18px); }
+.sp-switch input:disabled { opacity: .45; cursor: not-allowed; }
+.sp-switch:has(input:disabled) { color: var(--muted); cursor: default; }
+.sp-range { display: grid; grid-template-columns: auto minmax(0, 1fr) 3em; align-items: center; gap: 10px; min-height: 32px; font-weight: 600; }
+.sp-range input { width: 100%; margin: 0; accent-color: var(--primary); }
+.sp-range input:disabled { opacity: .45; }
+.sp-range:has(input:disabled) { color: var(--muted); }
+.sp-range output { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; }
+
+/* Segmented choice (a radio group): the radios stay keyboard-operable, their labels are the buttons */
+.seg { display: flex; gap: 2px; padding: 3px; border-radius: var(--radius-sm); background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--border); }
+.seg label { position: relative; flex: 1 1 0; min-width: 0; }
+.seg input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.seg input:disabled { cursor: not-allowed; }
+.seg span {
+  display: block;
+  overflow: hidden;
+  padding: 7px 4px;
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: background-color .15s, color .15s, box-shadow .15s;
+}
+.seg label:hover span { color: var(--text); }
+.seg input:checked + span { background: var(--surface); color: var(--text); box-shadow: 0 1px 2px rgb(0 0 0 / .12), 0 0 0 1px var(--border); }
+.seg input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 1px; }
+.seg input:disabled + span { opacity: .4; }
+
 /* ---------------------------------------------------------------- screens */
 
 .screen { padding: 24px 16px 48px; }
@@ -502,6 +681,9 @@ kbd {
   background: var(--surface);
   box-shadow: var(--shadow);
 }
+/* The 3D layout's fold controls (see "full-screen 3D layout" below); the 2D panel is unchanged. */
+.sheet-handle, .panel-toggle { display: none; }
+.panel-more { display: contents; }
 .panel-section .section-title { margin-bottom: 8px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
 .panel-footer { display: flex; justify-content: flex-end; }
 .panel-footer:empty { display: none; }
@@ -901,6 +1083,12 @@ legend.trade-col-head { margin-bottom: 0; padding: 0 4px; }
 @keyframes pop { from { opacity: 0; transform: scale(.96); } }
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
 @keyframes bid-pop { 0% { transform: scale(1.18); color: var(--accent); } 100% { transform: none; } }
+@keyframes drop-in { from { opacity: 0; transform: translateY(-6px) scale(.97); } }
+@keyframes panel-in { from { opacity: 0; transform: translateX(28px); } }
+@keyframes sheet-in { from { opacity: 0; transform: translateY(48px); } }
+@keyframes fade-in { from { opacity: 0; } }
+@keyframes rise-in { from { opacity: 0; transform: translateY(18px) scale(.97); } }
+@keyframes glow-mine { 35% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--pc) 50%, transparent); } }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; transition-duration: 1ms !important; }
@@ -976,4 +1164,225 @@ legend.trade-col-head { margin-bottom: 0; padding: 0 4px; }
   .prop-btns { gap: 10px; }
   .dialog-x { width: 40px; height: 40px; }
   .toast-x { width: 34px; height: 34px; top: 2px; right: 2px; }
+}
+
+/* ---------------------------------------------------------------- phones: header */
+
+/* Room for the pill and the gear: the connection shows as a dot while all is well, and full
+   screen moves into the settings. */
+@media (max-width: 520px) {
+  .topbar-tools { gap: 2px; }
+  .conn.ok > span { display: none; }
+  .topbar .fs-btn { display: none; }
+  .view-pill button { min-width: 30px; padding: 5px 7px; }
+}
+
+/* ---------------------------------------------------------------- full-screen 3D layout
+   body.board-3d (ui.js, while the 3D board is chosen and the game screen is up): #board fills the
+   window behind a translucent header; the side panel floats on the right as a translucent card that
+   folds down to the turn banner and the action buttons; on phones held upright it is a bottom sheet
+   instead. Dialogs and toasts stay inside the part of the board nothing covers (--safe-*, written by
+   ui.js together with #board's data-safe-* for the renderer). */
+
+body.board-3d {
+  --panel-3d-w: 340px;
+  --gap-3d: 12px;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: var(--table);
+}
+
+body.board-3d .topbar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  left: 0;
+  border-bottom-color: var(--glass-edge);
+  background: color-mix(in srgb, var(--surface) 64%, transparent);
+  box-shadow: 0 6px 24px rgb(0 0 0 / .16);
+  backdrop-filter: blur(14px) saturate(1.3);
+  animation: fade-in .3s ease-out;
+}
+body.board-3d .view-pill { background: var(--glass-2); }
+body.board-3d .replaced { position: fixed; top: var(--topbar-h); right: 0; left: 0; }
+@media (min-width: 900px), (orientation: landscape) {
+  /* Beside the floating panel, not over it */
+  body.board-3d .replaced { right: calc(var(--panel-3d-w) + 2 * var(--gap-3d)); border-bottom-right-radius: var(--radius-sm); }
+}
+
+body.board-3d .game-layout { display: block; max-width: none; margin: 0; padding: 0; }
+body.board-3d .board-wrap { display: block; width: auto; min-width: 0; aspect-ratio: auto; }
+body.board-3d #board {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  width: auto;
+  height: auto;
+  background: var(--table);
+}
+/* While 3D loads the 2D board keeps running underneath, unseen (renderer-switch shows "Loading 3D…"). */
+body.board-3d #board > .r2d { visibility: hidden; }
+/* Edge to edge: no card frame around the 3D view. */
+body.board-3d #board > .r3d { border-radius: 0; box-shadow: none; }
+
+/* The panel: a translucent card floating on the right */
+body.board-3d .panel {
+  --surface-2: var(--glass-2);
+  --surface-3: var(--glass-3);
+  position: fixed;
+  top: calc(var(--topbar-h) + var(--gap-3d));
+  right: var(--gap-3d);
+  z-index: 40;
+  gap: 12px;
+  width: min(var(--panel-3d-w), calc(100vw - 2 * var(--gap-3d)));
+  min-height: 0;
+  max-height: calc(100vh - var(--topbar-h) - 2 * var(--gap-3d));
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-color: var(--glass-edge);
+  background: var(--glass);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: blur(16px) saturate(1.25);
+  scrollbar-width: thin;
+  animation: panel-in .32s cubic-bezier(.2, .8, .2, 1);
+}
+@supports (height: 100dvh) {
+  body.board-3d .panel { max-height: calc(100dvh - var(--topbar-h) - 2 * var(--gap-3d)); }
+}
+body.board-3d .panel-more { display: grid; gap: 12px; }
+body.board-3d .panel.is-folded .panel-more { display: none; }
+body.board-3d .panel:not(.is-folded) .panel-more { animation: fade-in .22s ease-out; }
+body.board-3d .panel-dialog { background: var(--surface); }
+body.board-3d .turn-banner.mine { animation: glow-mine 1.6s ease-out 1; }
+body.board-3d .panel-dialog-slot,
+body.board-3d .auction-sheet { scroll-margin-top: 8px; }
+
+/* "Players & properties" — folds the card down to the banner and the buttons above it */
+body.board-3d .panel-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background-color .15s, color .15s;
+}
+body.board-3d .panel-toggle:hover { background: var(--surface-3); color: var(--text); }
+.panel-toggle-chev {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin: -4px 2px 0;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(45deg);
+  transition: transform .2s;
+}
+.panel-toggle[aria-expanded="false"] .panel-toggle-chev { margin-top: 0; transform: rotate(-45deg); }
+
+/* Dialogs float over the uncovered part of the board, low (like on the 2D board) */
+body.board-3d .dialog-layer {
+  position: fixed;
+  inset: var(--safe-top, 0px) var(--safe-right, 0px) var(--safe-bottom, 0px) var(--safe-left, 0px);
+  padding: 0 16px 16px;
+}
+body.board-3d .dialog-layer:has(.dialog-trade) { padding: 12px 16px; }
+body.board-3d .dialog { border-color: var(--glass-edge); }
+body.board-3d .dialog:not(.shown) { animation: rise-in .26s cubic-bezier(.2, .9, .3, 1.15); }
+
+/* Toasts: top centre of the uncovered part */
+body.board-3d .toasts {
+  top: calc(var(--safe-top, 0px) + 10px);
+  right: var(--safe-right, 0px);
+  bottom: auto;
+  left: var(--safe-left, 0px);
+  width: min(420px, calc(100vw - var(--safe-left, 0px) - var(--safe-right, 0px) - 24px));
+  max-width: none;
+  margin: 0 auto;
+}
+body.board-3d .toast { border-color: var(--glass-edge); background: var(--glass); backdrop-filter: blur(12px); }
+body.board-3d .toast:nth-last-child(n + 4) { display: none; }
+
+/* Narrow windows held sideways (phones in landscape): a narrower card; short ones a lower header */
+@media (max-width: 899px) {
+  body.board-3d { --panel-3d-w: min(320px, 42vw); --gap-3d: 8px; }
+}
+@media (max-height: 500px) {
+  body.board-3d { --topbar-h: 44px; }
+}
+
+/* Phones held upright: the panel is a bottom sheet. Folded, it shows the turn banner, an auction,
+   the decision at hand, the action buttons and the latest log line; the handle (tap or drag)
+   unfolds it to show everything, up to 70% of the height (ui.js SHEET, SHEET_MAX_SHARE). */
+@media (max-width: 899px) and (orientation: portrait) {
+  body.board-3d .panel {
+    top: auto;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    gap: 10px;
+    width: auto;
+    max-width: 720px;
+    max-height: 70vh;
+    margin: 0 auto;
+    padding: 0 12px calc(12px + env(safe-area-inset-bottom, 0px));
+    border-width: 1px 1px 0;
+    border-radius: 18px 18px 0 0;
+    animation-name: sheet-in;
+  }
+  body.board-3d .panel.is-folded { max-height: 50vh; }
+  @supports (height: 100dvh) {
+    body.board-3d .panel { max-height: 70dvh; }
+    body.board-3d .panel.is-folded { max-height: 50dvh; }
+  }
+  body.board-3d .panel.is-dragging { max-height: none; }
+  /* An auction's 10-second clock leaves no time to scroll: a compact deed, a taller fold. */
+  body.board-3d .auction-sheet :is(.deed-rent, .deed-foot) { display: none; }
+  body.board-3d .panel.is-folded:has(#auction-sheet:not([hidden])) { max-height: 64vh; max-height: 64dvh; }
+  body.board-3d .panel-more { gap: 10px; }
+  body.board-3d .panel-toggle { display: none; }
+  body.board-3d .panel.is-folded .recent-log li:not(:last-child) { display: none; }
+  /* A steady fold: the board is framed above it, so its height shouldn't bob with each message. */
+  body.board-3d .turn-text { display: flex; flex-direction: column; justify-content: center; min-height: 3.6em; }
+  body.board-3d .panel.is-folded .recent-log li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  body.board-3d .sheet-handle {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    display: block;
+    width: calc(100% + 24px);
+    height: 24px;
+    margin: 0 -12px -4px;
+    padding: 0;
+    border: 0;
+    border-radius: 18px 18px 0 0;
+    background: var(--glass);
+    cursor: grab;
+    touch-action: none;
+  }
+  body.board-3d .panel.is-dragging .sheet-handle { cursor: grabbing; }
+  .sheet-handle i {
+    display: block;
+    width: 42px;
+    height: 5px;
+    margin: 0 auto;
+    border-radius: 999px;
+    background: var(--muted);
+    opacity: .55;
+    transition: opacity .15s, width .15s;
+  }
+  .sheet-handle:hover i, .sheet-handle:focus-visible i { width: 52px; opacity: .85; }
+  .sheet-handle:focus-visible { outline-offset: -3px; }
+  body.board-3d .toasts { width: auto; left: 8px; right: 8px; max-width: 520px; }
 }

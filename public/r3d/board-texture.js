@@ -1,13 +1,18 @@
 // public/r3d/board-texture.js — draws the whole board face into ONE canvas (uploaded once as the
 // slab's top texture). Everything that changes during a game (owners, houses, mortgages, highlights)
-// is a separate 3D object, so this canvas is drawn once per renderer instance (~5 ms at 2048 px).
+// is a separate 3D object, so this canvas is drawn once per renderer instance and quality tier
+// (~10 ms at 2048 px, ~40 ms at 4096 px).
+//
+// The centre is the city's ground plan: the dice plaza, the ring road with sidewalks, one lot per
+// colour group, lawns (parks) in the gaps between them and four landmark lots in the inner corners
+// (city.js builds on exactly these: districtGaps / LANDMARK_LOTS are exported for it).
 //
 // Canvas pixels map 1:1 onto the 2D renderer's uv units (u → right, v → down), which is also how the
 // top face of the slab is UV-mapped, so tile i sits exactly at layout.tileRect(i).
 
 import {
   UNITS, CORNER, BAND, JAIL_STRIP, DECK_SPOTS, HALF, ROAD_R, ROAD_W, ROAD_CORNER, DISTRICT_IN, DISTRICT_OUT,
-  sideOf, tileRect, districts, districtPoint,
+  DISTRICT_SPAN, sideOf, tileRect, districts, districtPoint,
 } from './layout.js';
 
 export const COLORS = {
@@ -72,6 +77,7 @@ export function drawBoardCanvas(board, size = 2048) {
   g.lineWidth = 0.05;
   g.strokeRect(CORNER, CORNER, UNITS - 2 * CORNER, UNITS - 2 * CORNER);
   g.strokeRect(0.025, 0.025, UNITS - 0.05, UNITS - 0.05);
+  drawGrain(g, size);
   return cv;
 }
 
@@ -333,41 +339,70 @@ function drawCorner(g, board, tile) {
     drawJail(g);
     return;
   }
-  g.rotate(CORNER_ANGLE[i] ?? 0);
-  g.fillStyle = COLORS.ink;
+  const h = CORNER / 2;
+  const angle = CORNER_ANGLE[i] ?? 0;
   if (tile.type === 'go') {
-    setFont(g, 0.11, 700);
-    g.textAlign = 'center';
-    g.textBaseline = 'middle';
-    wrapText(g, `COLLECT ${money(board.goSalary ?? 200)} SALARY AS YOU PASS`, -0.44, 1.2, 0.11, { weight: 700 });
-    g.fillStyle = COLORS.accent;
+    // Sunburst behind the lettering (in board axes, clipped to the square).
+    g.save();
+    g.beginPath();
+    g.rect(-h, -h, CORNER, CORNER);
+    g.clip();
+    const rays = 16;
+    for (let k = 0; k < rays; k++) {
+      const a0 = (k / rays) * Math.PI * 2;
+      const a1 = ((k + 0.5) / rays) * Math.PI * 2;
+      g.fillStyle = 'rgba(200, 16, 46, 0.09)';
+      g.beginPath();
+      g.moveTo(0, 0);
+      g.lineTo(Math.cos(a0) * 1.4, Math.sin(a0) * 1.4);
+      g.lineTo(Math.cos(a1) * 1.4, Math.sin(a1) * 1.4);
+      g.closePath();
+      g.fill();
+    }
+    g.restore();
+    g.save();
+    g.rotate(angle);
+    g.fillStyle = COLORS.ink;
+    wrapText(g, `COLLECT ${money(board.goSalary ?? 200)} SALARY AS YOU PASS`, -0.56, 1.15, 0.105, { weight: 800 });
     setFont(g, 0.62, 900);
     g.textAlign = 'center';
     g.textBaseline = 'middle';
-    fillText(g, 'GO', 0, 0.12);
-    g.strokeStyle = COLORS.ink;
-    fillText(g, 'GO', 0, 0.12, 0.02);
-    // Travel arrow along the bottom row (points left, drawn in board axes).
-    g.rotate(-(CORNER_ANGLE[i] ?? 0));
+    g.strokeStyle = '#ffffff';
+    g.lineJoin = 'round';
+    fillText(g, 'GO', 0.02, 0.0, 0.09); // white halo
     g.fillStyle = COLORS.accent;
+    fillText(g, 'GO', 0.02, 0.0);
+    g.strokeStyle = COLORS.ink;
+    fillText(g, 'GO', 0.02, 0.0, 0.018);
+    g.restore();
+    // Travel arrow along the bottom row (points left, drawn in board axes).
+    g.fillStyle = COLORS.accent;
+    g.strokeStyle = COLORS.ink;
+    g.lineWidth = 0.02;
     g.beginPath();
-    g.moveTo(-0.62, 0.52);
-    g.lineTo(-0.3, 0.34);
-    g.lineTo(-0.3, 0.46);
-    g.lineTo(0.52, 0.46);
-    g.lineTo(0.52, 0.58);
-    g.lineTo(-0.3, 0.58);
-    g.lineTo(-0.3, 0.7);
+    g.moveTo(-0.68, 0.6);
+    g.lineTo(-0.36, 0.43);
+    g.lineTo(-0.36, 0.53);
+    g.lineTo(0.6, 0.53);
+    g.lineTo(0.6, 0.67);
+    g.lineTo(-0.36, 0.67);
+    g.lineTo(-0.36, 0.73);
     g.closePath();
     g.fill();
-  } else if (tile.type === 'free_parking') {
+    g.stroke();
+    return;
+  }
+  g.rotate(angle);
+  g.fillStyle = COLORS.ink;
+  if (tile.type === 'free_parking') {
     wrapText(g, 'FREE', -0.5, 1.2, 0.2, { baseline: 'middle' });
-    drawCar(g, 0, 0.02, 0.62);
+    drawCar(g, -0.08, 0.04, 0.6);
+    drawParkingSign(g, 0.42, -0.02, 0.36);
     g.fillStyle = COLORS.ink;
     wrapText(g, 'PARKING', 0.5, 1.2, 0.2, { baseline: 'middle' });
   } else if (tile.type === 'go_to_jail') {
     wrapText(g, 'GO TO', -0.5, 1.2, 0.2, { baseline: 'middle' });
-    drawBadge(g, 0, 0.02, 0.5);
+    drawBadge(g, 0, 0.03, 0.55);
     g.fillStyle = COLORS.ink;
     wrapText(g, 'JAIL', 0.5, 1.2, 0.2, { baseline: 'middle' });
   } else {
@@ -384,14 +419,27 @@ function drawJail(g) {
   const cw = CORNER - JAIL_STRIP;
   g.fillStyle = COLORS.jail;
   g.fillRect(cx, cy, cw, cw);
+  // Painted bars and a back wall line.
+  g.fillStyle = 'rgba(22, 27, 24, 0.55)';
+  const bars = 7;
+  for (let k = 1; k < bars; k++) g.fillRect(cx + (k * cw) / bars - 0.012, cy, 0.024, cw);
+  g.fillRect(cx, cy + 0.06, cw, 0.03);
+  g.fillRect(cx, cy + cw - 0.09, cw, 0.03);
   g.strokeStyle = COLORS.line;
   g.lineWidth = 0.03;
   g.strokeRect(cx, cy, cw, cw);
   g.save();
   g.translate(cx + cw / 2, cy + cw / 2);
   g.rotate(Math.PI / 4);
+  g.fillStyle = '#fbf6ea';
+  g.strokeStyle = COLORS.ink;
+  g.lineWidth = 0.02;
+  g.beginPath();
+  g.rect(-0.4, -0.14, 0.8, 0.28);
+  g.fill();
+  g.stroke();
   g.fillStyle = COLORS.ink;
-  wrapText(g, 'IN JAIL', 0, 1.0, 0.2, { baseline: 'middle' });
+  wrapText(g, 'IN JAIL', 0, 0.74, 0.19, { baseline: 'middle', weight: 900 });
   g.restore();
   // "JUST" up the left strip, "VISITING" along the bottom strip — readable from outside.
   g.fillStyle = COLORS.ink;
@@ -413,55 +461,147 @@ function drawCar(g, x, y, s) {
   g.save();
   g.translate(x, y);
   g.scale(s, s);
+  g.lineJoin = 'round';
   g.fillStyle = COLORS.accent;
   g.strokeStyle = COLORS.ink;
-  g.lineWidth = 0.05;
+  g.lineWidth = 0.045;
   g.beginPath();
-  g.moveTo(-0.5, 0.1);
-  g.lineTo(-0.44, -0.08);
-  g.lineTo(-0.2, -0.12);
-  g.lineTo(-0.08, -0.32);
-  g.lineTo(0.24, -0.32);
-  g.lineTo(0.36, -0.12);
-  g.lineTo(0.5, -0.06);
-  g.lineTo(0.5, 0.1);
+  g.moveTo(-0.52, 0.12);
+  g.quadraticCurveTo(-0.54, -0.06, -0.4, -0.1);
+  g.lineTo(-0.22, -0.13);
+  g.quadraticCurveTo(-0.1, -0.36, 0.1, -0.36);
+  g.quadraticCurveTo(0.28, -0.36, 0.36, -0.13);
+  g.lineTo(0.48, -0.09);
+  g.quadraticCurveTo(0.56, -0.02, 0.54, 0.12);
   g.closePath();
   g.fill();
   g.stroke();
-  g.fillStyle = COLORS.ink;
-  for (const cx of [-0.28, 0.3]) {
+  // Windows.
+  g.fillStyle = '#bfe3f6';
+  g.beginPath();
+  g.moveTo(-0.14, -0.14);
+  g.quadraticCurveTo(-0.06, -0.3, 0.04, -0.3);
+  g.lineTo(0.04, -0.14);
+  g.closePath();
+  g.fill();
+  g.beginPath();
+  g.moveTo(0.1, -0.14);
+  g.lineTo(0.1, -0.3);
+  g.quadraticCurveTo(0.24, -0.3, 0.29, -0.14);
+  g.closePath();
+  g.fill();
+  // Headlight and wheels.
+  g.fillStyle = '#ffe07a';
+  g.fillRect(0.44, -0.05, 0.07, 0.05);
+  for (const cx of [-0.3, 0.3]) {
+    g.fillStyle = COLORS.ink;
     g.beginPath();
-    g.arc(cx, 0.12, 0.12, 0, Math.PI * 2);
+    g.arc(cx, 0.13, 0.13, 0, Math.PI * 2);
+    g.fill();
+    g.fillStyle = '#d5d8da';
+    g.beginPath();
+    g.arc(cx, 0.13, 0.055, 0, Math.PI * 2);
     g.fill();
   }
   g.restore();
 }
 
+/** A blue "P" parking sign on a pole. */
+function drawParkingSign(g, x, y, s) {
+  g.save();
+  g.translate(x, y);
+  g.scale(s, s);
+  g.fillStyle = '#6b7075';
+  g.fillRect(-0.03, -0.1, 0.06, 0.6);
+  g.fillStyle = '#1d5fb4';
+  g.strokeStyle = '#ffffff';
+  g.lineWidth = 0.05;
+  g.beginPath();
+  g.rect(-0.26, -0.56, 0.52, 0.52);
+  g.fill();
+  g.stroke();
+  g.restore();
+  // The letter in unscaled board units (fillText works in board units).
+  g.save();
+  g.fillStyle = '#ffffff';
+  setFont(g, 0.15, 900);
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  fillText(g, 'P', x, y - 0.3 * s + 0.005);
+  g.restore();
+}
+
+/** A police officer's cap with a gold badge and a whistle on a cord. */
 function drawBadge(g, x, y, s) {
   g.save();
   g.translate(x, y);
   g.scale(s, s);
+  g.lineJoin = 'round';
   g.fillStyle = '#1d3f8f';
   g.strokeStyle = COLORS.ink;
-  g.lineWidth = 0.05;
+  g.lineWidth = 0.045;
   g.beginPath();
-  g.moveTo(-0.46, -0.1);
-  g.quadraticCurveTo(0, -0.62, 0.46, -0.1); // cap
-  g.lineTo(0.5, 0.02);
-  g.lineTo(-0.5, 0.02);
+  g.moveTo(-0.5, -0.08);
+  g.quadraticCurveTo(-0.5, -0.46, 0, -0.5);
+  g.quadraticCurveTo(0.5, -0.46, 0.5, -0.08);
+  g.lineTo(0.44, 0.04);
+  g.lineTo(-0.44, 0.04);
   g.closePath();
   g.fill();
   g.stroke();
-  g.fillStyle = '#111';
-  g.fillRect(-0.52, 0.02, 1.04, 0.1); // visor
-  g.fillStyle = '#f4c542';
+  g.fillStyle = '#10141a';
   g.beginPath();
-  g.arc(0, -0.2, 0.1, 0, Math.PI * 2);
+  g.moveTo(-0.46, 0.04);
+  g.lineTo(0.46, 0.04);
+  g.quadraticCurveTo(0.3, 0.22, 0, 0.22);
+  g.quadraticCurveTo(-0.3, 0.22, -0.46, 0.04);
+  g.closePath();
   g.fill();
+  g.fillStyle = '#f4c542';
+  g.strokeStyle = '#8a6a12';
+  g.lineWidth = 0.025;
+  g.beginPath();
+  for (let k = 0; k < 10; k++) {
+    const r = k % 2 ? 0.07 : 0.14;
+    const a = (k / 10) * Math.PI * 2 - Math.PI / 2;
+    g.lineTo(Math.cos(a) * r, -0.24 + Math.sin(a) * r);
+  }
+  g.closePath();
+  g.fill();
+  g.stroke();
   g.restore();
 }
 
 // ---- centre ------------------------------------------------------------------------------------
+
+/**
+ * Gaps between the colour districts along each side (world units, like layout.districts):
+ * [{ side, horizontal, out, a0, a1 }]. The city plants parks there; the texture paints lawns.
+ */
+export function districtGaps(board) {
+  const list = districts(board);
+  const out = [];
+  for (const side of ['bottom', 'left', 'top', 'right']) {
+    const mine = list.filter((d) => d.side === side).sort((a, b) => a.a0 - b.a0);
+    if (!mine.length) continue;
+    const proto = mine[0];
+    let at = -DISTRICT_SPAN;
+    for (const d of mine) {
+      if (d.a0 - at > 0.45) out.push({ side, horizontal: proto.horizontal, out: proto.out, a0: at + 0.05, a1: d.a0 - 0.05 });
+      at = Math.max(at, d.a1);
+    }
+    if (DISTRICT_SPAN - at > 0.45) out.push({ side, horizontal: proto.horizontal, out: proto.out, a0: at + 0.05, a1: DISTRICT_SPAN - 0.05 });
+  }
+  return out;
+}
+
+/** The four inner corners (world centres of the landmark lots): go, jail, parking, gotojail. */
+export const LANDMARK_LOTS = {
+  go: { x: 3.98, z: 3.98 },
+  jail: { x: -3.98, z: 3.98 },
+  parking: { x: -3.98, z: -3.98 },
+  gotojail: { x: 3.98, z: -3.98 },
+};
 
 function drawCentre(g, board) {
   const c0 = CORNER;
@@ -469,7 +609,6 @@ function drawCentre(g, board) {
   g.fillStyle = COLORS.centre;
   g.fillRect(c0, c0, c1 - c0, c1 - c0);
 
-  // The city's ring road (cars drive on it: city.js) and one plot per colour group.
   const roundRect = (x, y, w, h, r) => {
     g.beginPath();
     g.moveTo(x + r, y);
@@ -479,15 +618,64 @@ function drawCentre(g, board) {
     g.arcTo(x, y, x + w, y, r);
     g.closePath();
   };
-  roundRect(HALF - ROAD_R, HALF - ROAD_R, 2 * ROAD_R, 2 * ROAD_R, ROAD_CORNER);
-  g.strokeStyle = '#7d8581';
-  g.lineWidth = ROAD_W;
-  g.stroke();
-  g.setLineDash([0.12, 0.1]);
-  g.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+
+  // The dice plaza: a softly paved circle.
+  g.fillStyle = '#d9eedb';
+  g.beginPath();
+  g.arc(HALF, HALF, 2.55, 0, Math.PI * 2);
+  g.fill();
+  g.strokeStyle = 'rgba(22, 60, 38, 0.1)';
   g.lineWidth = 0.02;
-  g.stroke();
-  g.setLineDash([]);
+  for (const r of [0.9, 1.7, 2.55]) {
+    g.beginPath();
+    g.arc(HALF, HALF, r, 0, Math.PI * 2);
+    g.stroke();
+  }
+
+  // Landmark lots in the inner corners (bank, power plant, fairground, water tower).
+  const lot = (p, fill, edge) => {
+    const x = HALF + p.x - 0.5;
+    const y = HALF + p.z - 0.5;
+    g.fillStyle = fill;
+    roundRect(x, y, 1, 1, 0.12);
+    g.fill();
+    g.strokeStyle = edge;
+    g.lineWidth = 0.025;
+    g.stroke();
+  };
+  lot(LANDMARK_LOTS.go, '#ece3cf', '#bfae8a');
+  lot(LANDMARK_LOTS.jail, '#cfd1cc', '#9da19b');
+  lot(LANDMARK_LOTS.parking, '#f1e2bd', '#d4b879');
+  lot(LANDMARK_LOTS.gotojail, '#b6dca6', '#86b877');
+
+  // Parks between the districts.
+  for (const p of districtGaps(board)) {
+    const a = districtPoint(p, p.a0, DISTRICT_IN);
+    const b = districtPoint(p, p.a1, DISTRICT_OUT);
+    const x = Math.min(a.x, b.x) + HALF;
+    const y = Math.min(a.z, b.z) + HALF;
+    const w = Math.abs(a.x - b.x);
+    const h = Math.abs(a.z - b.z);
+    g.fillStyle = '#a9d89a';
+    roundRect(x, y, w, h, 0.1);
+    g.fill();
+    g.strokeStyle = '#86bd76';
+    g.lineWidth = 0.02;
+    g.stroke();
+    g.strokeStyle = '#efe6cf';
+    g.lineWidth = 0.05;
+    g.beginPath();
+    if (p.horizontal) {
+      g.moveTo(x + 0.08, y + h / 2);
+      g.lineTo(x + w - 0.08, y + h / 2);
+    } else {
+      g.moveTo(x + w / 2, y + 0.08);
+      g.lineTo(x + w / 2, y + h - 0.08);
+    }
+    g.stroke();
+  }
+
+  // One lot per colour group: pale pavement tinted with the group colour, plot lines.
   for (const d of districts(board)) {
     const a = districtPoint(d, d.a0, DISTRICT_IN);
     const b = districtPoint(d, d.a1, DISTRICT_OUT);
@@ -495,16 +683,36 @@ function drawCentre(g, board) {
     const y = Math.min(a.z, b.z) + HALF;
     const w = Math.abs(a.x - b.x);
     const h = Math.abs(a.z - b.z);
-    g.globalAlpha = 0.3;
-    g.fillStyle = d.color;
+    g.fillStyle = '#e7e3d6';
     roundRect(x, y, w, h, 0.08);
     g.fill();
-    g.globalAlpha = 0.7;
+    g.globalAlpha = 0.28;
+    g.fillStyle = d.color;
+    g.fill();
+    g.globalAlpha = 0.85;
     g.strokeStyle = d.color;
     g.lineWidth = 0.03;
     g.stroke();
     g.globalAlpha = 1;
   }
+
+  // The ring road with sidewalks and kerbs (cars drive on it: city.js).
+  const road = () => roundRect(HALF - ROAD_R, HALF - ROAD_R, 2 * ROAD_R, 2 * ROAD_R, ROAD_CORNER);
+  road();
+  g.strokeStyle = '#b9b2a2';
+  g.lineWidth = ROAD_W + 0.24;
+  g.stroke();
+  g.strokeStyle = '#e4ded0';
+  g.lineWidth = ROAD_W + 0.2;
+  g.stroke();
+  g.strokeStyle = '#6f7773';
+  g.lineWidth = ROAD_W;
+  g.stroke();
+  g.setLineDash([0.12, 0.1]);
+  g.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+  g.lineWidth = 0.02;
+  g.stroke();
+  g.setLineDash([]);
 
   // Deck spots.
   for (const [deck, spot] of Object.entries(DECK_SPOTS)) {
@@ -524,17 +732,33 @@ function drawCentre(g, board) {
     g.restore();
   }
 
-  // Wordmark across the anti-diagonal: plain type, not the trademark banner.
+  // Wordmark across the anti-diagonal: plain type, not the trademark banner, kept modest so the
+  // town reads as the centrepiece.
   g.save();
   g.translate(UNITS / 2, UNITS / 2);
   g.rotate(-Math.PI / 4);
-  g.fillStyle = 'rgba(22, 60, 38, 0.9)';
-  setFont(g, 1.05, 900);
+  g.fillStyle = 'rgba(22, 60, 38, 0.85)';
+  setFont(g, 0.78, 900);
   g.textAlign = 'center';
   g.textBaseline = 'middle';
   fillText(g, 'MONOPOLY', 0, 0.02);
-  g.lineWidth = 0.035;
-  g.strokeStyle = 'rgba(22, 60, 38, 0.35)';
-  g.strokeRect(-3.35, -0.78, 6.7, 1.56);
+  g.lineWidth = 0.03;
+  g.strokeStyle = 'rgba(22, 60, 38, 0.3)';
+  g.strokeRect(-2.55, -0.6, 5.1, 1.2);
+  g.restore();
+}
+
+/** A faint printed-card grain over the whole face (keeps large flat areas from looking plastic). */
+function drawGrain(g, size) {
+  let seed = 99;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  g.save();
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  const n = Math.round((size * size) / 700);
+  for (let k = 0; k < n; k++) {
+    g.fillStyle = rnd() < 0.5 ? 'rgba(0,0,0,0.035)' : 'rgba(255,255,255,0.05)';
+    const w = 1 + rnd() * (size / 1024);
+    g.fillRect(rnd() * size, rnd() * size, w, w);
+  }
   g.restore();
 }

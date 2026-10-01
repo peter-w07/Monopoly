@@ -4,6 +4,16 @@
 // render(state, events, myPlayerId), and owns everything inside <div id="board"> by delegating to
 // exactly one renderer at a time. Extra API:
 //   getMode() → '2d' | '3d'      setMode(mode, {persist})      onModeChange(cb) → unsubscribe
+//                                 (cb runs before the board is redrawn, so the page can switch
+//                                 its layout first and the new renderer is built at its final size)
+//   getStatus() → { mode, view, loading, unsupported, paused, failed }
+//                                 view = the renderer on screen ('2d' | '3d' | null before the first
+//                                 render); loading = 3D is wanted but not on screen yet
+//   onStatus(cb) → unsubscribe    cb(status) whenever anything in getStatus() changes
+//   probe3d() → boolean           checks for WebGL2 now (cached) — e.g. when a 3D button is pointed at
+//   setOptions({ speed, camera, quality }) / getOptions()
+//                                 remembered and forwarded to the active renderer's setOptions?.(),
+//                                 to 3D right after it loads, and to each renderer as it takes over
 //   setBoardToggle(visible)       show / hide the small built-in 2D|3D toggle inside #board
 //   busyUntil()                   Date.now() ms when the board's running animation reaches its
 //                                 landing (0 when idle / in 2D) — ui.js holds dialogs until then
@@ -37,7 +47,10 @@ let toggleVisible = true;
 let veil = null;
 let swapTimer = 0;
 let swapReady = false;
+let options = {}; // renderer options from ui.js ({ speed, camera, quality }), see setOptions
+let statusSig = ''; // getStatus() as last reported to status listeners
 const listeners = new Set();
+const statusListeners = new Set();
 
 injectStyles();
 window.addEventListener(EVENT, (e) => {
@@ -78,21 +91,67 @@ export function setMode(next, { persist = true } = {}) {
     loadFailed = false;
   }
   if (next === mode) {
-    updateToggle();
+    refresh();
     return;
   }
   mode = next;
   notify();
   if (mode === '3d' && supportsWebGL2()) ensure3d();
   if (last) render(last.state, [], last.myPlayerId);
-  else updateToggle();
+  else refresh();
 }
 
-/** Calls cb(mode) whenever the mode changes. Returns an unsubscribe function. */
+/**
+ * Calls cb(mode) whenever the mode changes — before the board is redrawn for it. Returns an
+ * unsubscribe function.
+ */
 export function onModeChange(cb) {
   if (typeof cb !== 'function') return () => {};
   listeners.add(cb);
   return () => listeners.delete(cb);
+}
+
+/** What the board is doing, for view controls outside #board (see the header comment). */
+export function getStatus() {
+  const view = !active ? null : active === r3d && r3d ? '3d' : '2d';
+  return {
+    mode,
+    view,
+    loading: mode === '3d' && view !== '3d',
+    unsupported: webgl2 === false,
+    paused,
+    failed: loadFailed,
+  };
+}
+
+/** Calls cb(getStatus()) whenever the status changes. Returns an unsubscribe function. */
+export function onStatus(cb) {
+  if (typeof cb !== 'function') return () => {};
+  statusListeners.add(cb);
+  return () => statusListeners.delete(cb);
+}
+
+/** Probes WebGL2 now (once per page; cheap afterwards). True when the 3D board can run. */
+export function probe3d() {
+  const ok = supportsWebGL2();
+  refresh();
+  return ok;
+}
+
+/**
+ * Renderer options ({ speed: 'normal'|'fast'|'instant', camera: 'cinematic'|'calm'|'free',
+ * quality: 'auto'|'low'|'medium'|'high' }; any subset). Remembered here and forwarded to the
+ * active renderer's setOptions?.() now, to the 3D renderer as soon as it has loaded, and to each
+ * renderer again when it takes over #board. Renderers ignore what they don't use.
+ */
+export function setOptions(opts) {
+  if (!opts || typeof opts !== 'object') return;
+  options = { ...options, ...opts };
+  forwardOptions(active);
+}
+
+export function getOptions() {
+  return { ...options };
 }
 
 /** Shows or hides the small 2D|3D toggle drawn inside #board (e.g. when ui.js offers its own). */
@@ -135,6 +194,32 @@ function notify() {
       console.error('[renderer-switch] mode listener failed:', err);
     }
   }
+  refresh();
+}
+
+/** Updates the in-board toggle and tells status listeners, if anything in getStatus() changed. */
+function refresh() {
+  updateToggle();
+  const status = getStatus();
+  const sig = JSON.stringify(status);
+  if (sig === statusSig) return;
+  statusSig = sig;
+  for (const cb of statusListeners) {
+    try {
+      cb({ ...status });
+    } catch (err) {
+      console.error('[renderer-switch] status listener failed:', err);
+    }
+  }
+}
+
+function forwardOptions(target) {
+  if (!target) return;
+  try {
+    target.setOptions?.({ ...options });
+  } catch (err) {
+    console.error('[renderer-switch] setOptions failed:', err);
+  }
 }
 
 /** 3D can't go on: show 2D for this page (the saved choice stays), and say why on the toggle. */
@@ -147,7 +232,7 @@ function pause(reason) {
     notify();
     if (last) render(last.state, [], last.myPlayerId);
   }
-  updateToggle();
+  refresh();
 }
 
 /** WebGL2 is required by three.js r163+. The probe context is released straight away. */
@@ -165,13 +250,13 @@ function supportsWebGL2() {
 
 function ensure3d() {
   if (r3d || loading3d) return loading3d;
-  updateToggle();
   loading3d = import('./renderer3d.js')
     .then((mod) => {
       r3d = mod;
       loading3d = null;
+      forwardOptions(r3d); // before it builds anything
       if (mode === '3d' && last) render(last.state, [], last.myPlayerId);
-      else updateToggle();
+      else refresh();
       return mod;
     })
     .catch((err) => {
@@ -183,8 +268,9 @@ function ensure3d() {
         notify();
         if (last) render(last.state, [], last.myPlayerId);
       }
-      updateToggle();
+      refresh();
     });
+  refresh();
   return loading3d;
 }
 
@@ -204,6 +290,7 @@ function draw(events) {
   target.render(last.state, switched ? [] : events, last.myPlayerId);
   mountToggle();
   mountVeil();
+  refresh();
 }
 
 /**
@@ -232,7 +319,10 @@ function cancelSwap() {
   swapReady = false;
 }
 
-/** Makes `target` the owner of #board. Returns true if it just took over. */
+/**
+ * Makes `target` the owner of #board. Returns true if it just took over. It gets the current
+ * options, and status listeners hear about the new view, before it draws anything.
+ */
 function use(target) {
   if (active === target) return false;
   const prev = active;
@@ -245,6 +335,8 @@ function use(target) {
     }
   }
   document.getElementById('board')?.replaceChildren();
+  forwardOptions(target);
+  refresh();
   return true;
 }
 
@@ -290,7 +382,7 @@ function buildToggle() {
     b.addEventListener('click', (e) => {
       e.stopPropagation();
       if (m === '3d' && supportsWebGL2() === false) {
-        updateToggle();
+        refresh();
         return;
       }
       setMode(m);
@@ -298,10 +390,7 @@ function buildToggle() {
     if (m === '3d') {
       // Probe WebGL2 only when someone shows interest in 3D (not on every 2D page load).
       const probe = () => {
-        if (webgl2 === null) {
-          supportsWebGL2();
-          updateToggle();
-        }
+        if (webgl2 === null) probe3d();
       };
       b.addEventListener('pointerenter', probe);
       b.addEventListener('focus', probe);
@@ -359,6 +448,8 @@ function injectStyles() {
 .rsw-veil { position: absolute; inset: 0; z-index: 19; display: grid; place-items: center; border-radius: 8px;
   background: rgb(20 14 10 / 0.55); color: #fff; font: 700 16px/1.2 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   letter-spacing: 0.02em; pointer-events: none; }
+/* Full-screen 3D layout (ui.js: body.board-3d): the 2D board waiting underneath isn't shown at all. */
+body.board-3d .rsw-veil { border-radius: 0; background: #1b130e; }
 `;
   document.head.append(style);
 }

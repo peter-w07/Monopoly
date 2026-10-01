@@ -7,12 +7,22 @@
 //
 // sync(ctx, animate) reconciles every ownable tile with the public state; with animate = true the
 // differences pop in / out through the shared Animator, otherwise they snap.
+//
+// The slab is a bevelled, rounded block slightly larger than the printed face (a dark rim with a
+// gold inlay line round the face) whose sides carry a printed trim: a dark green band, a gold
+// pinstripe and a row of the colour-group colours. The face texture is drawn at the quality
+// tier's size (2048 / 3072 / 4096 px) and redrawn when the tier changes (world bus 'tier').
 
 import * as THREE from './three.js';
 import { drawBoardCanvas, COLORS } from './board-texture.js';
 import { UNITS, CORNER, BAND, SLAB_H, JAIL_CELL, DECK_SPOTS, sideOf, tileCenter, toWorld, SIDE_ROT } from './layout.js';
 import { ease } from './tween.js';
-import { mergeParts } from './token-models.js';
+import { Kit, roundedRect, canvas } from './world-geo.js';
+import { worldBus } from './world-quality.js';
+
+const RIM = 0.16; // dark rim round the printed face
+const SLAB_BEVEL = 0.05;
+const SLAB_CORNER = 0.22;
 
 const TILE_W = 1;
 const TILE_D = CORNER;
@@ -34,22 +44,44 @@ export function createBoard(BOARD, { renderer, animator, markShadows, fx = null 
   const maxAniso = renderer.capabilities.getMaxAnisotropy();
 
   // ---- slab with the printed face ----------------------------------------------------------------
-  const texSize = Math.min(2048, renderer.capabilities.maxTextureSize || 2048);
+  const bus = worldBus(renderer);
+  const maxTex = renderer.capabilities.maxTextureSize || 2048;
+  let texSize = Math.min(bus.tier?.boardTex ?? 2048, maxTex);
   const faceTex = new THREE.CanvasTexture(drawBoardCanvas(BOARD, texSize));
   faceTex.colorSpace = THREE.SRGBColorSpace;
   faceTex.anisotropy = maxAniso;
   faceTex.generateMipmaps = true;
-  const faceMat = new THREE.MeshStandardMaterial({ map: faceTex, roughness: 0.78, metalness: 0 });
-  const edgeMat = new THREE.MeshStandardMaterial({ color: '#173a25', roughness: 0.6 });
-  // The slab (one material) with the printed face as a plane just on top: 2 draw calls, not 6.
+  faceTex.minFilter = THREE.LinearMipmapLinearFilter;
+  const faceMat = new THREE.MeshStandardMaterial({ map: faceTex, roughness: 0.74, metalness: 0 });
+  // The slab (caps + printed side trim: 2 materials) with the printed face as a plane just on top.
   // The plane is UV-mapped exactly like the canvas (u → +x, v → +z).
-  const slab = new THREE.Mesh(new THREE.BoxGeometry(UNITS, SLAB_H - 0.004, UNITS), edgeMat);
-  slab.position.y = -SLAB_H / 2 - 0.002;
+  const trimTex = new THREE.CanvasTexture(trimCanvas(BOARD));
+  trimTex.colorSpace = THREE.SRGBColorSpace;
+  trimTex.wrapS = THREE.RepeatWrapping;
+  trimTex.repeat.set(0.5, 1);
+  trimTex.anisotropy = maxAniso;
+  const capMat = new THREE.MeshStandardMaterial({ color: '#173a25', roughness: 0.55 });
+  const trimMat = new THREE.MeshStandardMaterial({ map: trimTex, roughness: 0.5 });
+  const slab = new THREE.Mesh(slabGeometry(), [capMat, trimMat]);
   slab.receiveShadow = true;
   slab.castShadow = true;
   const face = new THREE.Mesh(new THREE.PlaneGeometry(UNITS, UNITS).rotateX(-Math.PI / 2), faceMat);
   face.receiveShadow = true;
-  group.add(slab, face);
+  const inlay = new THREE.Mesh(frameGeometry(UNITS + 0.13, UNITS + 0.13, 0.03, 0.004), new THREE.MeshStandardMaterial({ color: '#d8b25a', metalness: 0.8, roughness: 0.3 }));
+  inlay.position.y = -0.003;
+  group.add(slab, face, inlay);
+
+  /** Redraws the face at `size` px (quality tier change). */
+  function setTextureSize(size) {
+    const next = Math.min(Math.max(512, size | 0), maxTex);
+    if (next === texSize) return;
+    texSize = next;
+    // The GL texture has immutable storage at the old size: free it, it's re-created on upload.
+    faceTex.dispose();
+    faceTex.image = drawBoardCanvas(BOARD, texSize);
+    faceTex.needsUpdate = true;
+  }
+  const offTier = bus.on('tier', (t) => setTextureSize(t.boardTex));
 
   // ---- card piles -----------------------------------------------------------------------------
   const decks = {};
@@ -81,8 +113,9 @@ export function createBoard(BOARD, { renderer, animator, markShadows, fx = null 
     new THREE.MeshBasicMaterial({ map: mortgageTexture(maxAniso), transparent: true, depthWrite: false, toneMapped: false }),
     ownable.length,
   );
-  const houses = new THREE.InstancedMesh(houseGeometry(0.21, 0.17, 0.12, 0.26), new THREE.MeshStandardMaterial({ color: COL_HOUSE, roughness: 0.45 }), properties.length * 4);
-  const hotels = new THREE.InstancedMesh(houseGeometry(0.6, 0.25, 0.14, 0.28), new THREE.MeshStandardMaterial({ color: COL_HOTEL, roughness: 0.45 }), properties.length);
+  // Game pieces on the colour band (the town in the middle shows the same development at scale).
+  const houses = new THREE.InstancedMesh(houseGeometry(0.18, 0.14, 0.1, 0.22), new THREE.MeshStandardMaterial({ color: COL_HOUSE, roughness: 0.45 }), properties.length * 4);
+  const hotels = new THREE.InstancedMesh(houseGeometry(0.5, 0.21, 0.12, 0.24), new THREE.MeshStandardMaterial({ color: COL_HOTEL, roughness: 0.45 }), properties.length);
   frames.castShadow = plates.castShadow = true;
   houses.castShadow = hotels.castShadow = true;
   houses.receiveShadow = hotels.receiveShadow = true;
@@ -345,13 +378,116 @@ export function createBoard(BOARD, { renderer, animator, markShadows, fx = null 
     });
   }
 
+  /** The bars lift off the cell and settle back (someone left jail). ~0.9 s, no sound. */
+  function cageLift(delay = 0) {
+    animator.add({
+      delay,
+      duration: 0.9,
+      update: (p) => {
+        const up = p < 0.45 ? ease.outCubic(p / 0.45) : 1 - ease.outBounce((p - 0.45) / 0.55);
+        cage.position.y = 0.55 * up;
+        markShadows();
+      },
+      end: () => {
+        cage.position.y = 0;
+        markShadows();
+      },
+    });
+  }
+
   /** Current visual state of an ownable tile (for tests / debugging). */
   function inspect(i) {
     const v = vis.get(i);
     return v && { owner: v.owner, color: `#${v.color.getHexString()}`, mortgaged: v.mortgaged, houses: v.houses, frame: v.frame, cover: v.cover, house: v.house.slice(), hotel: v.hotel, pending: pending === i };
   }
 
-  return { group, sync, syncTile, reset, setPending, flash, ambient, drawCard, deckPose, cageBounce, inspect, ownable };
+  return {
+    group,
+    sync,
+    syncTile,
+    reset,
+    setPending,
+    flash,
+    ambient,
+    drawCard,
+    deckPose,
+    cageBounce,
+    cageLift,
+    inspect,
+    ownable,
+    setTextureSize,
+    /** Current face texture size in px. */
+    get textureSize() { return texSize; },
+    /** Stops listening to quality changes (the stage's dispose frees the GPU side). */
+    dispose() { offTier(); },
+  };
+}
+
+// ---- slab ------------------------------------------------------------------------------------------
+
+/**
+ * The board block: a rounded square a rim wider than the face, bevelled top and bottom, top at
+ * y = -0.002 (the face plane sits at 0). Group 0 = caps, group 1 = sides + bevels, whose UVs are
+ * re-mapped for the trim texture: u = distance along the edge (world units), v = height (0..1).
+ */
+function slabGeometry() {
+  const half = UNITS / 2 + RIM;
+  const bt = 0.04;
+  const height = SLAB_H - 0.004;
+  const depth = height - 2 * bt;
+  const geo = new THREE.ExtrudeGeometry(roundedRect(2 * half, 2 * half, SLAB_CORNER), {
+    depth,
+    bevelEnabled: true,
+    bevelThickness: bt,
+    bevelSize: SLAB_BEVEL,
+    bevelSegments: 3,
+    curveSegments: 6,
+  });
+  geo.rotateX(-Math.PI / 2);
+  geo.translate(0, -0.002 - height + bt, 0);
+  const pos = geo.attributes.position;
+  const nor = geo.attributes.normal;
+  const uv = geo.attributes.uv;
+  const y0 = -0.002 - height;
+  const side = geo.groups.find((g) => g.materialIndex === 1);
+  if (side) {
+    for (let k = side.start; k < side.start + side.count; k++) {
+      const x = pos.getX(k);
+      const z = pos.getZ(k);
+      const nx = Math.abs(nor.getX(k));
+      const nz = Math.abs(nor.getZ(k));
+      // Distance along the edge: x on the ±z sides, z on the ±x sides (corners are short).
+      const u = nx > nz ? z * Math.sign(x || 1) : -x * Math.sign(z || 1);
+      uv.setXY(k, u, (pos.getY(k) - y0) / height);
+    }
+    uv.needsUpdate = true;
+  }
+  return geo;
+}
+
+/**
+ * The printed side trim (one repeat = 2 world units along the edge): dark green, a gold
+ * pinstripe, a row of colour-group blocks, a cream edge line.
+ */
+function trimCanvas(board) {
+  const { cv, g } = canvas(512, 64);
+  const colors = Object.values(board?.groups ?? {}).map((x) => x.color).filter(Boolean);
+  const list = colors.length ? colors : ['#955436', '#aae0fa', '#d93a96', '#f7941d', '#ed1b24', '#fef200', '#1fb25a', '#0072bb'];
+  g.fillStyle = '#173a25';
+  g.fillRect(0, 0, 512, 64);
+  // Canvas row 0 is the top of the side (v = 1).
+  g.fillStyle = '#efe6cf';
+  g.fillRect(0, 9, 512, 3);
+  const w = 512 / list.length;
+  list.forEach((c, k) => {
+    g.fillStyle = c;
+    g.fillRect(k * w + 4, 17, w - 8, 15);
+  });
+  g.fillStyle = '#d8b25a';
+  g.fillRect(0, 38, 512, 3);
+  g.fillStyle = 'rgba(0,0,0,0.3)';
+  g.fillRect(0, 60, 512, 4);
+  return cv;
 }
 
 // ---- geometry helpers ------------------------------------------------------------------------------
@@ -514,8 +650,18 @@ function buildCage() {
     r.rotation.y = rot;
     rails.add(r);
   }
-  const railMesh = new THREE.Mesh(mergeParts(rails), iron); // one draw call for all four rails
+  const railMesh = new THREE.Mesh(mergeGroup(rails), iron); // one draw call for all four rails
   railMesh.castShadow = true;
   cage.add(railMesh);
   return cage;
+}
+
+/** Merges a group's child meshes (their own transforms applied) into one geometry. */
+function mergeGroup(group) {
+  const kit = new Kit();
+  for (const m of group.children) {
+    m.updateMatrix();
+    kit.add(m.geometry, { matrix: m.matrix });
+  }
+  return kit.build();
 }
