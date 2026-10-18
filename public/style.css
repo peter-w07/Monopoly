@@ -1301,9 +1301,10 @@ body.board-3d .dialog-layer:has(.dialog-trade) { padding: 12px 16px; }
 body.board-3d .dialog { border-color: var(--glass-edge); }
 body.board-3d .dialog:not(.shown) { animation: rise-in .26s cubic-bezier(.2, .9, .3, 1.15); }
 
-/* Toasts: top centre of the uncovered part */
+/* Toasts: top centre of the uncovered part, one row down so they never cover the 3D turn chip
+   (top-left of the same area) when the uncovered width is narrow. */
 body.board-3d .toasts {
-  top: calc(var(--safe-top, 0px) + 10px);
+  top: calc(var(--safe-top, 0px) + 58px);
   right: var(--safe-right, 0px);
   bottom: auto;
   left: var(--safe-left, 0px);
