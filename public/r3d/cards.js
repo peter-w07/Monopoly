@@ -1,7 +1,9 @@
-// public/r3d/cards.js — a drawn Chance / Community Chest card hops off its pile, flips over with a
-// little twirl as it flies up, lands in front of the camera with a settle wobble (text facing the
-// player), floats there for a moment, then flicks away. The overlay shows the same text as a
-// caption (overlay.showCard), which stays readable a little longer.
+// public/r3d/cards.js — a drawn Chance / Community Chest card hops out of its kiosk's ticket slot
+// (or the community hall's chest), flips over with a little twirl as it flies up, lands in front of
+// the camera with a settle wobble (text facing the player), floats there for a moment, then flicks
+// away. The overlay shows the same text as a caption (overlay.showCard), which stays readable a
+// little longer. Sizes are in metres: the card hangs VIEW_DIST (3 m) in front of the camera, so the
+// camera's near plane must stay ≤ 1 m (the director / stage keep it so).
 //
 // Also the card artwork shared with fx.js: rounded card geometry and title-deed textures (trades).
 
@@ -25,7 +27,8 @@ export class CardFlight {
    * @param {THREE.Scene} scene
    * @param {THREE.PerspectiveCamera} camera
    * @param {import('./tween.js').Animator} animator
-   * @param {object} board createBoard(...) (deckPose)
+   * @param {{deckPose(deck:string):{position,quaternion,w,h}}} board where a deck's card starts: the
+   *   renderer's adapter returns the current kiosk / chest anchor pose (landmarks.kiosk(...).cardPose)
    * @param {{w:number,h:number}} size live canvas size
    * @param {{sfx?: object}} [opts]
    */

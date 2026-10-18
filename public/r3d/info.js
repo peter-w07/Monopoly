@@ -2,13 +2,32 @@
 // rents, owner, buildings and the rent right now. Pure; no DOM, no three.js.
 
 const money = (n) => `$${Number(n) || 0}`;
+// Where each square is in the 3D city (city design §5, §6.2).
+export const HOOD = {
+  brown: 'Brickworks Row', lightblue: 'Old Town', pink: 'Market Lanes', orange: 'Midtown Brownstones',
+  red: 'Theatre Row', yellow: 'Downtown', green: 'Bank Quarter', darkblue: 'Harbour Heights',
+};
+const PLACE = {
+  railroad: 'Circle Line station', utility: 'City utility', chance: 'Fortune Kiosk', community: 'Community Hall',
+  tax: 'City Revenue Office', go: 'GO Plaza & City Bank', jail: 'Central Police Station', free_parking: 'Parking Plaza',
+  go_to_jail: 'Police checkpoint',
+};
+
+/** The place a tile is in the 3D city: its neighbourhood (properties) or what stands there. */
+export function placeOf(BOARD, i) {
+  const t = BOARD?.tiles?.[i];
+  if (!t) return '';
+  if (t.type === 'property') return HOOD[t.group] ?? '';
+  if (t.type === 'tax' && /luxury/i.test(String(t.name))) return 'The Jeweller';
+  return PLACE[t.type] ?? '';
+}
 const isOwnable = (t) => t?.type === 'property' || t?.type === 'railroad' || t?.type === 'utility';
 
 /**
  * @param {object} BOARD parsed board.json
  * @param {object} ctx   render context (renderer3d makeCtx)
  * @param {number} i     tile index
- * @returns {{name:string, band:string, owner:{name:string,color:string}|null, status:string[], facts:string[]}|null}
+ * @returns {{name:string, band:string, owner:{name:string,color:string}|null, status:string[], facts:string[], where:string}|null}
  */
 export function tileInfo(BOARD, ctx, i) {
   const tile = BOARD?.tiles?.[i];
@@ -58,7 +77,9 @@ export function tileInfo(BOARD, ctx, i) {
     }
   }
   const band = tile.type === 'property' ? BOARD.groups?.[tile.group]?.color ?? '' : '';
-  return { name: String(tile.name ?? ''), band, owner, status, facts };
+  const where = placeOf(BOARD, i);
+  if (where) facts.unshift(tile.type === 'property' ? `${where} · ${BOARD.groups?.[tile.group]?.name ?? ''} set` : where);
+  return { name: String(tile.name ?? ''), band, owner, status, facts, where };
 }
 
 function currentRent(BOARD, tile, ctx, ownerId, houses) {

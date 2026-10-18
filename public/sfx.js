@@ -857,7 +857,369 @@ const SOUNDS = {
     whistle(v, 0.35 + v.rnd() * 0.2, 0.035);
     whistle(v, 0.9 + v.rnd() * 0.3, 0.03);
   } },
+
+  // =================================================================================================
+  // The city (design §14.2): crowds, streets, construction, landmarks, nature and the time-lapse.
+  // Every one of these is under 1 s; most are tied to a place (sfx.play(name, { pos })).
+  // =================================================================================================
+
+  // --- crowds -------------------------------------------------------------------------------------
+  crowdAww: { dur: 0.95, max: 1, vary: 0.02, gain: 1.2, fn(v) { // a crowd's sympathetic "awww", falling
+    for (let k = 0; k < 10; k++) {
+      const f0 = 330 * 2 ** (((v.rnd() * 2 - 1) * 40) / 1200) * (0.85 + v.rnd() * 0.3);
+      formantVoice(v, v.rnd() * 0.08, {
+        path: [[0, f0], [0.55, f0 * 0.66]],
+        formants: [{ f: 700, q: 4, g: 1, path: [[0, 700], [0.55, 380]] }, { f: 1100, q: 5, g: 0.55, path: [[0, 1100], [0.55, 760]] }],
+        a: 0.09, hold: 0.3, d: 0.38, peak: 0.05, vib: 0.01,
+      });
+    }
+    hiss(v, 0, { color: 'pink', f: 600, q: 0.9, a: 0.1, hold: 0.3, d: 0.4, peak: 0.04 });
+  } },
+  crowdOoh: { dur: 0.85, max: 1, vary: 0.02, gain: 1.2, fn(v) { // an impressed "ooh", rising
+    for (let k = 0; k < 10; k++) {
+      const f0 = 200 * 2 ** (((v.rnd() * 2 - 1) * 40) / 1200) * (0.9 + v.rnd() * 0.2);
+      formantVoice(v, v.rnd() * 0.06, {
+        path: [[0, f0], [0.45, f0 * 1.5]],
+        formants: [{ f: 330, q: 4, g: 1, path: [[0, 330], [0.45, 520]] }, { f: 870, q: 5, g: 0.5, path: [[0, 870], [0.45, 920]] }],
+        a: 0.08, hold: 0.3, d: 0.35, peak: 0.05, vib: 0.01,
+      });
+    }
+    hiss(v, 0, { color: 'pink', f: 500, q: 0.9, a: 0.08, hold: 0.3, d: 0.35, peak: 0.03 });
+  } },
+  applause: { dur: 0.95, max: 1, vary: 0.02, gain: 1.3, fn(v) { // a short round of applause
+    const c = v.ctx;
+    const t = T(v, 0);
+    const buf = applauseBuffer(c);
+    const src = c.createBufferSource();
+    src.buffer = buf;
+    src.playbackRate.value = v.r;
+    const e = gainNode(c);
+    const end = held(e.gain, t, 0.6, 0.04 / v.r, 0.5 / v.r, 0.3 / v.r, 0.9);
+    src.connect(filterNode(c, 'highpass', 300, 0.7)).connect(e).connect(v.out);
+    src.start(t, 0.35);
+    src.stop(end);
+  } },
+  coinsIn: { dur: 0.7, max: 2, vary: 0, gain: 0.95, fn(v) { // money arriving: four coins rising C E G C
+    ['C6', 'E6', 'G6', 'C7'].forEach((n, k) => coinAt(v, k * 0.07, hzOf(n), 0.15, 0.35));
+    hiss(v, 0.21, { type: 'highpass', f: 7000, a: 0.01, d: 0.2, peak: 0.03 });
+  } },
+
+  // --- streets ------------------------------------------------------------------------------------
+  siren: { dur: 0.95, max: 1, vary: 0.01, gain: 0.9, fn(v) { // one wail of a police siren
+    const c = v.ctx;
+    const t = T(v, 0);
+    const e = gainNode(c);
+    const end = held(e.gain, t, 0.22, 0.03 / v.r, 0.72 / v.r, 0.12 / v.r, 0.9);
+    for (const [type, g, lpf] of [['triangle', 1, 0], ['square', 0.18, 2600]]) {
+      const o = c.createOscillator();
+      o.type = type;
+      o.frequency.setValueAtTime(620 * v.r, t);
+      o.frequency.linearRampToValueAtTime(1320 * v.r, t + 0.42 / v.r);
+      o.frequency.linearRampToValueAtTime(680 * v.r, t + 0.86 / v.r);
+      let node = o.connect(gainNode(c, g));
+      if (lpf) node = node.connect(filterNode(c, 'lowpass', lpf * v.r, 0.7));
+      node.connect(filterNode(c, 'bandpass', 1100 * v.r, 0.9)).connect(e);
+      o.start(t);
+      o.stop(end);
+    }
+    e.connect(v.out);
+  } },
+  whistleCop: { dur: 0.5, max: 1, vary: 0.02, gain: 0.9, fn(v) { // a traffic cop's whistle: "fweet — fweeeet"
+    for (const [at, hold] of [[0, 0.11], [0.17, 0.22]]) {
+      tone(v, at, { f: 2900, a: 0.008, hold, d: 0.04, peak: 0.12, vib: 0.06, vibRate: 34 });
+      hiss(v, at, { f: 3000, q: 1.5, a: 0.005, hold, d: 0.04, peak: 0.02 });
+    }
+  } },
+  hornCar: { dur: 0.45, max: 2, vary: 0.04, gain: 0.8, fn(v) { // an everyday car horn (a major third)
+    for (const f of [415, 523]) {
+      tone(v, 0, { type: 'sawtooth', f, a: 0.012, hold: 0.28, d: 0.05, sustain: 0.9, peak: 0.07, lp: 1800, q: 1.2 });
+      tone(v, 0, { type: 'square', f, a: 0.012, hold: 0.28, d: 0.05, sustain: 0.9, peak: 0.03, lp: 1200 });
+    }
+  } },
+  hornBus: { dur: 0.7, max: 1, vary: 0.02, gain: 0.8, fn(v) { // a bus: lower and longer
+    for (const f of [233, 294]) {
+      tone(v, 0, { type: 'sawtooth', f, a: 0.02, hold: 0.48, d: 0.08, sustain: 0.9, peak: 0.08, lp: 1300, q: 1.4 });
+      tone(v, 0, { type: 'square', f, a: 0.02, hold: 0.48, d: 0.08, sustain: 0.9, peak: 0.035, lp: 800 });
+    }
+  } },
+  bikeBell: { dur: 0.45, max: 2, vary: 0.02, gain: 0.85, fn(v) { // "ring-ring"
+    clinkAt(v, 0, 2350, 0.16, 0.26);
+    clinkAt(v, 0.13, 2350, 0.16, 0.28);
+    hiss(v, 0, { type: 'highpass', f: 6000, a: 0.001, d: 0.006, peak: 0.04 });
+  } },
+  tramBell: { dur: 0.5, max: 1, vary: 0.01, gain: 0.85, fn(v) { // "ding-ding" (the bus at its stops, trams)
+    for (const at of [0, 0.16]) {
+      modal(v, at, 1250, BELL, 0.18, { decay: 0.3 });
+      hiss(v, at, { type: 'highpass', f: 5000, a: 0.001, d: 0.005, peak: 0.03 });
+    }
+  } },
+  trainHorn: { dur: 0.9, max: 1, vary: 0.01, gain: 1, fn(v) { // a three-chime train horn
+    for (const [f, g] of [[277, 1], [349, 0.85], [415, 0.7]]) brass(v, 0, f, 0.68, 0.05 * g, { bright: 3 });
+  } },
+  brakeSqueal: { dur: 0.6, max: 2, vary: 0.04, gain: 0.8, fn(v) { // a bus or truck pulling up
+    const c = v.ctx;
+    const t = T(v, 0);
+    const o = c.createOscillator();
+    o.type = 'triangle';
+    o.frequency.setValueAtTime(2700 * v.r, t);
+    o.frequency.exponentialRampToValueAtTime(2350 * v.r, t + 0.5 / v.r);
+    const e = gainNode(c);
+    const end = held(e.gain, t, 0.07, 0.04 / v.r, 0.38 / v.r, 0.1 / v.r, 0.8);
+    oscNode(c, 'sine', 23, t, end).connect(gainNode(c, 2700 * v.r * 0.012)).connect(o.frequency);
+    o.connect(filterNode(c, 'bandpass', 2500 * v.r, 6)).connect(e).connect(v.out);
+    o.start(t);
+    o.stop(end);
+    hiss(v, 0, { f: 2600, q: 5, a: 0.04, hold: 0.36, d: 0.1, peak: 0.03 });
+  } },
+  skid: { dur: 0.5, max: 1, vary: 0.04, gain: 0.8, fn(v) { // tyres screeching
+    hiss(v, 0, { path: [[0, 2300], [0.4, 1500]], q: 7, a: 0.01, hold: 0.3, d: 0.12, peak: 0.25 });
+    hiss(v, 0, { color: 'pink', f: 900, q: 1, a: 0.01, hold: 0.3, d: 0.12, peak: 0.08 });
+  } },
+  reverseBeep: { dur: 0.5, max: 2, vary: 0, gain: 0.7, fn(v) { // one reversing beep (repeat every 0.5 s)
+    tone(v, 0, { type: 'square', f: 1040, a: 0.004, hold: 0.22, d: 0.02, peak: 0.05, lp: 3000 });
+    tone(v, 0, { f: 1040, a: 0.004, hold: 0.22, d: 0.02, peak: 0.05 });
+  } },
+  hydraulicHop: { dur: 0.45, max: 2, vary: 0.04, gain: 1, fn(v) { // the boot car's lowrider bounce
+    hiss(v, 0, { type: 'highpass', f: 2200, a: 0.004, hold: 0.06, d: 0.14, peak: 0.12 });
+    thump(v, 0.05, 160, 70, 0.12, 0.3);
+    tone(v, 0.08, { f: 190, f2: 140, a: 0.005, d: 0.3, peak: 0.08, vib: 0.08, vibRate: 11 });
+  } },
+  meow: { dur: 0.45, max: 1, vary: 0.05, gain: 0.75, fn(v) { // the tabby's "mee-ow"
+    formantVoice(v, 0, {
+      path: [[0, 520], [0.12, 820], [0.34, 560]],
+      formants: [{ f: 900, q: 4, g: 1, path: [[0, 900], [0.12, 1800], [0.34, 1000]] }, { f: 2900, q: 6, g: 0.35 }],
+      a: 0.025, hold: 0.24, d: 0.12, peak: 0.5,
+    });
+  } },
+  footstep: { dur: 0.1, max: 6, gap: 0.02, vary: 0.06, gain: 1, fn(v) { // one shoe step (rate = surface)
+    thump(v, 0, 130, 70, 0.04, 0.22);
+    hiss(v, 0, { type: 'lowpass', f: 1800, a: 0.002, d: 0.035, peak: 0.12 });
+    hiss(v, 0.004, { f: 3200, q: 1.2, a: 0.001, d: 0.012, peak: 0.05 });
+  } },
+  pawStep: { dur: 0.08, max: 6, gap: 0.015, vary: 0.08, gain: 1, fn(v) { // a dog's or cat's padded step
+    hiss(v, 0, { f: 2400, q: 1, a: 0.002, d: 0.025, peak: 0.08 });
+    thump(v, 0, 260, 170, 0.025, 0.08);
+  } },
+  engineStart: { dur: 0.8, max: 1, vary: 0.03, gain: 0.9, fn(v) { // starter whirr, the engine catches and revs
+    const c = v.ctx;
+    const t = T(v, 0);
+    const st = gainNode(c);
+    const stEnd = held(st.gain, t, 0.12, 0.01 / v.r, 0.3 / v.r, 0.04 / v.r, 0.8);
+    const so = c.createOscillator();
+    so.type = 'sawtooth';
+    so.frequency.setValueAtTime(110 * v.r, t);
+    so.frequency.linearRampToValueAtTime(150 * v.r, t + 0.3 / v.r);
+    const am = gainNode(c, 0.5);
+    oscNode(c, 'square', 11 * v.r, t, stEnd).connect(gainNode(c, 0.45)).connect(am.gain);
+    so.connect(am).connect(filterNode(c, 'lowpass', 900 * v.r, 1)).connect(st).connect(v.out);
+    so.start(t);
+    so.stop(stEnd);
+    thump(v, 0.32, 90, 50, 0.1, 0.25);
+    const rt = T(v, 0.33);
+    const re = gainNode(c);
+    const rEnd = held(re.gain, rt, 0.2, 0.02 / v.r, 0.3 / v.r, 0.1 / v.r, 0.7);
+    const putt = gainNode(c, 0.55);
+    oscNode(c, 'square', 22 * v.r, rt, rEnd).connect(gainNode(c, 0.4)).connect(putt.gain);
+    for (const k of [1, 1.012]) {
+      const o = c.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.setValueAtTime(45 * k * v.r, rt);
+      o.frequency.exponentialRampToValueAtTime(110 * k * v.r, rt + 0.15 / v.r);
+      o.frequency.exponentialRampToValueAtTime(72 * k * v.r, rt + 0.4 / v.r);
+      o.connect(putt);
+      o.start(rt);
+      o.stop(rEnd);
+    }
+    putt.connect(filterNode(c, 'lowpass', 700 * v.r, 1.5)).connect(re).connect(v.out);
+  } },
+  doorSlam: { dur: 0.3, max: 2, vary: 0.04, gain: 1, fn(v) { // a car door
+    thump(v, 0, 110, 55, 0.13, 0.4);
+    hiss(v, 0, { color: 'brown', type: 'lowpass', f: 1200, a: 0.001, d: 0.08, peak: 0.25 });
+    knock(v, 0.012, 2300, 0.06, 0.3);
+    modal(v, 0, 240, METAL, 0.03, { decay: 0.12 });
+  } },
+  ribbonSnip: { dur: 0.3, max: 1, vary: 0.03, gain: 1, fn(v) { // ceremonial scissors through a ribbon
+    clinkAt(v, 0, 4200, 0.06, 0.07);
+    hiss(v, 0, { type: 'highpass', f: 5000, a: 0.001, d: 0.012, peak: 0.08 });
+    clinkAt(v, 0.055, 4600, 0.05, 0.06);
+    hiss(v, 0.055, { type: 'highpass', f: 5000, a: 0.001, d: 0.012, peak: 0.07 });
+    hiss(v, 0.07, { path: [[0, 4500], [0.15, 1800]], q: 0.8, a: 0.02, d: 0.15, peak: 0.06 });
+  } },
+  confettiPop: { dur: 0.35, max: 3, vary: 0.05, gain: 1, fn(v) { // a confetti cannon: pop and paper
+    hiss(v, 0, { type: 'lowpass', f: 1500, a: 0.001, d: 0.045, peak: 0.35 });
+    thump(v, 0, 320, 90, 0.06, 0.25);
+    hiss(v, 0.05, { type: 'highpass', f: 4000, a: 0.02, hold: 0.08, d: 0.15, peak: 0.05 });
+  } },
+  firework: { dur: 0.95, max: 4, gap: 0.05, vary: 0.05, gain: 1, fn(v) { // whistle up, BOOM (0.36 s in), crackle
+    tone(v, 0, { f: 900, f2: 2400, glide: 0.34, a: 0.03, hold: 0.28, d: 0.05, sustain: 0.8, peak: 0.05 });
+    hiss(v, 0.36, { type: 'lowpass', f: 1500, a: 0.001, d: 0.06, peak: 0.4 });
+    thump(v, 0.36, 110, 40, 0.3, 0.35);
+    for (let k = 0; k < 16; k++) {
+      hiss(v, 0.45 + v.rnd() * 0.42, { type: 'highpass', f: 2500 + v.rnd() * 3000, a: 0.001, d: 0.004 + v.rnd() * 0.006, peak: 0.05 + v.rnd() * 0.08 });
+    }
+  } },
+
+  // --- construction -------------------------------------------------------------------------------
+  craneBeep: { dur: 0.5, max: 1, vary: 0, gain: 0.8, fn(v) { // a tower crane's warning beeps
+    for (const at of [0, 0.22]) tone(v, at, { type: 'square', f: 2350, a: 0.004, hold: 0.12, d: 0.02, peak: 0.045, lp: 4000 });
+  } },
+  hammer: { dur: 0.5, max: 3, vary: 0.05, gain: 1, fn(v) { // two hammer blows on a nail
+    for (const at of [0, 0.24]) {
+      knock(v, at, 1750, 0.24, 0.7);
+      thump(v, at, 280, 140, 0.05, 0.18);
+      modal(v, at, 1750, METAL, 0.03, { decay: 0.12 });
+    }
+  } },
+  drill: { dur: 0.6, max: 2, vary: 0.04, gain: 0.9, fn(v) { // a power drill
+    const c = v.ctx;
+    const t = T(v, 0);
+    const o = c.createOscillator();
+    o.type = 'square';
+    o.frequency.setValueAtTime(150 * v.r, t);
+    o.frequency.linearRampToValueAtTime(230 * v.r, t + 0.12 / v.r);
+    o.frequency.linearRampToValueAtTime(215 * v.r, t + 0.5 / v.r);
+    const am = gainNode(c, 0.6);
+    const e = gainNode(c);
+    const end = held(e.gain, t, 0.08, 0.03 / v.r, 0.44 / v.r, 0.06 / v.r, 0.85);
+    oscNode(c, 'sine', 31, t, end).connect(gainNode(c, 0.35)).connect(am.gain);
+    o.connect(am).connect(filterNode(c, 'bandpass', 1100 * v.r, 1.6)).connect(e).connect(v.out);
+    o.start(t);
+    o.stop(end);
+    hiss(v, 0.02, { f: 2600, q: 1.5, a: 0.03, hold: 0.4, d: 0.06, peak: 0.03 });
+  } },
+  demolishRumble: { dur: 0.95, max: 2, vary: 0.04, gain: 1, fn(v) { // floors collapsing into a dust cloud
+    hiss(v, 0, { color: 'brown', type: 'lowpass', f: 380, q: 0.7, a: 0.04, hold: 0.35, d: 0.5, peak: 0.45 });
+    thump(v, 0, 75, 35, 0.5, 0.35);
+    for (let k = 0; k < 10; k++) knock(v, 0.05 + v.rnd() * 0.55, 300 + v.rnd() * 900, 0.05 + v.rnd() * 0.07, 0.3);
+    hiss(v, 0.02, { color: 'pink', f: 1400, q: 0.6, a: 0.05, hold: 0.25, d: 0.4, peak: 0.07 });
+  } },
+
+  // --- landmarks ----------------------------------------------------------------------------------
+  barrierArm: { dur: 0.5, max: 2, vary: 0.02, gain: 1, fn(v) { // a boom barrier swinging, then its stop
+    tone(v, 0, { type: 'sawtooth', f: 115, f2: 175, glide: 0.3, a: 0.02, hold: 0.28, d: 0.05, sustain: 0.8, peak: 0.07, lp: 900 });
+    hiss(v, 0, { f: 1400, q: 2, a: 0.02, hold: 0.28, d: 0.05, peak: 0.02 });
+    knock(v, 0.34, 620, 0.2, 0.8);
+    thump(v, 0.34, 160, 80, 0.08, 0.2);
+  } },
+  gateSlide: { dur: 0.8, max: 1, vary: 0.02, gain: 1, fn(v) { // a heavy sliding gate rolling, then its clang
+    const c = v.ctx;
+    const t = T(v, 0);
+    const rum = gainNode(c, 0.6);
+    oscNode(c, 'square', 17, t, t + 0.66 / v.r).connect(gainNode(c, 0.35)).connect(rum.gain);
+    hiss(v, 0, { color: 'pink', f: 650, q: 1.2, a: 0.05, hold: 0.48, d: 0.1, peak: 0.2, dest: rum });
+    rum.connect(v.out);
+    tone(v, 0.08, { type: 'triangle', f: 1900, f2: 1700, a: 0.03, hold: 0.25, d: 0.08, peak: 0.012, vib: 0.02, vibRate: 19 });
+    modal(v, 0.6, 330, METAL, 0.16, { decay: 0.13 });
+    thump(v, 0.6, 140, 70, 0.1, 0.25);
+  } },
+  chainFence: { dur: 0.5, max: 2, vary: 0.04, gain: 1, fn(v) { // a chain-link fence rattling
+    for (let k = 0; k < 12; k++) clinkAt(v, v.rnd() * 0.28, 2500 + v.rnd() * 2200, 0.025 + v.rnd() * 0.03, 0.09);
+    hiss(v, 0, { type: 'highpass', f: 3500, a: 0.01, hold: 0.15, d: 0.15, peak: 0.04 });
+    thump(v, 0, 120, 70, 0.08, 0.1);
+  } },
+  splitFlap: { dur: 0.4, max: 2, vary: 0.03, gain: 1, fn(v) { // a split-flap board clattering to a new value
+    for (let k = 0; k < 9; k++) {
+      knock(v, k * 0.032, 2900 + v.rnd() * 600, 0.07, 0.18);
+      hiss(v, k * 0.032, { f: 4500, q: 1, a: 0.001, d: 0.006, peak: 0.03 });
+    }
+  } },
+  doormanBell: { dur: 0.4, max: 1, vary: 0, gain: 0.9, fn(v) { // a hotel desk bell
+    knock(v, 0, 3000, 0.04, 0.2);
+    modal(v, 0.005, 2637, BELL, 0.2, { decay: 0.34 });
+  } },
+
+  // --- nature and weather --------------------------------------------------------------------------
+  pigeonFlap: { dur: 0.5, max: 2, vary: 0.06, gain: 1, fn(v) { // pigeons taking off
+    const c = v.ctx;
+    const t = T(v, 0);
+    const fl = gainNode(c, 0.5);
+    const lfo = c.createOscillator();
+    lfo.type = 'square';
+    lfo.frequency.setValueAtTime(13 * v.r, t);
+    lfo.frequency.linearRampToValueAtTime(9 * v.r, t + 0.4 / v.r);
+    lfo.connect(gainNode(c, 0.5)).connect(fl.gain);
+    const end = hiss(v, 0, { color: 'pink', f: 1300, q: 0.9, a: 0.01, hold: 0.28, d: 0.12, peak: 0.25, dest: fl });
+    hiss(v, 0, { type: 'highpass', f: 3500, a: 0.01, hold: 0.25, d: 0.1, peak: 0.04, dest: fl });
+    lfo.start(t);
+    lfo.stop(end);
+    fl.connect(v.out);
+  } },
+  gull: { dur: 0.7, max: 2, vary: 0.06, gain: 0.7, fn(v) { // a herring gull: "kee-ow … kya"
+    const formants = [{ f: 2200, q: 5, g: 1 }, { f: 3600, q: 6, g: 0.4 }];
+    formantVoice(v, 0, { path: [[0, 1350], [0.07, 2000], [0.3, 1250], [0.45, 900]], formants, a: 0.015, hold: 0.32, d: 0.12, peak: 0.35, vib: 0.02 });
+    formantVoice(v, 0.5, { path: [[0, 1600], [0.06, 1900], [0.12, 1500]], formants, a: 0.01, hold: 0.06, d: 0.06, peak: 0.25 });
+  } },
+  foghorn: { dur: 0.95, max: 1, vary: 0, gain: 1, fn(v) { // the lighthouse / ferry: a deep long blast
+    for (const k of [1, 1.006]) tone(v, 0, { type: 'sawtooth', f: 87 * k, a: 0.14, hold: 0.55, d: 0.2, sustain: 0.85, peak: 0.12, lp: 420, q: 1.6 });
+    tone(v, 0, { type: 'square', f: 43.5, a: 0.14, hold: 0.55, d: 0.2, sustain: 0.85, peak: 0.05, lp: 200 });
+  } },
+  chirp: { dur: 0.4, max: 3, vary: 0.08, gain: 0.8, fn(v) { // a small bird
+    const n = 3 + Math.floor(v.rnd() * 2);
+    for (let k = 0; k < n; k++) tone(v, k * 0.09, { f: 2800 + v.rnd() * 300, f2: 4200 + v.rnd() * 400, a: 0.004, d: 0.05, peak: 0.05 });
+  } },
+  thunder: { dur: 0.95, max: 2, vary: 0.06, gain: 1, fn(v) { // a crack and a rolling rumble
+    hiss(v, 0, { color: 'brown', type: 'lowpass', f: 220, q: 0.7, a: 0.03, hold: 0.3, d: 0.55, peak: 0.6 });
+    for (const [at, g] of [[0, 0.25], [0.06, 0.18], [0.15, 0.12]]) hiss(v, at, { type: 'lowpass', f: 2600, a: 0.001, d: 0.07, peak: g });
+    thump(v, 0, 70, 32, 0.6, 0.35);
+    hiss(v, 0.1, { color: 'pink', f: 500, q: 0.6, a: 0.08, hold: 0.2, d: 0.5, peak: 0.12 });
+  } },
+
+  // --- the clock and the game layer ---------------------------------------------------------------
+  timelapseRise: { dur: 0.95, max: 1, vary: 0, gain: 1, fn(v) { // the city starts racing: a rising rush
+    hiss(v, 0, { color: 'pink', path: [[0, 300], [0.75, 3200]], q: 1.4, a: 0.55, hold: 0.15, d: 0.2, peak: 0.25 });
+    tone(v, 0, { f: 220, f2: 880, glide: 0.8, a: 0.5, hold: 0.2, d: 0.18, peak: 0.03 });
+    hiss(v, 0.3, { type: 'highpass', f: 6000, a: 0.4, d: 0.2, peak: 0.02 });
+  } },
+  timelapseLand: { dur: 0.6, max: 1, vary: 0, gain: 1, fn(v) { // ... and settles back to real time
+    hiss(v, 0, { color: 'pink', path: [[0, 2600], [0.4, 380]], q: 1.2, a: 0.01, hold: 0.08, d: 0.38, peak: 0.25 });
+    thump(v, 0.02, 130, 60, 0.18, 0.18);
+    glock(v, 0.04, 'G6', 0.03, 0.25);
+  } },
+  stepTick: { dur: 0.08, max: 2, gap: 0.05, vary: 0, gain: 1, fn(v) { // the counting ritual, one bay
+    knock(v, 0, 3200, 0.12, 0.22);
+    tone(v, 0, { f: 1760, a: 0.001, d: 0.03, peak: 0.04 });
+  } },
+  setComplete: { dur: 0.95, max: 1, vary: 0, duck: true, gain: 1.1, fn(v) { // a neighbourhood is yours
+    brass(v, 0, 'F4', 0.08, 0.1);
+    brass(v, 0.09, 'A4', 0.08, 0.1);
+    brass(v, 0.18, 'C5', 0.08, 0.1);
+    brass(v, 0.27, 'F5', 0.4, 0.13, { vib: 0.005 });
+    brass(v, 0.27, 'A4', 0.36, 0.06);
+    brass(v, 0.27, 'C5', 0.36, 0.06);
+    ['F6', 'A6', 'C7'].forEach((n, k) => glock(v, k * 0.09, n, 0.06, 0.3));
+    glock(v, 0.27, 'F7', 0.08, 0.5);
+    crash(v, 0.27, 0.06, 0.5);
+    timpani(v, 0.27, 'F2', 0.22, 0.5);
+  } },
+  outbid: { dur: 0.25, max: 1, vary: 0, gain: 1, fn(v) { // someone topped your bid: a falling minor third
+    glock(v, 0, 'E6', 0.2, 0.14);
+    glock(v, 0.08, 'C#6', 0.22, 0.15);
+  } },
 };
+
+/**
+ * Default priority per name (sfx.play's `priority` overrides): 0 = never dropped (score moments),
+ * 2 = dropped first when a burst of ≥ 12 voices starts within 100 ms (small and ambient sounds).
+ */
+const PRIORITY = {
+  passGo: 0, jailSlam: 0, sold: 0, auctionEnd: 0, notify: 0, offer: 0, outbid: 0, setComplete: 0, victory: 0, bankrupt: 0, hotel: 0,
+  hop: 2, diceBounce: 2, coin: 2, footstep: 2, pawStep: 2, chirp: 2, pigeonFlap: 2, gull: 2, stepTick: 2, hornCar: 2, bikeBell: 2, splitFlap: 2,
+};
+
+/** refDistance (m) of the inverse-distance model, by kind of sound (design §14.1). */
+const REF_CLASSES = [
+  [2, ['footstep', 'pawStep']],
+  [6, ['horn', 'bark', 'purr', 'meow', 'squeak', 'stomp', 'clink', 'hatSpin', 'drive', 'engineStart', 'hydraulicHop', 'reverseBeep', 'doorSlam', 'hop', 'land']],
+  [10, ['hornCar', 'brakeSqueal', 'skid', 'bikeBell']],
+  [15, ['crowdAww', 'crowdOoh', 'applause', 'cheer', 'hornBus', 'tramBell', 'pigeonFlap', 'gull', 'chirp', 'confettiPop', 'ribbonSnip', 'doormanBell']],
+  [20, ['hammer', 'drill', 'craneBeep', 'demolishRumble', 'demolish', 'build', 'barrierArm', 'gateSlide', 'chainFence', 'splitFlap']],
+  [40, ['siren', 'whistleCop']],
+  [60, ['trainHorn']],
+  [150, ['firework']],
+  [200, ['foghorn']],
+  [300, ['thunder']],
+];
+const REF_DISTANCE = new Map(REF_CLASSES.flatMap(([d, names]) => names.map((n) => [n, d])));
 
 /** Every sound name, in catalogue order. */
 export const SOUND_NAMES = Object.freeze(Object.keys(SOUNDS));
@@ -1042,6 +1404,7 @@ function ensureContext() {
   }
   chain = masterChainInto(ctx, ctx.destination, settings.enabled ? settings.volume : 0);
   warmUp(ctx);
+  try { applyListener(); } catch (err) { warnOnce(err); }
   return ctx;
 }
 
@@ -1088,12 +1451,122 @@ function admit(name, def, start, end) {
   return true;
 }
 
-/** Builds one voice of `name` into `dest` at time `t`; returns the voice's output node. */
-function voice(c, dest, name, t, { volume = 1, rate = 1, pan = 0, rnd = Math.random } = {}) {
+// --- space: the listener, positional voices -----------------------------------------------------------
+// A sound placed in the city (play(name, { pos })) runs through an equal-power PannerNode (inverse
+// distance, refDistance by kind of sound, maxDistance 800 m) and a distance low-pass, once a listener
+// has been set (sfx.setListener) and the context can make panners. Otherwise it falls back to stereo pan.
+
+const MAX_POSITIONAL = 16;
+const MAX_DISTANCE = 800;
+const listener = { set: false, x: 0, y: 0, z: 0, fx: 0, fy: 0, fz: -1, ux: 0, uy: 1, uz: 0 };
+let positional = []; // end times of live positional one-shots
+const recentStarts = new Float64Array(32); // start times of the last voices (P2 burst dropping)
+let recentAt = 0;
+
+const finite3 = (p) => !!p && Number.isFinite(Number(p.x)) && Number.isFinite(Number(p.y ?? 0)) && Number.isFinite(Number(p.z));
+const refDistanceOf = (name) => REF_DISTANCE.get(name) ?? 10;
+const distanceCutoff = (c, d) => Math.min(nyquist(c), 18000 / (1 + Math.max(0, d) / 60));
+
+function listenerDistance(p) {
+  return Math.hypot(Number(p.x) - listener.x, Number(p.y ?? 0) - listener.y, Number(p.z) - listener.z);
+}
+
+/** Stereo pan of a world point seen from the listener (the fallback when there is no panner). */
+function panOf(p) {
+  const dx = Number(p.x) - listener.x, dy = Number(p.y ?? 0) - listener.y, dz = Number(p.z) - listener.z;
+  // right = forward × up
+  const rx = listener.fy * listener.uz - listener.fz * listener.uy;
+  const ry = listener.fz * listener.ux - listener.fx * listener.uz;
+  const rz = listener.fx * listener.uy - listener.fy * listener.ux;
+  const len = Math.hypot(dx, dy, dz) || 1;
+  return clamp(((dx * rx + dy * ry + dz * rz) / len) * 0.8, -0.8, 0.8);
+}
+
+function setParam(param, value, at, tau = 0) {
+  if (!param) return;
+  if (tau > 0 && typeof param.setTargetAtTime === 'function') param.setTargetAtTime(value, at, tau);
+  else param.value = value;
+}
+
+/** A PannerNode at `p` (equal-power, inverse distance); `tau` > 0 glides an existing one. */
+function makePanner(c, p, ref) {
+  const pn = c.createPanner();
+  pn.panningModel = 'equalpower';
+  pn.distanceModel = 'inverse';
+  pn.refDistance = ref;
+  pn.maxDistance = MAX_DISTANCE;
+  pn.rolloffFactor = 1;
+  placePanner(pn, p, c.currentTime, 0);
+  return pn;
+}
+
+function placePanner(pn, p, at, tau) {
+  const x = Number(p.x), y = Number(p.y ?? 0), z = Number(p.z);
+  if (pn.positionX) {
+    setParam(pn.positionX, x, at, tau);
+    setParam(pn.positionY, y, at, tau);
+    setParam(pn.positionZ, z, at, tau);
+  } else if (typeof pn.setPosition === 'function') {
+    pn.setPosition(x, y, z);
+  }
+}
+
+function applyListener() {
+  if (!ctx || !listener.set) return;
+  const L = ctx.listener;
+  if (!L) return;
+  const at = ctx.currentTime;
+  if (L.positionX) {
+    setParam(L.positionX, listener.x, at, 0.03);
+    setParam(L.positionY, listener.y, at, 0.03);
+    setParam(L.positionZ, listener.z, at, 0.03);
+    setParam(L.forwardX, listener.fx, at, 0.03);
+    setParam(L.forwardY, listener.fy, at, 0.03);
+    setParam(L.forwardZ, listener.fz, at, 0.03);
+    setParam(L.upX, listener.ux, at, 0.03);
+    setParam(L.upY, listener.uy, at, 0.03);
+    setParam(L.upZ, listener.uz, at, 0.03);
+  } else { // Firefox: no AudioParams on the listener
+    L.setPosition?.(listener.x, listener.y, listener.z);
+    L.setOrientation?.(listener.fx, listener.fy, listener.fz, listener.ux, listener.uy, listener.uz);
+  }
+}
+
+/**
+ * Where the ears are (metres, world space): sfx.setListener(pos, forward, up = {0, 1, 0}). Positional
+ * sounds and loops are heard from here. Never throws; harmless before audio exists (applied on unlock).
+ */
+function setListener(pos, forward, up) {
+  try {
+    if (!finite3(pos)) return;
+    const f = finite3(forward) ? forward : { x: 0, y: 0, z: -1 };
+    const u = finite3(up) ? up : { x: 0, y: 1, z: 0 };
+    const fl = Math.hypot(f.x, f.y ?? 0, f.z) || 1;
+    const ul = Math.hypot(u.x, u.y ?? 0, u.z) || 1;
+    listener.x = Number(pos.x); listener.y = Number(pos.y ?? 0); listener.z = Number(pos.z);
+    listener.fx = f.x / fl; listener.fy = (f.y ?? 0) / fl; listener.fz = f.z / fl;
+    listener.ux = u.x / ul; listener.uy = (u.y ?? 0) / ul; listener.uz = u.z / ul;
+    listener.set = true;
+    applyListener();
+  } catch (err) {
+    warnOnce(err);
+  }
+}
+
+/**
+ * Builds one voice of `name` into `dest` at time `t`; returns the voice's output and tail nodes.
+ * `spatial` = { x, y, z, ref, d } routes it through a distance low-pass and a PannerNode instead of `pan`.
+ */
+function voice(c, dest, name, t, { volume = 1, rate = 1, pan = 0, rnd = Math.random, spatial = null } = {}) {
   const def = SOUNDS[name];
   const out = gainNode(c, volume * (def.gain ?? 1));
   let tail = out;
-  if (pan && typeof c.createStereoPanner === 'function') {
+  if (spatial && typeof c.createPanner === 'function') {
+    let node = out;
+    if (Number.isFinite(spatial.d)) node = node.connect(filterNode(c, 'lowpass', distanceCutoff(c, spatial.d), 0.5));
+    tail = makePanner(c, spatial, spatial.ref ?? refDistanceOf(name));
+    node.connect(tail);
+  } else if (pan && typeof c.createStereoPanner === 'function') {
     tail = c.createStereoPanner();
     tail.pan.value = clamp(pan, -1, 1);
     out.connect(tail);
@@ -1101,6 +1574,13 @@ function voice(c, dest, name, t, { volume = 1, rate = 1, pan = 0, rnd = Math.ran
   tail.connect(dest);
   def.fn({ ctx: c, out, t, r: rate, rnd });
   return { out, tail };
+}
+
+/** Voices started within 100 ms of `start` (the P2 burst rule). */
+function burstAround(start) {
+  let n = 0;
+  for (let i = 0; i < recentStarts.length; i++) if (recentStarts[i] > 0 && Math.abs(recentStarts[i] - start) < 0.1) n++;
+  return n;
 }
 
 function play(name, opts) {
@@ -1118,10 +1598,27 @@ function play(name, opts) {
     const rate = clamp(num(o.rate, 1), 0.25, 4) * (1 + (Math.random() * 2 - 1) * human);
     const start = ctx.currentTime + LEAD + delay + (human ? Math.random() * 0.005 : 0);
     const end = start + def.dur / rate;
+    const priority = [0, 1, 2].includes(o.priority) ? o.priority : (PRIORITY[name] ?? 1);
+    if (priority >= 2 && burstAround(start) >= 12) return;
+    // Placed in the city: a panner once a listener exists (and the context makes panners), else stereo pan.
+    let pan = clamp(num(o.pan, 0), -1, 1);
+    let spatial = null;
+    if (finite3(o.pos) && listener.set) {
+      const d = listenerDistance(o.pos);
+      if (d > MAX_DISTANCE * 1.5) return; // far beyond hearing
+      positional = positional.filter((e) => e > ctx.currentTime);
+      if (typeof ctx.createPanner === 'function' && positional.length < MAX_POSITIONAL) {
+        spatial = { x: Number(o.pos.x), y: Number(o.pos.y ?? 0), z: Number(o.pos.z), d, ref: refDistanceOf(name) };
+      } else if (!Number.isFinite(Number(o.pan))) {
+        pan = panOf(o.pos);
+      }
+    }
     if (!admit(name, def, start, end)) return;
     const gain = volume * (human ? 1 + (Math.random() * 2 - 1) * 0.07 : 1);
-    const { out, tail } = voice(ctx, chain.sfx, name, start, { volume: gain, rate, pan: clamp(num(o.pan, 0), -1, 1) });
+    const { out, tail } = voice(ctx, chain.sfx, name, start, { volume: gain, rate, pan, spatial });
     played++;
+    recentStarts[recentAt++ % recentStarts.length] = start;
+    if (spatial) positional.push(end);
     if (def.duck) duckMusic(start, end);
     // Sources stop themselves; drop the voice's own nodes from the graph once it is over.
     setTimeout(() => {
@@ -1129,6 +1626,423 @@ function play(name, opts) {
     }, (end - ctx.currentTime + 0.5) * 1000);
   } catch (err) {
     warnOnce(err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Loops (design §14.3): continuous voices — character engines and the city's ambience beds — from a
+// separate LOOPS registry (not in SOUND_NAMES, not counted by status()). sfx.loop(name, opts) returns a
+// handle { set({ volume, rate, pos, pan, lowpass }), stop(fade), playing }; parameter changes glide.
+// Inert (playing: false) when the name is unknown, audio is off / not unlocked / suspended, or the tab
+// is hidden. Every loop stops when sound is switched off.
+// ---------------------------------------------------------------------------
+
+/**
+ * Loop builder context: continuous sources started at L.t; `rate` lists [AudioParam, base] pairs that
+ * follow handle.set({ rate }); `events(from, to)` (optional) schedules grains (chirps, ticks, gull cries)
+ * into L.out for [from, to). L.state.rate is the current rate (event loops read it).
+ */
+function loopKit(c, out, t, rnd) {
+  const L = { ctx: c, out, t, rnd, sources: [], rate: [], state: { rate: 1 }, events: null };
+  L.noise = (color, { type = 'bandpass', f = 1000, q = 0.7, gain = 0.1, dest = out, follow = false, speed = 1 } = {}) => {
+    const s = c.createBufferSource();
+    s.buffer = noiseBuffer(c, color);
+    s.loop = true;
+    s.playbackRate.value = speed;
+    const flt = filterNode(c, type, f, q);
+    const g = gainNode(c, gain);
+    s.connect(flt).connect(g).connect(dest);
+    s.start(t, rnd() * (NOISE_SECONDS - 0.5));
+    L.sources.push(s);
+    if (follow) L.rate.push([flt.frequency, f]);
+    return { src: s, flt, g };
+  };
+  L.osc = (type, f, { gain = 0.1, dest = out, follow = true } = {}) => {
+    const o = c.createOscillator();
+    o.type = type;
+    o.frequency.value = Math.min(f, nyquist(c));
+    const g = gainNode(c, gain);
+    o.connect(g).connect(dest);
+    o.start(t);
+    L.sources.push(o);
+    if (follow) L.rate.push([o.frequency, f]);
+    return { o, g };
+  };
+  /** An LFO adding ±depth to `param` (follow: its frequency tracks the rate). */
+  L.lfo = (f, depth, param, { type = 'sine', follow = false } = {}) => {
+    const o = c.createOscillator();
+    o.type = type;
+    o.frequency.value = f;
+    o.connect(gainNode(c, depth)).connect(param);
+    o.start(t);
+    L.sources.push(o);
+    if (follow) L.rate.push([o.frequency, f]);
+    return o;
+  };
+  L.gain = (value = 1, dest = out) => {
+    const g = gainNode(c, value);
+    g.connect(dest);
+    return g;
+  };
+  L.filter = (type, f, q = 0.707, dest = out, follow = false) => {
+    const flt = filterNode(c, type, f, q);
+    flt.connect(dest);
+    if (follow) L.rate.push([flt.frequency, f]);
+    return flt;
+  };
+  /** A grain: one of the one-shot recipes into the loop (`at` is context time). */
+  L.grain = (name, at, { volume = 1, rate = 1, pan = 0 } = {}) => {
+    const def = SOUNDS[name];
+    if (!def) return;
+    const g = gainNode(c, volume * (def.gain ?? 1));
+    let tail = g;
+    if (pan && typeof c.createStereoPanner === 'function') {
+      tail = c.createStereoPanner();
+      tail.pan.value = clamp(pan, -1, 1);
+      g.connect(tail);
+    }
+    tail.connect(out);
+    def.fn({ ctx: c, out: g, t: at, r: rate, rnd });
+  };
+  /** Calls fn(at) at random intervals in [lo, hi] s over [from, to) (keeps its own schedule). */
+  L.every = (lo, hi, fn) => {
+    let next = t + lo + rnd() * (hi - lo);
+    return (from, to) => {
+      if (next < from) next = from + rnd() * (hi - lo) * 0.5;
+      while (next < to) {
+        fn(next);
+        next += (lo + rnd() * (hi - lo)) / Math.max(0.25, L.state.rate || 1);
+      }
+    };
+  };
+  return L;
+}
+
+/** Combines several event schedulers into one. */
+const allOf = (...fns) => (from, to) => { for (const fn of fns) fn(from, to); };
+
+const LOOPS = {
+  // --- the characters' engines (rate = rpm: 1 at idle-ish cruise, ~0.6 idle, up to ~2.5) -----------
+  engineRoadster: { gain: 0.55, ref: 6, build(L) { // 1930s straight-six: saw harmonics and firing pulses
+    const lp = L.filter('lowpass', 650, 1.2, L.out, true);
+    const putt = L.gain(0.55, lp);
+    L.lfo(24, 0.4, putt.gain, { type: 'square', follow: true });
+    for (const k of [1, 1.008]) L.osc('sawtooth', 48 * k, { gain: 0.3, dest: putt });
+    L.osc('square', 24, { gain: 0.12, dest: putt });
+    L.noise('pink', { f: 900, q: 0.8, gain: 0.03, follow: true });
+  } },
+  engineBubble: { gain: 0.5, ref: 6, build(L) { // the bubble car's two-stroke buzz
+    const bp = L.filter('bandpass', 1000, 1.4, L.out, true);
+    const am = L.gain(0.5, bp);
+    L.lfo(46, 0.45, am.gain, { type: 'square', follow: true });
+    L.osc('square', 92, { gain: 0.25, dest: am });
+    L.osc('sawtooth', 184, { gain: 0.12, dest: am });
+    L.noise('white', { type: 'highpass', f: 3000, gain: 0.01 });
+  } },
+  engineBoot: { gain: 0.55, ref: 6, build(L) { // the boot car's lumpy big-block burble
+    const lp = L.filter('lowpass', 420, 1.6, L.out, true);
+    const am = L.gain(0.5, lp);
+    L.lfo(18, 0.3, am.gain, { type: 'square', follow: true });
+    L.lfo(7, 0.15, am.gain, { follow: true });
+    for (const k of [1, 1.009]) L.osc('sawtooth', 36 * k, { gain: 0.3, dest: am });
+    L.osc('square', 18, { gain: 0.15, dest: am });
+  } },
+  dieselBoat: { gain: 0.6, ref: 8, build(L) { // a duck boat's diesel chug over lapping water
+    const lp = L.filter('lowpass', 300, 1, L.out, true);
+    L.osc('sawtooth', 38, { gain: 0.25, dest: lp });
+    const chug = L.gain(0.4);
+    L.lfo(5.5, 0.38, chug.gain, { type: 'square', follow: true });
+    L.noise('brown', { f: 160, q: 1, gain: 0.5, dest: chug, follow: true });
+    const lap = L.gain(0.5);
+    L.lfo(0.35, 0.3, lap.gain);
+    L.noise('brown', { type: 'lowpass', f: 500, gain: 0.3, dest: lap });
+  } },
+  pennyTick: { gain: 0.6, ref: 4, build(L) { // a penny-farthing: spoke ticks and tyre hiss
+    L.noise('pink', { type: 'lowpass', f: 1200, gain: 0.02, follow: true });
+    L.events = L.every(0.12, 0.16, (at) => {
+      L.grain('stepTick', at, { volume: 0.35, rate: 1.4 });
+    });
+  } },
+
+  // --- the city's beds ----------------------------------------------------------------------------
+  cityHum: { gain: 0.6, ref: 60, build(L) { // the distant city everywhere: a low rumble
+    const g = L.gain(1);
+    L.lfo(0.04, 0.25, g.gain);
+    L.noise('brown', { type: 'lowpass', f: 160, gain: 0.35, dest: g });
+    L.noise('pink', { f: 450, q: 0.6, gain: 0.06, dest: g });
+  } },
+  trafficBed: { gain: 0.6, ref: 30, build(L) { // nearby traffic: rumble, tyre hiss and pass-bys
+    const g1 = L.gain(1);
+    L.lfo(0.06, 0.3, g1.gain);
+    L.noise('brown', { f: 300, q: 0.5, gain: 0.3, dest: g1 });
+    const g2 = L.gain(1);
+    L.lfo(0.11, 0.35, g2.gain);
+    L.noise('pink', { f: 1300, q: 0.7, gain: 0.06, dest: g2 });
+    const passBy = (at) => {
+      const v = { ctx: L.ctx, out: L.out, t: at, r: 0.9 + L.rnd() * 0.4, rnd: L.rnd };
+      hiss(v, 0, { color: 'pink', path: [[0, 500], [0.35, 1500], [0.75, 600]], q: 0.9, a: 0.3, hold: 0.05, d: 0.4, peak: 0.05 + L.rnd() * 0.04 });
+    };
+    L.events = L.every(1.8, 5.5, passBy);
+  } },
+  parkBed: { gain: 0.6, ref: 25, build(L) { // leaves in the wind, small birds
+    const g = L.gain(1);
+    L.lfo(0.13, 0.4, g.gain);
+    L.noise('pink', { type: 'bandpass', f: 2600, q: 0.5, gain: 0.05, dest: g });
+    L.noise('white', { type: 'highpass', f: 6000, gain: 0.006, dest: g });
+    L.events = L.every(0.8, 3, (at) => L.grain('chirp', at, { volume: 0.25 + L.rnd() * 0.45, rate: 0.85 + L.rnd() * 0.45, pan: L.rnd() * 1.2 - 0.6 }));
+  } },
+  marketBed: { gain: 0.6, ref: 20, build(L) { // a market murmur and the odd till
+    for (const [f, q] of [[400, 2], [750, 2.5], [1300, 3], [2300, 3]]) {
+      const g = L.gain(0.6);
+      L.lfo(3 + L.rnd() * 3, 0.4, g.gain);
+      L.noise('pink', { f, q, gain: 0.06, dest: g });
+    }
+    L.events = L.every(3, 8, (at) => {
+      const v = { ctx: L.ctx, out: L.out, t: at, r: 1, rnd: L.rnd };
+      modal(v, 0, 2900 + L.rnd() * 400, BELL, 0.04, { decay: 0.4 });
+    });
+  } },
+  harbourBed: { gain: 0.6, ref: 40, build(L) { // waves, lapping, rigging, gulls
+    const waves = L.gain(0.7);
+    L.lfo(0.11, 0.3, waves.gain);
+    L.noise('pink', { type: 'lowpass', f: 700, gain: 0.18, dest: waves });
+    const lap = L.gain(0.6);
+    L.lfo(0.6, 0.35, lap.gain);
+    L.noise('brown', { f: 260, q: 0.8, gain: 0.25, dest: lap });
+    L.events = allOf(
+      L.every(4, 11, (at) => L.grain('gull', at, { volume: 0.25 + L.rnd() * 0.3, rate: 0.9 + L.rnd() * 0.25, pan: L.rnd() * 1.4 - 0.7 })),
+      L.every(1, 3, (at) => clinkAt({ ctx: L.ctx, out: L.out, t: at, r: 1, rnd: L.rnd }, 0, 2200 + L.rnd() * 1400, 0.012, 0.25)),
+    );
+  } },
+  windHigh: { gain: 0.6, ref: 60, build(L) { // altitude: wind with gusts
+    const g = L.gain(0.7);
+    L.lfo(0.09, 0.3, g.gain);
+    const n = L.noise('pink', { f: 520, q: 0.8, gain: 0.25, dest: g });
+    L.lfo(0.07, 250, n.flt.frequency);
+    L.noise('white', { type: 'highpass', f: 2500, gain: 0.015, dest: g });
+  } },
+  rainBed: { gain: 0.6, ref: 30, build(L) { // rain on the streets
+    const hi = L.filter('lowpass', 9000);
+    L.noise('white', { type: 'highpass', f: 900, gain: 0.07, dest: hi });
+    L.noise('pink', { f: 3200, q: 0.6, gain: 0.05 });
+    L.noise('brown', { type: 'lowpass', f: 300, gain: 0.08 });
+    L.events = L.every(0.06, 0.22, (at) => {
+      const v = { ctx: L.ctx, out: L.out, t: at, r: 0.7 + L.rnd() * 0.8, rnd: L.rnd };
+      hiss(v, 0, { f: 2500 + L.rnd() * 2500, q: 2, a: 0.001, d: 0.012, peak: 0.01 + L.rnd() * 0.02 });
+    });
+  } },
+  constructionBed: { gain: 0.6, ref: 20, build(L) { // a building site: machinery, hammers, a drill, the crane
+    const lp = L.filter('lowpass', 250, 1);
+    L.osc('sawtooth', 58, { gain: 0.05, dest: lp, follow: false });
+    L.noise('brown', { f: 220, q: 0.8, gain: 0.1 });
+    L.events = allOf(
+      L.every(0.6, 1.6, (at) => L.grain('hammer', at, { volume: 0.5 + L.rnd() * 0.3, rate: 0.85 + L.rnd() * 0.3 })),
+      L.every(4, 9, (at) => L.grain('drill', at, { volume: 0.45 })),
+      L.every(10, 20, (at) => L.grain('craneBeep', at, { volume: 0.4 })),
+    );
+  } },
+  crowdMurmur: { gain: 0.6, ref: 15, build(L) { // people talking
+    for (const [f, q] of [[420, 2.5], [680, 2.5], [1050, 3], [1600, 3], [2500, 3]]) {
+      const g = L.gain(0.5);
+      L.lfo(2.5 + L.rnd() * 3, 0.45, g.gain);
+      L.noise('pink', { f, q, gain: 0.07, dest: g });
+    }
+  } },
+  nightBed: { gain: 0.6, ref: 25, build(L) { // crickets and a soft night wind
+    for (const f of [4400, 4650]) {
+      const groups = L.gain(0.5);
+      L.lfo(1.4 + L.rnd() * 0.5, 0.5, groups.gain, { type: 'square' });
+      const pulses = L.gain(0.5, groups);
+      L.lfo(28 + L.rnd() * 4, 0.5, pulses.gain, { type: 'square' });
+      L.osc('sine', f, { gain: 0.02, dest: pulses, follow: false });
+    }
+    L.noise('pink', { type: 'lowpass', f: 400, gain: 0.05 });
+  } },
+  sirenLoop: { gain: 0.5, ref: 40, build(L) { // a police wail, round and round (rate: Doppler)
+    const bp = L.filter('bandpass', 1100, 0.8, L.out, true);
+    for (const [type, gain] of [['triangle', 0.3], ['square', 0.05]]) {
+      const o = L.osc(type, 950, { gain, dest: bp });
+      L.lfo(0.32, 330, o.o.frequency, { follow: true });
+    }
+  } },
+  trainRumble: { gain: 0.6, ref: 60, build(L) { // a passing train: rumble, rail joints, motor whine
+    L.noise('brown', { type: 'lowpass', f: 220, gain: 0.4, follow: true });
+    L.noise('pink', { f: 1800, q: 3, gain: 0.02, follow: true });
+    const whine = L.filter('lowpass', 1000);
+    L.osc('sawtooth', 210, { gain: 0.012, dest: whine });
+    L.events = L.every(1.2, 1.4, (at) => {
+      for (const dt of [0, 0.09]) {
+        const v = { ctx: L.ctx, out: L.out, t: at + dt, r: 1, rnd: L.rnd };
+        thump(v, 0, 95, 60, 0.06, 0.12);
+        knock(v, 0, 700, 0.05, 0.4);
+      }
+    });
+  } },
+  fountainBed: { gain: 0.6, ref: 15, build(L) { // a plaza fountain
+    const flutter = L.gain(0.85);
+    L.lfo(7, 0.15, flutter.gain);
+    L.noise('white', { f: 1900, q: 0.6, gain: 0.08, dest: flutter });
+    L.noise('pink', { type: 'lowpass', f: 5000, gain: 0.06, dest: flutter });
+    L.noise('brown', { type: 'lowpass', f: 300, gain: 0.05 });
+  } },
+};
+
+/** Every loop name (disjoint from SOUND_NAMES). */
+export const LOOP_NAMES = Object.freeze(Object.keys(LOOPS));
+
+const MAX_LOOPS = 24;
+const LOOP_TICK_MS = 100;
+const LOOP_AHEAD = 0.4; // seconds of grains scheduled ahead of the clock
+const loops = new Set(); // live loop voices
+let loopTimer = null;
+
+/**
+ * Builds a loop voice into `dest` at `t`: sources → def gain → low-pass → volume → (panner | stereo pan).
+ * Returns { L, inner, lp, vol, tail, ref }.
+ */
+function buildLoop(c, dest, name, t, { volume = 1, rate = 1, pan = 0, spatial = null, lowpass = 0, rnd = Math.random, fadeIn = 0.15 } = {}) {
+  const def = LOOPS[name];
+  const vol = gainNode(c, 0);
+  const v0 = clamp(num(volume, 1), 0, 2);
+  if (fadeIn > 0) {
+    vol.gain.setValueAtTime(0, t);
+    vol.gain.linearRampToValueAtTime(v0, t + fadeIn);
+  } else vol.gain.value = v0;
+  const lp = filterNode(c, 'lowpass', lowpass > 0 ? Math.min(lowpass, nyquist(c)) : nyquist(c), 0.5);
+  const inner = gainNode(c, def.gain ?? 1);
+  inner.connect(lp).connect(vol);
+  let tail = vol;
+  const ref = def.ref ?? 10;
+  if (spatial && typeof c.createPanner === 'function') {
+    tail = makePanner(c, spatial, ref);
+    vol.connect(tail);
+  } else if (typeof c.createStereoPanner === 'function') {
+    tail = c.createStereoPanner();
+    tail.pan.value = clamp(num(pan, 0), -1, 1);
+    vol.connect(tail);
+  }
+  tail.connect(dest);
+  const L = loopKit(c, inner, t, rnd);
+  def.build(L);
+  const r = clamp(num(rate, 1), 0.1, 4);
+  if (r !== 1) {
+    L.state.rate = r;
+    for (const [param, base] of L.rate) param.value = Math.min(base * r, nyquist(c));
+  }
+  return { L, inner, lp, vol, tail, ref };
+}
+
+const INERT_LOOP = Object.freeze({ set() {}, stop() {}, get playing() { return false; } });
+
+function loopTick() {
+  try {
+    if (!ctx || ctx.state !== 'running') return;
+    const now = ctx.currentTime;
+    for (const lv of loops) {
+      if (!lv.L.events || lv.stopped) continue;
+      if (lv.until < now - 1) lv.until = now; // the timer stalled: no backlog
+      const to = now + LOOP_AHEAD;
+      if (to <= lv.until) continue;
+      lv.L.events(Math.max(lv.until, now), to);
+      lv.until = to;
+    }
+  } catch (err) {
+    warnOnce(err);
+  }
+}
+
+function syncLoopTimer() {
+  const need = [...loops].some((lv) => lv.L.events);
+  if (need && !loopTimer) loopTimer = setInterval(loopTick, LOOP_TICK_MS);
+  else if (!need && loopTimer) {
+    clearInterval(loopTimer);
+    loopTimer = null;
+  }
+}
+
+function stopLoopVoice(lv, fade) {
+  if (lv.stopped) return;
+  lv.stopped = true;
+  loops.delete(lv);
+  syncLoopTimer();
+  try {
+    const now = ctx.currentTime;
+    const f = clamp(num(fade, 0.3), 0.01, 10);
+    glideTo(lv.vol.gain, 0, now, f / 4);
+    const end = now + f + 0.05;
+    for (const s of lv.L.sources) { try { s.stop(end); } catch { /* already stopped */ } }
+    setTimeout(() => {
+      try { lv.tail.disconnect(); lv.vol.disconnect(); } catch { /* gone */ }
+    }, (f + 0.5) * 1000);
+  } catch (err) {
+    warnOnce(err);
+  }
+}
+
+/** Stops every live loop (sound switched off, view disposed). */
+function stopLoops(fade = 0.2) {
+  for (const lv of [...loops]) stopLoopVoice(lv, fade);
+}
+
+/**
+ * Starts a continuous voice: sfx.loop(name, { volume = 1, rate = 1, pos, pan = 0, lowpass }) →
+ * { set({ volume, rate, pos, pan, lowpass }), stop(fade = 0.3), playing }.
+ */
+function loop(name, opts) {
+  try {
+    if (typeof name !== 'string' || !Object.hasOwn(LOOPS, name)) return INERT_LOOP;
+    if (!settings.enabled || !ctx || !chain || ctx.state !== 'running' || pageHidden()) return INERT_LOOP;
+    if (loops.size >= MAX_LOOPS) return INERT_LOOP;
+    const o = opts && typeof opts === 'object' ? opts : {};
+    const spatial = finite3(o.pos) && listener.set ? { x: Number(o.pos.x), y: Number(o.pos.y ?? 0), z: Number(o.pos.z) } : null;
+    const t = ctx.currentTime + LEAD;
+    let userLp = num(o.lowpass, 0) > 0 ? num(o.lowpass, 0) : 0;
+    const d0 = spatial ? listenerDistance(spatial) : NaN;
+    const lp0 = Math.min(userLp || nyquist(ctx), spatial ? distanceCutoff(ctx, d0) : nyquist(ctx));
+    const built = buildLoop(ctx, chain.sfx, name, t, {
+      volume: o.volume ?? 1, rate: o.rate ?? 1, pan: spatial ? 0 : num(o.pan, 0), spatial, lowpass: lp0,
+    });
+    const lv = { ...built, name, until: t, stopped: false };
+    const isSpatial = !!(spatial && typeof ctx.createPanner === 'function');
+    loops.add(lv);
+    syncLoopTimer();
+    if (lv.L.events) loopTick();
+    const handle = {
+      set(p) {
+        try {
+          if (lv.stopped || !p || typeof p !== 'object') return;
+          const now = ctx.currentTime;
+          if (Number.isFinite(Number(p.volume))) glideTo(lv.vol.gain, clamp(Number(p.volume), 0, 2), now, 0.05);
+          if (Number.isFinite(Number(p.rate))) {
+            const r = clamp(Number(p.rate), 0.1, 4);
+            lv.L.state.rate = r;
+            for (const [param, base] of lv.L.rate) glideTo(param, Math.min(base * r, nyquist(ctx)), now, 0.05);
+          }
+          if (Number.isFinite(Number(p.lowpass))) userLp = Number(p.lowpass) > 0 ? Number(p.lowpass) : 0;
+          if (isSpatial && finite3(p.pos)) {
+            placePanner(lv.tail, p.pos, now, 0.05);
+            const d = listenerDistance(p.pos);
+            glideTo(lv.lp.frequency, Math.max(40, Math.min(userLp || nyquist(ctx), distanceCutoff(ctx, d))), now, 0.05);
+          } else {
+            if (Number.isFinite(Number(p.lowpass))) glideTo(lv.lp.frequency, Math.max(40, Math.min(userLp || nyquist(ctx), nyquist(ctx))), now, 0.05);
+            const pan = Number.isFinite(Number(p.pan)) ? Number(p.pan) : finite3(p.pos) && listener.set ? panOf(p.pos) : NaN;
+            if (Number.isFinite(pan) && lv.tail.pan) glideTo(lv.tail.pan, clamp(pan, -1, 1), now, 0.05);
+          }
+        } catch (err) {
+          warnOnce(err);
+        }
+      },
+      stop(fade = 0.3) {
+        try { stopLoopVoice(lv, fade); } catch (err) { warnOnce(err); }
+      },
+      get playing() {
+        return !lv.stopped;
+      },
+    };
+    return handle;
+  } catch (err) {
+    warnOnce(err);
+    return INERT_LOOP;
   }
 }
 
@@ -1202,6 +2116,7 @@ function setEnabled(on, persist = true) {
       unlock();
     } else if (ctx) {
       stopMusic();
+      stopLoops(0.1);
       applyVolume();
       setTimeout(() => {
         if (!settings.enabled && ctx.state === 'running') ctx.suspend().catch(() => {});
@@ -1301,6 +2216,12 @@ export const sfx = {
   getVolume: () => settings.volume,
   setMusic: (on) => setMusic(on),
   isMusicOn: () => settings.music,
+  /** The listener for positional sounds (metres, world space). */
+  setListener,
+  /** A continuous voice from LOOP_NAMES → { set, stop, playing } (inert when audio is unavailable). */
+  loop,
+  /** Stops every live loop. */
+  stopLoops: (fade) => { try { stopLoops(fade); } catch (err) { warnOnce(err); } },
   /** Diagnostics: context state, voices alive, sounds played so far, whether the music loop runs. */
   status() {
     let voices = 0;
@@ -1325,11 +2246,40 @@ export function soundBudget(name) {
  * Schedules one sound into `destination` of any BaseAudioContext at context time `when`, with no
  * random variation beyond the seeded `seed`. Returns the budgeted end time, or 0 for an unknown name.
  */
-export function renderInto(c, destination, name, when = 0, { volume = 1, rate = 1, pan = 0, seed = 1 } = {}) {
+export function renderInto(c, destination, name, when = 0, { volume = 1, rate = 1, pan = 0, seed = 1, pos = null } = {}) {
   if (!Object.hasOwn(SOUNDS, name)) return 0;
   const r = clamp(num(rate, 1), 0.25, 4);
-  voice(c, destination, name, when, { volume: clamp(num(volume, 1), 0, 2), rate: r, pan, rnd: mulberry32(seed) });
+  // `pos` (with a panner-capable context): placed relative to that context's listener at its origin.
+  const spatial = finite3(pos) && typeof c.createPanner === 'function'
+    ? { x: Number(pos.x), y: Number(pos.y ?? 0), z: Number(pos.z), d: Math.hypot(Number(pos.x), Number(pos.y ?? 0), Number(pos.z)), ref: refDistanceOf(name) }
+    : null;
+  voice(c, destination, name, when, { volume: clamp(num(volume, 1), 0, 2), rate: r, pan, rnd: mulberry32(seed), spatial });
   return when + SOUNDS[name].dur / r;
+}
+
+/**
+ * Schedules `seconds` of the loop `name` into `destination` of any BaseAudioContext from `when`: every
+ * source starts at `when` and stops by `when + seconds` (grains are only started while they can finish).
+ * Returns the end time, or 0 for an unknown name.
+ */
+export function renderLoopInto(c, destination, name, when = 0, seconds = 2, { volume = 1, rate = 1, pan = 0, seed = 1, lowpass = 0, pos = null } = {}) {
+  if (!Object.hasOwn(LOOPS, name)) return 0;
+  const len = Math.max(0.1, num(seconds, 2));
+  const end = when + len;
+  const spatial = finite3(pos) && typeof c.createPanner === 'function' ? { x: Number(pos.x), y: Number(pos.y ?? 0), z: Number(pos.z) } : null;
+  const lv = buildLoop(c, destination, name, when, { volume, rate, pan, spatial, lowpass, rnd: mulberry32(seed), fadeIn: Math.min(0.15, len / 4) });
+  // fade out over the last 50 ms, then stop
+  const fade = Math.min(0.05, len / 4);
+  lv.vol.gain.setValueAtTime(clamp(num(volume, 1), 0, 2), end - fade);
+  lv.vol.gain.linearRampToValueAtTime(0, end);
+  if (lv.L.events) lv.L.events(when, end - 1.0);
+  for (const s of lv.L.sources) s.stop(end);
+  return end;
+}
+
+/** Whether `name` is a loop (LOOP_NAMES). */
+export function isLoop(name) {
+  return typeof name === 'string' && Object.hasOwn(LOOPS, name);
 }
 
 /**

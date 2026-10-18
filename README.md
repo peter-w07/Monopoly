@@ -5,8 +5,8 @@ process serves the static client, a small JSON API and a WebSocket endpoint, and
 games in memory with JSON files on disk for persistence. There is no database, no build
 step and no front-end framework; the only dependency is [`ws`](https://github.com/websockets/ws).
 The rules engine is pure and deterministic, so any saved game replays identically.
-The board has two interchangeable renderers — a classic 2D board and an early 3D board
-(Three.js) inspired by Monopoly Plus — switched with the 2D | 3D toggle on the board.
+The board has two interchangeable renderers — a classic 2D board and a 3D mode (Three.js) in
+which the board is a life-size living city — switched with the 2D | 3D toggle on the board.
 
 **What works**
 
@@ -25,10 +25,25 @@ The board has two interchangeable renderers — a classic 2D board and an early 
 - Turn timer with auto-play for absent players, reconnect and seat resume, several tabs
   as different players, spectators.
 - Games survive a server restart or redeploy.
-- 3D board (early, work in progress): a toy board on a table, hopping tokens, thrown dice,
-  a camera that follows the action (drag to orbit, scroll to zoom, ⟲ to reset), and a small
-  town that grows as properties are bought and built on. Click **3D** on the board to try it;
-  it falls back to 2D on devices without WebGL2.
+- 3D city: the 40 squares are 40 real places on a one-way street loop around a downtown
+  (GO plaza, the police station and its yard, a parking plaza, a police checkpoint, train
+  stations, a power station and waterworks, eight neighbourhoods), built at real scale in
+  metres. Tokens are life-size characters — a roadster, a Scottie dog, a street magician on a
+  penny-farthing, a duck boat, a boot car, a cat, a bubble car, a gardener with a wheelbarrow —
+  that drive and walk the streets; long trips time-lapse the city around them so a roll still
+  lands in about 2–3 seconds. Buying, building and mortgaging are real construction
+  ceremonies (hoardings, cranes, scaffolding, towers, BANK OWNED boards), the city lives
+  (traffic, people, trains, boats, day and night, weather) and a camera director films it like
+  television: a helicopter overview, a dive behind your character on your turn, one cut to the
+  kerb as you arrive, crane shots for construction, a tow-truck scene for jail. Others' turns
+  play shorter by default. Painted address bays, street signs, owner flags and roofs, a
+  minimap and pins keep the game readable; tap a building (or a minimap square) for its info
+  card. The **⊞** button or the **M** key switches to a north-up map view, and the **🏙** menu on
+  the board sets others' turns (short / full / instant), the time of day (story — the city
+  ages toward dusk as it grows — day cycle, or afternoon), weather, ambience volume, the
+  minimap and labels (saved in this browser). Drag to orbit, scroll to zoom, ✋ to keep the
+  camera, ⟲ to give it back; click or Esc skips an animation. Click **3D** on the board to try
+  it; it falls back to 2D on devices without WebGL2.
 
 ---
 
@@ -226,7 +241,7 @@ server/    node:http + ws. index.js (HTTP API, static files, /ws, shutdown), roo
            limits.js (abuse limits).
 public/    Vanilla ES-module client, served as-is. ui.js (screens, panel, dialogs), net.js (socket,
            reconnect), renderer-switch.js (2D | 3D), renderer2d.js + renderer2d.css (2D board),
-           renderer3d.js + r3d/ (3D board), vendor/three/ (three.js r186, MIT), boarddata.js, style.css.
+           renderer3d.js + r3d/ (3D city), vendor/three/ (three.js r186, MIT), boarddata.js, style.css.
 test/      node:test suites: engine unit tests, a 150-game simulation, server integration tests.
            bot.js is the bots' move chooser (shared with scripts/).
 scripts/   bot-client.js (headless WebSocket player), playtest.js (bot game against a live server).

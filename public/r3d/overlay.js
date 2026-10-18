@@ -526,6 +526,17 @@ export class Overlay {
     this.resetBtn.title = free ? 'Back to the whole board' : 'Reset view (the camera follows the game again)';
   }
 
+  // ---- city HUD (M0 skeleton: safe no-ops, real in M1) -------------------------------------------
+  chyron() {}
+  stepCount() {}
+  routeChip() {}
+  letterbox() {}
+  moneyFlight() { return 0; }
+  setMinimap() {}
+  setMapLabels() {}
+  setCityMenu() {}
+  setMapButton() {}
+
   reset() {
     this.hideCard();
     this.hideInfo();
